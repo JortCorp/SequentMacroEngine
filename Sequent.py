@@ -510,29 +510,38 @@ class ModernScrollBar(tk.Canvas):
 
     def draw(self):
         self.delete("all")
-        h = self.winfo_height()
-        if h <= 2 or (self.first <= 0.0 and self.last >= 1.0): return
 
-        y0 = self.first * h
-        y1 = self.last * h
+        def _hex_to_rgb(h):
+            h = h.lstrip("#")
+            return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
-        min_thumb_h = 32
-        if (y1 - y0) < min_thumb_h:
-            center = (y0 + y1) / 2
-            y0 = max(0, center - min_thumb_h / 2)
-            y1 = min(h, y0 + min_thumb_h)
-            if (y1 - y0) < min_thumb_h:
-                y0 = max(0, y1 - min_thumb_h)
+        try:
+            r1, g1, b1 = _hex_to_rgb(BG_BORDER)
+            r2, g2, b2 = _hex_to_rgb(COLOR_ACCENT)
+            r = int(r1 + (r2 - r1) * self.anim_pos)
+            g = int(g1 + (g2 - g1) * self.anim_pos)
+            b = int(b1 + (b2 - b1) * self.anim_pos)
+            bg_color = f"#{r:02x}{g:02x}{b:02x}"
+        except Exception:
+            bg_color = COLOR_ACCENT if self.state else BG_BORDER
 
-        cx = self.w / 2
-        thumb_width = 10
-        r = thumb_width / 2
+        radius = self.h / 2
+        self.create_arc(0, 0, self.h, self.h, start=90, extent=180, fill=bg_color, outline=bg_color)
+        self.create_arc(self.w - self.h, 0, self.w, self.h, start=-90, extent=180, fill=bg_color, outline=bg_color)
+        self.create_rectangle(radius, 0, self.w - radius, self.h, fill=bg_color, outline=bg_color)
 
-        y_top = y0 + r + 2
-        y_bot = y1 - r - 2
-        if y_bot < y_top: y_bot = y_top
+        pad = 3
+        knob_size = self.h - (pad * 2)
+        x_min = pad
+        x_max = self.w - pad - knob_size
+        x0 = x_min + ((x_max - x_min) * self.anim_pos)
+        y0 = pad
+        x1 = x0 + knob_size
+        y1 = y0 + knob_size
 
-        self.create_line(cx, y_top, cx, y_bot, fill=self.current_color, width=thumb_width, capstyle="round")
+        knob_color = "#ffffff" if self.anim_pos > 0.5 else TEXT_MUTED
+        self.create_oval(x0, y0, x1, y1, fill=knob_color, outline=knob_color)
+
 
     def _on_click(self, event):
         h = self.winfo_height()
@@ -612,7 +621,6 @@ class VSCodeQueueViewer(tk.Frame):
         self.sep = tk.Frame(self, bg=BG_BORDER, width=1)
         self.sep.pack(side=tk.LEFT, fill=tk.Y)
 
-        # Dynamic scrollbar and separator (packed dynamically only when content overflows)
         self.scrollbar = ModernScrollBar(
             self, command=self._on_scrollbar_scroll,
             width=18, bg_trough=BG_SCROLL_TRACK
@@ -649,6 +657,10 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter.bind("<Button-1>", self._on_gutter_click)
         self.code_text.bind("<Button-1>", self._on_code_click)
         self.bind("<MouseWheel>", self._on_mousewheel)
+
+        # Bind double-click events to trigger in-place action editing
+        self.gutter.bind("<Double-Button-1>", self._on_double_click)
+        self.code_text.bind("<Double-Button-1>", self._on_double_click)
 
         self.code_text.bind("<<Selection>>", self._on_text_selection_changed)
         self.code_text.bind("<ButtonRelease-1>", self._on_text_selection_changed)
@@ -860,6 +872,9 @@ class VSCodeQueueViewer(tk.Frame):
             act_type = act.get("type", "Action")
             is_bp = act_idx in self.app.breakpoints
             bp_label = f"Remove Breakpoint (Line {line_num})" if is_bp else f"Toggle Breakpoint (Line {line_num})"
+
+            # Direct edit option
+            menu.add_command(label=f"Edit Action '{act_type}' (Line {line_num})...", command=lambda: self.open_action_submenu(line_num, event, edit_idx=act_idx))
             menu.add_command(label=bp_label, command=lambda: self.app.toggle_breakpoint(act_idx))
             menu.add_command(label=f"Delete Action '{act_type}' (Line {line_num})", command=lambda: self.app.delete_action(act_idx))
             if act_type == "move":
@@ -874,6 +889,7 @@ class VSCodeQueueViewer(tk.Frame):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
 
     
     def _on_scrollbar_scroll(self, *args):
@@ -964,38 +980,121 @@ class VSCodeQueueViewer(tk.Frame):
         except Exception:
             pass
     
+    def _on_double_click(self, event):
+        if not self.interactive_enabled or not self.app.recorded_actions:
+            return "break"
+        try:
+            if event.widget == self.gutter:
+                rel_y = event.y_root - self.gutter.winfo_rooty()
+                idx = self.gutter.index(f"@0,{rel_y}")
+            else:
+                idx = self.code_text.index(f"@{event.x},{event.y}")
+            line_num = int(idx.split(".")[0])
+            if line_num >= 2:
+                act_idx = line_num - 2
+                if 0 <= act_idx < len(self.app.recorded_actions):
+                    self.open_action_submenu(line_num, event, edit_idx=act_idx)
+                    return "break"
+        except Exception:
+            pass
+        return "break"
+    
     def _on_plus_btn_click(self, event):
         if self.hovered_line:
             self.open_action_submenu(self.hovered_line, event)
 
-    def open_action_submenu(self, line_num, event):
+    def open_action_submenu(self, line_num, event, edit_idx=None):
         self.close_sub_menu()
         if not self.interactive_enabled: return
 
+        TYPE_TO_LABEL = {
+            "delay": "Delay",
+            "disclaimer": "Disclaimer / Warning",
+            "if_var": "If Variable Condition",
+            "read_clipboard": "Read Clipboard",
+            "prompt_input": "Request Input",
+            "type_variable": "Type Variable",
+            "search_area": "Search selected area",
+            "wait_pixel": "Wait Pixel",
+            "label": "Label Marker",
+            "goto": "Jump to Label"
+        }
+
+        editing_act = None
+        if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions):
+            editing_act = self.app.recorded_actions[edit_idx]
+            if editing_act.get("type") not in TYPE_TO_LABEL:
+                return
+
+        initial_action = TYPE_TO_LABEL.get(editing_act.get("type"), "Delay") if editing_act else "Delay"
+
         menu_w = 340
-        menu_h = 250
+        base_h = 400 if initial_action in ("Search selected area", "If Variable Condition") else (
+            370 if initial_action == "Disclaimer / Warning" else (
+                350 if initial_action == "Read Clipboard" else (
+                    300 if initial_action == "Request Input" else (
+                        280 if initial_action in ("Wait Pixel", "Type Variable") else 250
+                    )
+                )
+            )
+        )
+        menu_h = base_h - 30 if edit_idx is not None else base_h
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint32),
+                ("rcMonitor", RECT),
+                ("rcWork", RECT),
+                ("dwFlags", ctypes.c_uint32)
+            ]
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        MONITOR_DEFAULTTONEAREST = 2
+
+        if hwnd:
+            hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        else:
+            pt = POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            hmon = user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            mon_x = mi.rcWork.left
+            mon_y = mi.rcWork.top
+            mon_w = mi.rcWork.right - mi.rcWork.left
+            mon_h = mi.rcWork.bottom - mi.rcWork.top
+        else:
+            mon_x, mon_y = 0, 0
+            mon_w, mon_h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+
+        init_x = mon_x + max(0, (mon_w - menu_w) // 2)
+        init_y = mon_y + max(0, (mon_h - menu_h) // 2)
 
         root = self.app.root
-        rx = root.winfo_x()
-        ry = root.winfo_y()
-        rw = root.winfo_width()
-        rh = root.winfo_height()
-        sw = root.winfo_screenwidth()
-        sh = root.winfo_screenheight()
-
-        init_x = rx + rw + 10
-        if init_x + menu_w > sw - 10:
-            if rx - menu_w - 10 >= 10: init_x = rx - menu_w - 10
-            else: init_x = max(10, rx + rw - menu_w - 25)
-
-        init_y = max(ry + 10, min(event.y_root - 30, ry + rh - menu_h - 20))
-        init_y = max(10, min(init_y, sh - menu_h - 40))
-
         self.sub_menu = tk.Toplevel(root)
         self.sub_menu.overrideredirect(True)
         self.sub_menu.attributes('-topmost', True)
         self.sub_menu.geometry(f"{menu_w}x{menu_h}+{init_x}+{init_y}")
         self.sub_menu.configure(bg=BG_BORDER)
+        self.sub_menu.update_idletasks()
+
+        if getattr(self.app, 'entertain_me', True):
+            self.sub_menu.attributes('-alpha', 0.0)
+            def _fade_in_modal(alpha=0.0):
+                if not self.sub_menu or not self.sub_menu.winfo_exists(): return
+                alpha = min(1.0, alpha + 0.18)
+                self.sub_menu.attributes('-alpha', alpha)
+                if alpha < 1.0:
+                    self.sub_menu.after(12, lambda: _fade_in_modal(alpha))
+            self.sub_menu.after(10, _fade_in_modal)
+        else:
+            self.sub_menu.attributes('-alpha', 1.0)
 
         card = tk.Frame(self.sub_menu, bg=BG_PANEL)
         card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
@@ -1013,8 +1112,8 @@ class VSCodeQueueViewer(tk.Frame):
         drag_icon = tk.Label(head, text=" ⠇ ", font=("Segoe UI", 9), bg=BG_HEADER, fg=TEXT_MUTED, cursor="fleur")
         drag_icon.pack(side=tk.LEFT, padx=(4, 0))
 
-        title_lbl = "LINE OPTIONS" if line_num >= 2 else "ADD ACTION"
-        lbl_title = tk.Label(head, text=title_lbl, font=("Segoe UI", 8, "bold"), bg=BG_HEADER, fg=TEXT_MUTED, cursor="fleur")
+        title_lbl = "EDIT ACTION" if edit_idx is not None else ("LINE OPTIONS" if line_num >= 2 else "ADD ACTION")
+        lbl_title = tk.Label(head, text=title_lbl, font=("Segoe UI", 8, "bold"), bg=BG_HEADER, fg=COLOR_SUCCESS if edit_idx is not None else TEXT_MUTED, cursor="fleur")
         lbl_title.pack(side=tk.LEFT, padx=4, pady=5)
         lbl_line = tk.Label(head, text=f"Line {line_num}", font=("Consolas", 8, "bold"), bg=BG_INPUT, fg=SYNTAX_BLUE, padx=4, pady=1, cursor="fleur")
         lbl_line.pack(side=tk.LEFT, padx=2)
@@ -1044,18 +1143,17 @@ class VSCodeQueueViewer(tk.Frame):
             "Label Marker", 
             "Jump to Label"
         ]
-        action_var = tk.StringVar(value="Delay")
-        action_menu = tk.OptionMenu(top_row, action_var, *action_options, command=lambda val: self._switch_action_view(val, line_num))
+        action_var = tk.StringVar(value=initial_action)
+        action_menu = tk.OptionMenu(top_row, action_var, *action_options, command=lambda val: self._switch_action_view(val, line_num, edit_idx=edit_idx))
         action_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER, font=("Segoe UI", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
         action_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
         action_menu.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.action_content_frame = tk.Frame(card, bg=BG_PANEL, padx=12, pady=4)
         self.action_content_frame.pack(fill=tk.BOTH, expand=True)
-        self._render_delay_view(line_num)
+        self._switch_action_view(initial_action, line_num, edit_idx=edit_idx)
 
-
-    def _switch_action_view(self, action_type, line_num):
+    def _switch_action_view(self, action_type, line_num, edit_idx=None):
         if not self.sub_menu or not self.sub_menu.winfo_exists(): return
         menu_w = 340
         menu_h = 400 if action_type in ("Search selected area", "If Variable Condition") else (
@@ -1067,38 +1165,40 @@ class VSCodeQueueViewer(tk.Frame):
                 )
             )
         )
+        if edit_idx is not None:
+            menu_h -= 30
+
         curr_x, curr_y = self.sub_menu.winfo_x(), self.sub_menu.winfo_y()
         self.sub_menu.geometry(f"{menu_w}x{menu_h}+{curr_x}+{curr_y}")
 
         for child in self.action_content_frame.winfo_children(): child.destroy()
 
-        if action_type == "Delay": self._render_delay_view(line_num)
-        elif action_type == "Disclaimer / Warning": self._render_disclaimer_view(line_num)
-        elif action_type == "If Variable Condition": self._render_if_var_view(line_num)
-        elif action_type == "Read Clipboard": self._render_read_clipboard_view(line_num)
-        elif action_type == "Request Input": self._render_request_input_view(line_num)
-        elif action_type == "Type Variable": self._render_type_variable_view(line_num)
-        elif action_type == "Search selected area": self._render_search_area_view(line_num)
-        elif action_type == "Wait Pixel": self._render_wait_pixel_view(line_num)
-        elif action_type == "Label Marker": self._render_label_view(line_num)
-        elif action_type == "Jump to Label": self._render_goto_view(line_num)
+        if action_type == "Delay": self._render_delay_view(line_num, edit_idx=edit_idx)
+        elif action_type == "Disclaimer / Warning": self._render_disclaimer_view(line_num, edit_idx=edit_idx)
+        elif action_type == "If Variable Condition": self._render_if_var_view(line_num, edit_idx=edit_idx)
+        elif action_type == "Read Clipboard": self._render_read_clipboard_view(line_num, edit_idx=edit_idx)
+        elif action_type == "Request Input": self._render_request_input_view(line_num, edit_idx=edit_idx)
+        elif action_type == "Type Variable": self._render_type_variable_view(line_num, edit_idx=edit_idx)
+        elif action_type == "Search selected area": self._render_search_area_view(line_num, edit_idx=edit_idx)
+        elif action_type == "Wait Pixel": self._render_wait_pixel_view(line_num, edit_idx=edit_idx)
+        elif action_type == "Label Marker": self._render_label_view(line_num, edit_idx=edit_idx)
+        elif action_type == "Jump to Label": self._render_goto_view(line_num, edit_idx=edit_idx)
 
 
-    def _render_label_view(self, line_num):
+    def _render_label_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
 
-        # Find existing label identifiers in memory
         existing_labels = {
             a.get("name", "").strip().lower() 
-            for a in self.app.recorded_actions 
-            if a.get("type") == "label"
+            for i, a in enumerate(self.app.recorded_actions) 
+            if a.get("type") == "label" and i != edit_idx
         }
 
-        # Auto-suggest the next available checkpoint name
         default_idx = 1
         while f"checkpoint_{default_idx}".lower() in existing_labels:
             default_idx += 1
-        suggested_name = f"checkpoint_{default_idx}"
+        suggested_name = curr_act.get("name", "") if (curr_act and curr_act.get("type") == "label") else f"checkpoint_{default_idx}"
 
         tk.Label(body, text="Label Identifier (e.g. retry_loop):", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 4))
         
@@ -1128,11 +1228,10 @@ class VSCodeQueueViewer(tk.Frame):
                 lbl_error.config(text="Label name cannot be empty.")
                 return
 
-            # Re-verify against the current active action list
             current_existing = {
                 a.get("name", "").strip().lower() 
-                for a in self.app.recorded_actions 
-                if a.get("type") == "label"
+                for i, a in enumerate(self.app.recorded_actions) 
+                if a.get("type") == "label" and i != edit_idx
             }
 
             if name.lower() in current_existing:
@@ -1143,19 +1242,28 @@ class VSCodeQueueViewer(tk.Frame):
                     play_cue("error")
                 return
 
-            idx = max(0, min(line_num - 1, len(self.app.recorded_actions)))
-            self.app.recorded_actions.insert(idx, {"type": "label", "name": name})
-            self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.update_status(f"Added label '{name}'", COLOR_SUCCESS)
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = {"type": "label", "name": name}
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(edit_idx)
+                self.app.update_status(f"Updated label '{name}'", COLOR_SUCCESS)
+            else:
+                idx = max(0, min(line_num - 1, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(idx, {"type": "label", "name": name})
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.update_status(f"Added label '{name}'", COLOR_SUCCESS)
             self.close_sub_menu()
 
         name_entry.bind("<Return>", lambda e: submit())
-        ModernButton(body, text="Add Label Marker", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Label Marker"
+        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
-    def _render_goto_view(self, line_num):
+
+    def _render_goto_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
+        init_target = curr_act.get("target", "") if (curr_act and curr_act.get("type") == "goto") else ""
 
-        # Find all currently existing labels to populate the jump targets
         available_labels = [
             a.get("name", "").strip() 
             for a in self.app.recorded_actions 
@@ -1163,9 +1271,12 @@ class VSCodeQueueViewer(tk.Frame):
         ]
 
         tk.Label(body, text="Target Label to Jump To:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 4))
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Jump Instruction"
+        btn_col = COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT
+        btn_hov = "#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV
 
         if available_labels:
-            selected_var = tk.StringVar(value=available_labels[0])
+            selected_var = tk.StringVar(value=init_target if init_target in available_labels else available_labels[0])
             lbl_menu = tk.OptionMenu(body, selected_var, *available_labels)
             lbl_menu.config(
                 bg=BG_INPUT, fg=SYNTAX_PURPLE, activebackground=BG_HOVER,
@@ -1178,12 +1289,18 @@ class VSCodeQueueViewer(tk.Frame):
             def submit():
                 target = selected_var.get().strip()
                 if not target: return
-                idx = max(0, min(line_num - 1, len(self.app.recorded_actions)))
-                self.app.recorded_actions.insert(idx, {"type": "goto", "target": target})
-                self.app.display_actions_in_queue(self.app.recorded_actions)
+                if edit_idx is not None:
+                    self.app.recorded_actions[edit_idx] = {"type": "goto", "target": target}
+                    self.app.display_actions_in_queue(self.app.recorded_actions)
+                    self.app.set_active_action_index(edit_idx)
+                    self.app.update_status(f"Updated Jump to '{target}'", COLOR_SUCCESS)
+                else:
+                    idx = max(0, min(line_num - 1, len(self.app.recorded_actions)))
+                    self.app.recorded_actions.insert(idx, {"type": "goto", "target": target})
+                    self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.close_sub_menu()
 
-            ModernButton(body, text="Add Jump Instruction", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+            ModernButton(body, text=btn_txt, bg_color=btn_col, hover_color=btn_hov, command=submit).pack(fill=tk.X)
         else:
             target_entry = tk.Entry(
                 body, bg=BG_INPUT, fg=SYNTAX_PURPLE,
@@ -1191,7 +1308,7 @@ class VSCodeQueueViewer(tk.Frame):
                 bd=0, highlightbackground=BG_BORDER, highlightthickness=1
             )
             target_entry.pack(fill=tk.X, ipady=3, pady=(0, 4))
-            target_entry.insert(0, "checkpoint_1")
+            target_entry.insert(0, init_target or "checkpoint_1")
             target_entry.focus_set()
 
             lbl_note = tk.Label(body, text="// Note: No labels created in queue yet", font=("Segoe UI", 8), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w")
@@ -1200,32 +1317,40 @@ class VSCodeQueueViewer(tk.Frame):
             def submit():
                 target = target_entry.get().strip()
                 if not target: return
-                idx = max(0, min(line_num - 1, len(self.app.recorded_actions)))
-                self.app.recorded_actions.insert(idx, {"type": "goto", "target": target})
-                self.app.display_actions_in_queue(self.app.recorded_actions)
+                if edit_idx is not None:
+                    self.app.recorded_actions[edit_idx] = {"type": "goto", "target": target}
+                    self.app.display_actions_in_queue(self.app.recorded_actions)
+                    self.app.set_active_action_index(edit_idx)
+                else:
+                    idx = max(0, min(line_num - 1, len(self.app.recorded_actions)))
+                    self.app.recorded_actions.insert(idx, {"type": "goto", "target": target})
+                    self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.close_sub_menu()
 
             target_entry.bind("<Return>", lambda e: submit())
-            ModernButton(body, text="Add Jump Instruction", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
-    
-    def _render_wait_pixel_view(self, line_num):
+            ModernButton(body, text=btn_txt, bg_color=btn_col, hover_color=btn_hov, command=submit).pack(fill=tk.X)
+
+
+    def _render_wait_pixel_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
+
         coords_row = tk.Frame(body, bg=BG_PANEL)
         coords_row.pack(fill=tk.X, pady=(0, 6))
 
         tk.Label(coords_row, text="X:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT)
         x_entry = tk.Entry(coords_row, width=6, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        x_entry.insert(0, "0")
+        x_entry.insert(0, str(curr_act.get("x", 0)) if (curr_act and curr_act.get("type") == "wait_pixel") else "0")
         x_entry.pack(side=tk.LEFT, padx=(2, 6))
 
         tk.Label(coords_row, text="Y:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT)
         y_entry = tk.Entry(coords_row, width=6, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        y_entry.insert(0, "0")
+        y_entry.insert(0, str(curr_act.get("y", 0)) if (curr_act and curr_act.get("type") == "wait_pixel") else "0")
         y_entry.pack(side=tk.LEFT, padx=(2, 6))
 
         tk.Label(coords_row, text="Color:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT)
         col_entry = tk.Entry(coords_row, width=9, bg=BG_INPUT, fg=SYNTAX_GREEN, font=("Consolas", 9, "bold"), bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        col_entry.insert(0, "#FFFFFF")
+        col_entry.insert(0, str(curr_act.get("color", "#FFFFFF")).upper() if (curr_act and curr_act.get("type") == "wait_pixel") else "#FFFFFF")
         col_entry.pack(side=tk.LEFT, padx=(2, 0))
 
         def on_pixel_sampled(sx, sy, hex_color):
@@ -1240,11 +1365,12 @@ class VSCodeQueueViewer(tk.Frame):
         btn_inspect = ModernButton(body, text="⌖ Inspect Desktop Pixel", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=trigger_inspect)
         btn_inspect.pack(fill=tk.X, pady=(0, 8))
 
-        pos_var = tk.StringVar(value=f"Before Line {line_num}")
-        pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-        pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-        pos_menu.pack(fill=tk.X, pady=(0, 8))
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(0, 8))
 
         def submit_wait_pixel():
             try:
@@ -1256,26 +1382,38 @@ class VSCodeQueueViewer(tk.Frame):
                 col_entry.config(highlightbackground=COLOR_DANGER)
                 return
 
-            is_after = "After" in pos_var.get()
-            insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
-            insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx].update({
+                    "type": "wait_pixel", "x": px, "y": py, "color": color, "timeout": 15.0
+                })
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(edit_idx)
+                self.app.update_status("Updated Wait Pixel", COLOR_SUCCESS)
+            else:
+                is_after = "After" in pos_var.get()
+                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
 
-            self.app.recorded_actions.insert(insert_idx, {
-                "type": "wait_pixel", "x": px, "y": py, "color": color, "timeout": 15.0
-            })
-            self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.set_active_action_index(insert_idx)
+                self.app.recorded_actions.insert(insert_idx, {
+                    "type": "wait_pixel", "x": px, "y": py, "color": color, "timeout": 15.0
+                })
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(insert_idx)
             self.close_sub_menu()
 
-        ModernButton(body, text="Add Wait Pixel", bg_color=COLOR_SUCCESS, hover_color="#1d8a4b", command=submit_wait_pixel).pack(fill=tk.X)
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Wait Pixel"
+        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS, hover_color="#1d8a4b", command=submit_wait_pixel).pack(fill=tk.X)
 
-    def _render_read_clipboard_view(self, line_num):
+
+    def _render_read_clipboard_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
 
         tk.Label(body, text="Keywords to find (comma separated):", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         kw_entry = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         kw_entry.pack(fill=tk.X, ipady=2, pady=(0, 6))
-        kw_entry.insert(0, "Please Scrap, Please Return")
+        init_kws = ", ".join(curr_act.get("keywords", [])) if (curr_act and curr_act.get("type") == "read_clipboard") else "Please Scrap, Please Return"
+        kw_entry.insert(0, init_kws)
 
         var_row = tk.Frame(body, bg=BG_PANEL)
         var_row.pack(fill=tk.X, pady=(0, 6))
@@ -1285,20 +1423,21 @@ class VSCodeQueueViewer(tk.Frame):
         tk.Label(v_left, text="Variable Name:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         var_entry = tk.Entry(v_left, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         var_entry.pack(fill=tk.X, ipady=2)
-        var_entry.insert(0, "status")
+        var_entry.insert(0, curr_act.get("var_name", "status") if (curr_act and curr_act.get("type") == "read_clipboard") else "status")
 
         v_right = tk.Frame(var_row, bg=BG_PANEL)
         v_right.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
         tk.Label(v_right, text="Value if Matched:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         val_entry = tk.Entry(v_right, bg=BG_INPUT, fg=SYNTAX_GREEN, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         val_entry.pack(fill=tk.X, ipady=2)
-        val_entry.insert(0, "RTS")
+        val_entry.insert(0, curr_act.get("value", "RTS") if (curr_act and curr_act.get("type") == "read_clipboard") else "RTS")
 
-        pos_var = tk.StringVar(value=f"Before Line {line_num}")
-        pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-        pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-        pos_menu.pack(fill=tk.X, pady=(4, 10))
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(4, 10))
 
         def submit():
             raw_kws = [k.strip() for k in kw_entry.get().split(",") if k.strip()]
@@ -1308,60 +1447,86 @@ class VSCodeQueueViewer(tk.Frame):
             if not raw_kws or not v_name:
                 return
 
-            is_after = "After" in pos_var.get()
-            insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
-            insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = {
+                    "type": "read_clipboard",
+                    "keywords": raw_kws,
+                    "var_name": v_name,
+                    "value": v_val
+                }
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(edit_idx)
+                self.app.update_status(f"Updated Clipboard Check for '{v_name}'", COLOR_SUCCESS)
+            else:
+                is_after = "After" in pos_var.get()
+                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
 
-            self.app.recorded_actions.insert(insert_idx, {
-                "type": "read_clipboard",
-                "keywords": raw_kws,
-                "var_name": v_name,
-                "value": v_val
-            })
-            self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.update_status(f"Added Clipboard Check for '{v_name}'", COLOR_SUCCESS)
+                self.app.recorded_actions.insert(insert_idx, {
+                    "type": "read_clipboard",
+                    "keywords": raw_kws,
+                    "var_name": v_name,
+                    "value": v_val
+                })
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.update_status(f"Added Clipboard Check for '{v_name}'", COLOR_SUCCESS)
             self.close_sub_menu()
 
-        ModernButton(body, text="Add Clipboard Search", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Clipboard Search"
+        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
-    def _render_type_variable_view(self, line_num):
+
+    def _render_type_variable_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
 
         tk.Label(body, text="Variable Name to Type:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         var_entry = tk.Entry(body, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 10, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         var_entry.pack(fill=tk.X, ipady=3, pady=(0, 8))
-        var_entry.insert(0, "status")
+        var_entry.insert(0, curr_act.get("var_name", "status") if (curr_act and curr_act.get("type") == "type_variable") else "status")
         var_entry.focus_set()
 
-        pos_var = tk.StringVar(value=f"Before Line {line_num}")
-        pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-        pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-        pos_menu.pack(fill=tk.X, pady=(0, 10))
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(0, 10))
 
         def submit():
             v_name = var_entry.get().strip()
             if not v_name: return
 
-            is_after = "After" in pos_var.get()
-            insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
-            insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = {
+                    "type": "type_variable",
+                    "var_name": v_name
+                }
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(edit_idx)
+                self.app.update_status(f"Updated Type Variable '{v_name}'", COLOR_SUCCESS)
+            else:
+                is_after = "After" in pos_var.get()
+                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
 
-            self.app.recorded_actions.insert(insert_idx, {
-                "type": "type_variable",
-                "var_name": v_name
-            })
-            self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.update_status(f"Added Type Variable '{v_name}'", COLOR_SUCCESS)
+                self.app.recorded_actions.insert(insert_idx, {
+                    "type": "type_variable",
+                    "var_name": v_name
+                })
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.update_status(f"Added Type Variable '{v_name}'", COLOR_SUCCESS)
             self.close_sub_menu()
 
         var_entry.bind("<Return>", lambda e: submit())
-        ModernButton(body, text="Add Type Variable", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Type Variable"
+        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
-    def _render_if_var_view(self, line_num):
+
+    def _render_if_var_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
 
-        # Condition Row: Var name + Operator
         cond_row = tk.Frame(body, bg=BG_PANEL)
         cond_row.pack(fill=tk.X, pady=(0, 4))
 
@@ -1370,12 +1535,12 @@ class VSCodeQueueViewer(tk.Frame):
         tk.Label(v_left, text="Variable:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         var_entry = tk.Entry(v_left, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         var_entry.pack(fill=tk.X, ipady=2)
-        var_entry.insert(0, "status")
+        var_entry.insert(0, curr_act.get("var_name", "status") if (curr_act and curr_act.get("type") == "if_var") else "status")
 
         v_mid = tk.Frame(cond_row, bg=BG_PANEL)
         v_mid.pack(side=tk.LEFT, padx=2)
         tk.Label(v_mid, text="Condition:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        op_var = tk.StringVar(value="==")
+        op_var = tk.StringVar(value=curr_act.get("op", "==") if (curr_act and curr_act.get("type") == "if_var") else "==")
         op_menu = tk.OptionMenu(v_mid, op_var, "==", "!=", "contains", "not empty")
         op_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
         op_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
@@ -1386,22 +1551,26 @@ class VSCodeQueueViewer(tk.Frame):
         tk.Label(v_right, text="Match Value:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         val_entry = tk.Entry(v_right, bg=BG_INPUT, fg=SYNTAX_GREEN, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         val_entry.pack(fill=tk.X, ipady=2)
-        val_entry.insert(0, "RTS")
+        val_entry.insert(0, curr_act.get("val", "RTS") if (curr_act and curr_act.get("type") == "if_var") else "RTS")
 
-        # Action Selector
         tk.Label(body, text="If Condition is Met, Perform Action:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(6, 2))
 
-        action_mode_var = tk.StringVar(value="Switch to Preset")
+        init_tgt_type = curr_act.get("target_type", "preset") if (curr_act and curr_act.get("type") == "if_var") else "preset"
+        init_mode = "Jump to Label" if init_tgt_type == "label" else ("Browse & Run File" if init_tgt_type == "file" else "Switch to Preset")
+
+        action_mode_var = tk.StringVar(value=init_mode)
         mode_menu = tk.OptionMenu(body, action_mode_var, "Switch to Preset", "Browse & Run File", "Jump to Label", command=lambda m: render_target_input(m))
         mode_menu.config(bg=BG_INPUT, fg=SYNTAX_BLUE, font=("Segoe UI", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
         mode_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
         mode_menu.pack(fill=tk.X, pady=(0, 6))
 
-        # Dynamic Target Input Area
         target_container = tk.Frame(body, bg=BG_PANEL)
         target_container.pack(fill=tk.X, pady=(0, 6))
 
-        target_state = {"type": "preset", "target": ""}
+        target_state = {
+            "type": init_tgt_type, 
+            "target": curr_act.get("target", "") if (curr_act and curr_act.get("type") == "if_var") else ""
+        }
 
         def render_target_input(mode):
             for child in target_container.winfo_children():
@@ -1410,8 +1579,9 @@ class VSCodeQueueViewer(tk.Frame):
             if mode == "Switch to Preset":
                 target_state["type"] = "preset"
                 presets = self.app.get_preset_names()
-                p_var = tk.StringVar(value=presets[0] if presets else "-- No Presets Found --")
-                target_state["target"] = p_var.get()
+                curr_target = target_state["target"] if target_state["target"] in presets else (presets[0] if presets else "-- No Presets Found --")
+                p_var = tk.StringVar(value=curr_target)
+                target_state["target"] = curr_target
 
                 def on_p_select(val): target_state["target"] = val
                 p_menu = tk.OptionMenu(target_container, p_var, *(presets if presets else ["-- No Presets Found --"]), command=on_p_select)
@@ -1424,7 +1594,8 @@ class VSCodeQueueViewer(tk.Frame):
                 f_row = tk.Frame(target_container, bg=BG_PANEL)
                 f_row.pack(fill=tk.X)
 
-                lbl_file = tk.Label(f_row, text="Select macro file...", font=("Consolas", 8), bg=BG_INPUT, fg=TEXT_MUTED, anchor="w", padx=6, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
+                file_display = os.path.basename(target_state["target"]) if target_state["target"] else "Select macro file..."
+                lbl_file = tk.Label(f_row, text=file_display, font=("Consolas", 8), bg=BG_INPUT, fg=SYNTAX_GREEN if target_state["target"] else TEXT_MUTED, anchor="w", padx=6, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
                 lbl_file.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
                 def browse_file():
@@ -1448,8 +1619,9 @@ class VSCodeQueueViewer(tk.Frame):
                 target_state["type"] = "label"
                 labels = [a.get("name", "").strip() for a in self.app.recorded_actions if a.get("type") == "label" and a.get("name")]
                 if labels:
-                    l_var = tk.StringVar(value=labels[0])
-                    target_state["target"] = labels[0]
+                    curr_lbl = target_state["target"] if target_state["target"] in labels else labels[0]
+                    l_var = tk.StringVar(value=curr_lbl)
+                    target_state["target"] = curr_lbl
                     def on_l_select(val): target_state["target"] = val
                     l_menu = tk.OptionMenu(target_container, l_var, *labels, command=on_l_select)
                     l_menu.config(bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
@@ -1457,19 +1629,20 @@ class VSCodeQueueViewer(tk.Frame):
                     l_menu.pack(fill=tk.X)
                 else:
                     l_entry = tk.Entry(target_container, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-                    l_entry.insert(0, "checkpoint_1")
+                    l_entry.insert(0, target_state["target"] or "checkpoint_1")
                     l_entry.pack(fill=tk.X, ipady=3)
                     def update_tgt(e=None): target_state["target"] = l_entry.get().strip()
                     l_entry.bind("<KeyRelease>", update_tgt)
-                    target_state["target"] = "checkpoint_1"
+                    target_state["target"] = target_state["target"] or "checkpoint_1"
 
-        render_target_input("Switch to Preset")
+        render_target_input(init_mode)
 
-        pos_var = tk.StringVar(value=f"Before Line {line_num}")
-        pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-        pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-        pos_menu.pack(fill=tk.X, pady=(2, 8))
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(2, 8))
 
         def submit():
             v_name = var_entry.get().strip()
@@ -1481,31 +1654,47 @@ class VSCodeQueueViewer(tk.Frame):
             if not v_name or not t_val or t_val == "-- No Presets Found --":
                 return
 
-            is_after = "After" in pos_var.get()
-            insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
-            insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = {
+                    "type": "if_var",
+                    "var_name": v_name,
+                    "op": op,
+                    "val": val,
+                    "target_type": t_type,
+                    "target": t_val
+                }
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(edit_idx)
+                self.app.update_status(f"Updated Branch for '{v_name}'", COLOR_SUCCESS)
+            else:
+                is_after = "After" in pos_var.get()
+                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
 
-            self.app.recorded_actions.insert(insert_idx, {
-                "type": "if_var",
-                "var_name": v_name,
-                "op": op,
-                "val": val,
-                "target_type": t_type,
-                "target": t_val
-            })
-            self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.update_status(f"Added Conditional Branch for '{v_name}'", COLOR_SUCCESS)
+                self.app.recorded_actions.insert(insert_idx, {
+                    "type": "if_var",
+                    "var_name": v_name,
+                    "op": op,
+                    "val": val,
+                    "target_type": t_type,
+                    "target": t_val
+                })
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.update_status(f"Added Conditional Branch for '{v_name}'", COLOR_SUCCESS)
             self.close_sub_menu()
 
-        ModernButton(body, text="Add Conditional Branch", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Conditional Branch"
+        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
-    def _render_request_input_view(self, line_num):
+
+    def _render_request_input_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
 
         tk.Label(body, text="Prompt Message for User:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         prompt_entry = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         prompt_entry.pack(fill=tk.X, ipady=2, pady=(0, 6))
-        prompt_entry.insert(0, "Enter value:")
+        prompt_entry.insert(0, curr_act.get("prompt", "Enter value:") if (curr_act and curr_act.get("type") == "prompt_input") else "Enter value:")
         prompt_entry.focus_set()
 
         var_row = tk.Frame(body, bg=BG_PANEL)
@@ -1516,93 +1705,124 @@ class VSCodeQueueViewer(tk.Frame):
         tk.Label(v_left, text="Save to Variable:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         var_entry = tk.Entry(v_left, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         var_entry.pack(fill=tk.X, ipady=2)
-        var_entry.insert(0, "user_data")
+        var_entry.insert(0, curr_act.get("var_name", "user_data") if (curr_act and curr_act.get("type") == "prompt_input") else "user_data")
 
         v_right = tk.Frame(var_row, bg=BG_PANEL)
         v_right.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
         tk.Label(v_right, text="Default (Optional):", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         def_entry = tk.Entry(v_right, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         def_entry.pack(fill=tk.X, ipady=2)
+        def_entry.insert(0, curr_act.get("default", "") if (curr_act and curr_act.get("type") == "prompt_input") else "")
 
-        pos_var = tk.StringVar(value=f"Before Line {line_num}")
-        pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-        pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-        pos_menu.pack(fill=tk.X, pady=(4, 8))
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(4, 8))
 
         def submit():
             p_text = prompt_entry.get().strip() or "Enter value:"
             v_name = var_entry.get().strip() or "user_data"
             d_val = def_entry.get()
 
-            is_after = "After" in pos_var.get()
-            insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
-            insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = {
+                    "type": "prompt_input",
+                    "prompt": p_text,
+                    "var_name": v_name,
+                    "default": d_val
+                }
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(edit_idx)
+                self.app.update_status(f"Updated Input for '{v_name}'", COLOR_SUCCESS)
+            else:
+                is_after = "After" in pos_var.get()
+                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
 
-            self.app.recorded_actions.insert(insert_idx, {
-                "type": "prompt_input",
-                "prompt": p_text,
-                "var_name": v_name,
-                "default": d_val
-            })
-            self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.update_status(f"Added Request Input for '{v_name}'", COLOR_SUCCESS)
+                self.app.recorded_actions.insert(insert_idx, {
+                    "type": "prompt_input",
+                    "prompt": p_text,
+                    "var_name": v_name,
+                    "default": d_val
+                })
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.update_status(f"Added Request Input for '{v_name}'", COLOR_SUCCESS)
             self.close_sub_menu()
 
         prompt_entry.bind("<Return>", lambda e: submit())
         var_entry.bind("<Return>", lambda e: submit())
-        ModernButton(body, text="Add Request Input", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Request Input"
+        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
-    def _render_disclaimer_view(self, line_num):
+
+    def _render_disclaimer_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
 
         tk.Label(body, text="Warning Title:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         title_entry = tk.Entry(body, bg=BG_INPUT, fg=SYNTAX_ORANGE, font=("Segoe UI", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         title_entry.pack(fill=tk.X, ipady=2, pady=(0, 6))
-        title_entry.insert(0, "Disclaimer Note")
+        title_entry.insert(0, curr_act.get("title", "Disclaimer Note") if (curr_act and curr_act.get("type") == "disclaimer") else "Disclaimer Note")
         title_entry.focus_set()
 
         tk.Label(body, text="Disclaimer / Warning Message:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         msg_text = tk.Text(body, height=4, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1, wrap="word")
         msg_text.pack(fill=tk.X, pady=(0, 6))
-        msg_text.insert("1.0", "Please make sure your target window is open, focused, and scaled to 100% before proceeding.")
+        init_msg = curr_act.get("message", "Please make sure your target window is open, focused, and scaled to 100% before proceeding.") if (curr_act and curr_act.get("type") == "disclaimer") else "Please make sure your target window is open, focused, and scaled to 100% before proceeding."
+        msg_text.insert("1.0", init_msg)
 
-        pos_var = tk.StringVar(value=f"Before Line {line_num}")
-        pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-        pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-        pos_menu.pack(fill=tk.X, pady=(2, 8))
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(2, 8))
 
         def submit():
             t_title = title_entry.get().strip() or "Disclaimer Note"
             t_msg = msg_text.get("1.0", "end").strip() or "Proceed with execution?"
 
-            is_after = "After" in pos_var.get()
-            insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
-            insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = {
+                    "type": "disclaimer",
+                    "title": t_title,
+                    "message": t_msg
+                }
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(edit_idx)
+                self.app.update_status("Updated Disclaimer Warning", COLOR_SUCCESS)
+            else:
+                is_after = "After" in pos_var.get()
+                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
 
-            self.app.recorded_actions.insert(insert_idx, {
-                "type": "disclaimer",
-                "title": t_title,
-                "message": t_msg
-            })
-            self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.update_status(f"Added Disclaimer Warning", COLOR_SUCCESS)
+                self.app.recorded_actions.insert(insert_idx, {
+                    "type": "disclaimer",
+                    "title": t_title,
+                    "message": t_msg
+                })
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.update_status("Added Disclaimer Warning", COLOR_SUCCESS)
             self.close_sub_menu()
 
-        ModernButton(body, text="Add Disclaimer Note", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
-
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Disclaimer Note"
+        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
     
-    def _render_delay_view(self, line_num):
+    def _render_delay_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
+
         tk.Label(body, text="Delay Duration (seconds):", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 4))
 
         input_frame = tk.Frame(body, bg=BG_PANEL)
         input_frame.pack(fill=tk.X, pady=(0, 6))
 
         delay_entry = tk.Entry(input_frame, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 10, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1, justify="center")
-        delay_entry.insert(0, "1.00")
+        init_sec = f"{float(curr_act.get('seconds', 1.0)):.2f}" if (curr_act and curr_act.get("type") == "delay") else "1.00"
+        delay_entry.insert(0, init_sec)
         delay_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
         delay_entry.focus_set()
         delay_entry.select_range(0, "end")
@@ -1619,13 +1839,14 @@ class VSCodeQueueViewer(tk.Frame):
             lbl.pack(side=tk.LEFT, padx=(0, 4))
             lbl.bind("<Button-1>", lambda e, s=sec: set_chip(s))
 
-        pos_frame = tk.Frame(body, bg=BG_PANEL)
-        pos_frame.pack(fill=tk.X, pady=(0, 10))
-        pos_var = tk.StringVar(value=f"Before Line {line_num}")
-        pos_menu = tk.OptionMenu(pos_frame, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-        pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-        pos_menu.pack(fill=tk.X)
+        if edit_idx is None:
+            pos_frame = tk.Frame(body, bg=BG_PANEL)
+            pos_frame.pack(fill=tk.X, pady=(0, 10))
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(pos_frame, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X)
 
         def submit_delay(event=None):
             try:
@@ -1635,18 +1856,29 @@ class VSCodeQueueViewer(tk.Frame):
                 delay_entry.config(highlightbackground=COLOR_DANGER)
                 return
 
-            is_after = "After" in pos_var.get()
-            insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
-            insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
-            self.app.insert_delay_action(insert_idx, round(sec_val, 2))
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = {"type": "delay", "seconds": round(sec_val, 2)}
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(edit_idx)
+                self.app.update_status(f"Updated Delay #{edit_idx + 1}", COLOR_SUCCESS)
+            else:
+                is_after = "After" in pos_var.get()
+                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
+                self.app.insert_delay_action(insert_idx, round(sec_val, 2))
             self.close_sub_menu()
 
         delay_entry.bind("<Return>", submit_delay)
-        ModernButton(body, text="Add Delay", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit_delay).pack(fill=tk.X)
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Delay"
+        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit_delay).pack(fill=tk.X)
 
-    def _render_search_area_view(self, line_num):
+
+    def _render_search_area_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
-        match_any_state = {"val": False}
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
+
+        init_match_any = bool(curr_act.get("match_any", False)) if (curr_act and curr_act.get("type") == "search_area") else False
+        match_any_state = {"val": init_match_any}
 
         any_row = tk.Frame(body, bg=BG_PANEL)
         any_row.pack(fill=tk.X, pady=(0, 6))
@@ -1662,19 +1894,28 @@ class VSCodeQueueViewer(tk.Frame):
                 text_entry.config(state="normal")
                 text_entry.delete(0, "end")
 
-        any_toggle = ModernPillToggle(any_row, initial_state=False, command=toggle_match_any)
+        any_toggle = ModernPillToggle(any_row, initial_state=init_match_any, command=toggle_match_any)
         any_toggle.pack(side=tk.RIGHT)
 
         tk.Label(body, text="Target Text:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         text_entry = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         text_entry.pack(fill=tk.X, ipady=3, pady=(0, 8))
-        text_entry.focus_set()
 
-        selected_box = {"area": None}
+        init_text = curr_act.get("text", "") if (curr_act and curr_act.get("type") == "search_area") else ""
+        if init_match_any:
+            text_entry.insert(0, "<ANY TEXT DETECTED>")
+            text_entry.config(state="disabled", disabledforeground=SYNTAX_PURPLE)
+        else:
+            text_entry.insert(0, init_text)
+            text_entry.focus_set()
+
+        init_area = curr_act.get("area") if (curr_act and curr_act.get("type") == "search_area") else None
+        selected_box = {"area": init_area}
         area_row = tk.Frame(body, bg=BG_PANEL)
         area_row.pack(fill=tk.X, pady=(0, 8))
 
-        lbl_area_status = tk.Label(area_row, text="Area: None", font=("Consolas", 8), bg=BG_INPUT, fg=TEXT_MUTED, padx=6, pady=3, highlightbackground=BG_BORDER, highlightthickness=1, anchor="w")
+        area_lbl_text = f"[{init_area[0]},{init_area[1]} {init_area[2]}x{init_area[3]}]" if init_area else "Area: None"
+        lbl_area_status = tk.Label(area_row, text=area_lbl_text, font=("Consolas", 8), bg=BG_INPUT, fg=SYNTAX_BLUE if init_area else TEXT_MUTED, padx=6, pady=3, highlightbackground=BG_BORDER, highlightthickness=1, anchor="w")
         lbl_area_status.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
         def on_area_snip_completed(area):
@@ -1692,18 +1933,21 @@ class VSCodeQueueViewer(tk.Frame):
 
         tk.Label(body, text="If Found, Stop & Run Preset:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         preset_names = self.app.get_preset_names()
-        preset_var = tk.StringVar(value=preset_names[0] if preset_names else "-- No Presets Found --")
+        init_preset = curr_act.get("preset", "") if (curr_act and curr_act.get("type") == "search_area") else ""
+        chosen_preset = init_preset if init_preset in preset_names else (preset_names[0] if preset_names else "-- No Presets Found --")
+        preset_var = tk.StringVar(value=chosen_preset)
 
         opt_preset = tk.OptionMenu(body, preset_var, *(preset_names if preset_names else ["-- No Presets Found --"]))
         opt_preset.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
         opt_preset["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         opt_preset.pack(fill=tk.X, pady=(0, 8))
 
-        pos_var = tk.StringVar(value=f"Before Line {line_num}")
-        pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-        pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-        pos_menu.pack(fill=tk.X, pady=(0, 10))
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(0, 10))
 
         def submit_search_area(event=None):
             is_match_any = match_any_state["val"]
@@ -1717,15 +1961,30 @@ class VSCodeQueueViewer(tk.Frame):
             target_preset = preset_var.get()
             if target_preset == "-- No Presets Found --": return
 
-            is_after = "After" in pos_var.get()
-            insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
-            insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = {
+                    "type": "search_area",
+                    "text": "*" if is_match_any else search_str,
+                    "area": [int(v) for v in selected_box["area"]],
+                    "preset": str(target_preset),
+                    "match_any": bool(is_match_any)
+                }
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(edit_idx)
+                desc = "Any Text" if is_match_any else f"'{search_str}'"
+                self.app.update_status(f"Updated Area Search: {desc}", COLOR_SUCCESS)
+            else:
+                is_after = "After" in pos_var.get()
+                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
 
-            self.app.insert_search_area_action(insert_idx, "*" if is_match_any else search_str, selected_box["area"], target_preset, match_any=is_match_any)
+                self.app.insert_search_area_action(insert_idx, "*" if is_match_any else search_str, selected_box["area"], target_preset, match_any=is_match_any)
             self.close_sub_menu()
 
         text_entry.bind("<Return>", submit_search_area)
-        ModernButton(body, text="Add Search Action", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit_search_area).pack(fill=tk.X)
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Search Action"
+        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit_search_area).pack(fill=tk.X)
+
 
     def close_sub_menu(self):
         if self.sub_menu:
@@ -1781,8 +2040,10 @@ class ModernButton(tk.Frame):
         super().__init__(parent, bg=bg_color, cursor="hand2", **kwargs)
         self.bg_color = bg_color
         self.hover_color = hover_color
+        self.current_color = bg_color
         self.command = command
         self.disabled = False
+        self._fade_job = None
 
         self.label = tk.Label(self, text=text, bg=bg_color, fg=TEXT_PRIMARY, font=("Segoe UI", 10, "bold"), cursor="hand2")
         self.label.pack(expand=True, fill=tk.BOTH, padx=16, pady=9)
@@ -1792,15 +2053,61 @@ class ModernButton(tk.Frame):
             widget.bind("<Leave>", self.on_leave)
             widget.bind("<Button-1>", self.on_click)
 
+            
     def on_hover(self, event):
         if not self.disabled:
-            self.configure(bg=self.hover_color)
-            self.label.configure(bg=self.hover_color)
-
+            if getattr(BuiltInMacroApp, 'entertain_mode', True):
+                self._fade_to(self.hover_color)
+            else:
+                self.configure(bg=self.hover_color)
+                self.label.configure(bg=self.hover_color)
+                self.current_color = self.hover_color
+    
     def on_leave(self, event):
         if not self.disabled:
-            self.configure(bg=self.bg_color)
-            self.label.configure(bg=self.bg_color)
+            if getattr(BuiltInMacroApp, 'entertain_mode', True):
+                self._fade_to(self.bg_color)
+            else:
+                self.configure(bg=self.bg_color)
+                self.label.configure(bg=self.bg_color)
+                self.current_color = self.bg_color
+    
+    def _fade_to(self, target_hex, step=1, total_steps=5):
+        if self._fade_job:
+            try:
+                self.after_cancel(self._fade_job)
+            except Exception:
+                pass
+            self._fade_job = None
+
+        if self.disabled:
+            return
+
+        def _hex_to_rgb(h):
+            h = h.lstrip("#")
+            return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+        try:
+            r1, g1, b1 = _hex_to_rgb(self.current_color)
+            r2, g2, b2 = _hex_to_rgb(target_hex)
+            t = step / total_steps
+            rn = int(r1 + (r2 - r1) * t)
+            gn = int(g1 + (g2 - g1) * t)
+            bn = int(b1 + (b2 - b1) * t)
+            interpolated = f"#{rn:02x}{gn:02x}{bn:02x}"
+        except Exception:
+            interpolated = target_hex
+
+        self.configure(bg=interpolated)
+        self.label.configure(bg=interpolated)
+        self.current_color = interpolated
+
+        if step < total_steps:
+            self._fade_job = self.after(14, lambda: self._fade_to(target_hex, step + 1, total_steps))
+        else:
+            self.current_color = target_hex
+            self.configure(bg=target_hex)
+            self.label.configure(bg=target_hex)
 
     def on_click(self, event):
         if not self.disabled and self.command:
@@ -1823,37 +2130,79 @@ class ModernPillToggle(tk.Canvas):
     def __init__(self, parent, initial_state=True, command=None, width=44, height=22, **kwargs):
         super().__init__(parent, width=width, height=height, bg=BG_PANEL, highlightthickness=0, cursor="hand2", **kwargs)
         self.state = initial_state
+        self.anim_pos = 1.0 if initial_state else 0.0
+        self._anim_id = None
         self.command = command
         self.w = width
         self.h = height
 
         self.bind("<Button-1>", self.toggle)
         self.draw()
+    
 
     def draw(self):
         self.delete("all")
-        bg_color = COLOR_ACCENT if self.state else BG_BORDER
         
-        r = self.h / 2
+        # Smoothly interpolate track color from BG_BORDER (#383a40) to COLOR_ACCENT (#5865f2)
+        r = int(56 + (88 - 56) * self.anim_pos)
+        g = int(58 + (101 - 58) * self.anim_pos)
+        b = int(64 + (242 - 64) * self.anim_pos)
+        bg_color = f"#{r:02x}{g:02x}{b:02x}"
+        
+        radius = self.h / 2
         self.create_arc(0, 0, self.h, self.h, start=90, extent=180, fill=bg_color, outline=bg_color)
         self.create_arc(self.w - self.h, 0, self.w, self.h, start=-90, extent=180, fill=bg_color, outline=bg_color)
-        self.create_rectangle(r, 0, self.w - r, self.h, fill=bg_color, outline=bg_color)
+        self.create_rectangle(radius, 0, self.w - radius, self.h, fill=bg_color, outline=bg_color)
 
         pad = 3
         knob_size = self.h - (pad * 2)
-        x0 = self.w - pad - knob_size if self.state else pad
+        x_min = pad
+        x_max = self.w - pad - knob_size
+        x0 = x_min + ((x_max - x_min) * self.anim_pos)
         y0 = pad
         x1 = x0 + knob_size
         y1 = y0 + knob_size
 
-        knob_color = "#ffffff" if self.state else TEXT_MUTED
+        # Knob tone transitions from TEXT_MUTED (#949ba4) to crisp white (#ffffff)
+        kr = int(148 + (255 - 148) * self.anim_pos)
+        kg = int(155 + (255 - 155) * self.anim_pos)
+        kb = int(164 + (255 - 164) * self.anim_pos)
+        knob_color = f"#{kr:02x}{kg:02x}{kb:02x}"
+
         self.create_oval(x0, y0, x1, y1, fill=knob_color, outline=knob_color)
+
 
     def toggle(self, event=None):
         self.state = not self.state
-        self.draw()
+        if getattr(BuiltInMacroApp, 'entertain_mode', True):
+            self._animate()
+        else:
+            self.anim_pos = 1.0 if self.state else 0.0
+            self.draw()
         if self.command:
             self.command(self.state)
+
+    def _animate(self):
+        if self._anim_id:
+            try:
+                self.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+
+        target = 1.0 if self.state else 0.0
+        diff = target - self.anim_pos
+
+        if abs(diff) <= 0.04:
+            self.anim_pos = target
+            self.draw()
+            return
+
+        # Ease-out dampening step
+        self.anim_pos += diff * 0.38
+        self.draw()
+        self._anim_id = self.after(14, self._animate)
+
 
 class ModernSlider(tk.Canvas):
     def __init__(self, parent, min_val=1.0, max_val=10.0, step=0.5, initial_val=1.0, command=None, width=180, height=24, **kwargs):
@@ -2248,6 +2597,13 @@ class BuiltInMacroApp:
         self.playback_run_id = 0
         self._playback_ui_pending = False
 
+        # Theme & Entertainment Mode State
+        self.light_mode = False
+        self.entertain_me = True
+        BuiltInMacroApp.entertain_mode = True
+        self._sparkle_particles = []
+        self._sparkle_anim_id = None
+
         # Track mouse movements by default
         self.clicks_and_keys_only = False
         self.natural_timing = False
@@ -2301,7 +2657,7 @@ class BuiltInMacroApp:
         self.setup_resizing_handles()
         Thread(target=self.global_hotkey_listener, daemon=True).start()
 
-
+    
     def set_app_window(self):
         hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
         style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
@@ -2550,24 +2906,20 @@ class BuiltInMacroApp:
 
         self.content_frame = tk.Frame(self.main_container, bg=BG_APP)
         self.content_frame.pack(fill=tk.BOTH, expand=True)
-        self.content_frame.grid_rowconfigure(0, weight=1)
-        self.content_frame.grid_columnconfigure(0, weight=1)
 
+        self.current_tab_name = None
+        self._tab_anim_id = None
+
+        # Clean frames managed exclusively via place geometry
         self.frame_playback = tk.Frame(self.content_frame, bg=BG_APP)
-        self.frame_playback.grid(row=0, column=0, sticky="nsew")
-
         self.frame_sequencer = tk.Frame(self.content_frame, bg=BG_APP)
-        self.frame_sequencer.grid(row=0, column=0, sticky="nsew")
-
         self.frame_settings = tk.Frame(self.content_frame, bg=BG_APP)
-        self.frame_settings.grid(row=0, column=0, sticky="nsew")
 
         self.build_playback_view()
         self.build_sequencer_view()
         self.build_settings_view()
 
         self.overlay = tk.Canvas(self.root, highlightthickness=0, bg=BG_APP)
-        self.overlay.create_rectangle(0, 0, 3000, 3000, fill="black", stipple="gray50")
         self.overlay.bind("<Button-1>", lambda e: self.close_sidebar())
 
         self.sidebar_frame = tk.Frame(self.root, bg=BG_SIDEBAR, width=self.sidebar_width)
@@ -3893,77 +4245,273 @@ try {{
 
         scroll_container = self.settings_scroll.scrollable_frame
 
-        tk.Label(scroll_container, text="Preferences", font=("Segoe UI", 16, "bold"), bg=BG_APP, fg=TEXT_PRIMARY).pack(anchor="w", padx=20, pady=(20, 10))
+        tk.Label(
+            scroll_container, text="Settings & Preferences",
+            font=("Segoe UI", 16, "bold"), bg=BG_APP, fg=TEXT_PRIMARY
+        ).pack(anchor="w", padx=20, pady=(20, 14))
 
-        pref_card = ModernCard(scroll_container, bg_card=BG_PANEL)
-        pref_card.pack(fill=tk.X, padx=20, pady=(0, 10))
-
-        pref_frame = tk.Frame(pref_card, bg=BG_PANEL, padx=20, pady=15)
-        pref_frame.pack(fill=tk.X)
-
-        # Speed Slider
-        speed_row = tk.Frame(pref_frame, bg=BG_PANEL)
-        speed_row.pack(fill=tk.X, pady=(0, 12))
-        tk.Label(speed_row, text="Playback Speed", font=("Segoe UI", 10, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=22, anchor="w").pack(side=tk.LEFT)
-        speed_controls = tk.Frame(speed_row, bg=BG_PANEL)
-        speed_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.speed_slider = ModernSlider(speed_controls, min_val=1.0, max_val=10.0, step=0.5, initial_val=self.playback_speed, command=self.on_speed_slider_change, width=180, height=24)
-        self.speed_slider.pack(side=tk.LEFT, padx=(0, 10))
-        self.speed_lbl = tk.Label(speed_controls, text=f"{self.playback_speed:.1f}x", font=("Consolas", 10, "bold"), bg=BG_INPUT, fg=SYNTAX_BLUE, width=6)
-        self.speed_lbl.pack(side=tk.LEFT)
-
-        # Delay Slider
-        delay_row = tk.Frame(pref_frame, bg=BG_PANEL)
-        delay_row.pack(fill=tk.X, pady=(0, 12))
-        tk.Label(delay_row, text="Action Delay", font=("Segoe UI", 10, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=22, anchor="w").pack(side=tk.LEFT)
-        delay_controls = tk.Frame(delay_row, bg=BG_PANEL)
-        delay_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.delay_slider = ModernSlider(delay_controls, min_val=0.05, max_val=1.5, step=0.05, initial_val=self.action_delay, command=self.on_delay_slider_change, width=180, height=24)
-        self.delay_slider.pack(side=tk.LEFT, padx=(0, 10))
-        self.delay_lbl = tk.Label(delay_controls, text=f"{self.action_delay:.2f}s", font=("Consolas", 10, "bold"), bg=BG_INPUT, fg=SYNTAX_BLUE, width=6)
-        self.delay_lbl.pack(side=tk.LEFT)
-
-        # Toggles Helper
-        def add_setting_toggle(text, initial, callback):
-            r = tk.Frame(pref_frame, bg=BG_PANEL)
+        def add_setting_toggle(container, text, initial, callback):
+            r = tk.Frame(container, bg=BG_PANEL)
             r.pack(fill=tk.X, pady=(0, 10))
-            tk.Label(r, text=text, font=("Segoe UI", 10, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=22, anchor="w").pack(side=tk.LEFT)
+            tk.Label(
+                r, text=text, font=("Segoe UI", 9, "bold"),
+                bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w"
+            ).pack(side=tk.LEFT)
             t = ModernPillToggle(r, initial_state=initial, command=callback)
             t.pack(side=tk.LEFT)
             return t
 
-        self.fluid_toggle = add_setting_toggle("Fluid Mouse Playback", self.fluid_mouse, self.set_fluid_mouse)
-        self.filter_toggle = add_setting_toggle("Clicks & Keys Only", self.clicks_and_keys_only, lambda s: setattr(self, 'clicks_and_keys_only', s))
-        self.bezier_toggle = add_setting_toggle("Human Bézier Curves", self.human_bezier, lambda s: setattr(self, 'human_bezier', s))
-        self.jitter_toggle = add_setting_toggle("Delay Jitter (±15%)", self.delay_jitter, lambda s: setattr(self, 'delay_jitter', s))
-        self.timing_toggle = add_setting_toggle("Natural Timing Mode", self.natural_timing, lambda s: setattr(self, 'natural_timing', s))
-        self.win_rel_toggle = add_setting_toggle("Window Anchoring", self.window_relative, lambda s: setattr(self, 'window_relative', s))
-        self.audio_toggle = add_setting_toggle("Audio Cues (Beeps)", self.audio_cues, lambda s: setattr(self, 'audio_cues', s))
+        # --- SECTION 1: APPEARANCE & UI ---
+        tk.Label(scroll_container, text="APPEARANCE & UI", font=("Segoe UI", 8, "bold"), bg=BG_APP, fg=TEXT_MUTED).pack(anchor="w", padx=22, pady=(0, 4))
+        card_app = ModernCard(scroll_container, bg_card=BG_PANEL)
+        card_app.pack(fill=tk.X, padx=20, pady=(0, 16))
+        f_app = tk.Frame(card_app, bg=BG_PANEL, padx=16, pady=14)
+        f_app.pack(fill=tk.X)
 
-        # Preset Folder
-        folder_row = tk.Frame(pref_frame, bg=BG_PANEL)
-        folder_row.pack(fill=tk.X, pady=(4, 0))
-        tk.Label(folder_row, text="Preset Folder", font=("Segoe UI", 10, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=22, anchor="w").pack(side=tk.LEFT)
+        add_setting_toggle(f_app, "Light Mode Theme", self.light_mode, self.set_light_mode)
+        self.build_entertain_me_toggle(f_app)
+
+        # --- SECTION 2: PLAYBACK & TIMING ---
+        tk.Label(scroll_container, text="PLAYBACK & TIMING", font=("Segoe UI", 8, "bold"), bg=BG_APP, fg=TEXT_MUTED).pack(anchor="w", padx=22, pady=(0, 4))
+        card_timing = ModernCard(scroll_container, bg_card=BG_PANEL)
+        card_timing.pack(fill=tk.X, padx=20, pady=(0, 16))
+        f_timing = tk.Frame(card_timing, bg=BG_PANEL, padx=16, pady=14)
+        f_timing.pack(fill=tk.X)
+
+        # Speed Slider
+        speed_row = tk.Frame(f_timing, bg=BG_PANEL)
+        speed_row.pack(fill=tk.X, pady=(0, 12))
+        tk.Label(speed_row, text="Playback Speed", font=("Segoe UI", 9, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        speed_controls = tk.Frame(speed_row, bg=BG_PANEL)
+        speed_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.speed_slider = ModernSlider(speed_controls, min_val=1.0, max_val=10.0, step=0.5, initial_val=self.playback_speed, command=self.on_speed_slider_change, width=180, height=24)
+        self.speed_slider.pack(side=tk.LEFT, padx=(0, 10))
+        self.speed_lbl = tk.Label(speed_controls, text=f"{self.playback_speed:.1f}x", font=("Consolas", 9, "bold"), bg=BG_INPUT, fg=SYNTAX_BLUE, width=6)
+        self.speed_lbl.pack(side=tk.LEFT)
+
+        # Delay Slider
+        delay_row = tk.Frame(f_timing, bg=BG_PANEL)
+        delay_row.pack(fill=tk.X, pady=(0, 12))
+        tk.Label(delay_row, text="Action Delay", font=("Segoe UI", 9, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        delay_controls = tk.Frame(delay_row, bg=BG_PANEL)
+        delay_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.delay_slider = ModernSlider(delay_controls, min_val=0.05, max_val=1.5, step=0.05, initial_val=self.action_delay, command=self.on_delay_slider_change, width=180, height=24)
+        self.delay_slider.pack(side=tk.LEFT, padx=(0, 10))
+        self.delay_lbl = tk.Label(delay_controls, text=f"{self.action_delay:.2f}s", font=("Consolas", 9, "bold"), bg=BG_INPUT, fg=SYNTAX_BLUE, width=6)
+        self.delay_lbl.pack(side=tk.LEFT)
+
+        self.jitter_toggle = add_setting_toggle(f_timing, "Delay Jitter (±15%)", self.delay_jitter, lambda s: setattr(self, 'delay_jitter', s))
+        self.timing_toggle = add_setting_toggle(f_timing, "Natural Timing Mode", self.natural_timing, lambda s: setattr(self, 'natural_timing', s))
+
+        # --- SECTION 3: MOUSE & INPUT DYNAMICS ---
+        tk.Label(scroll_container, text="MOUSE & INPUT DYNAMICS", font=("Segoe UI", 8, "bold"), bg=BG_APP, fg=TEXT_MUTED).pack(anchor="w", padx=22, pady=(0, 4))
+        card_mouse = ModernCard(scroll_container, bg_card=BG_PANEL)
+        card_mouse.pack(fill=tk.X, padx=20, pady=(0, 16))
+        f_mouse = tk.Frame(card_mouse, bg=BG_PANEL, padx=16, pady=14)
+        f_mouse.pack(fill=tk.X)
+
+        self.fluid_toggle = add_setting_toggle(f_mouse, "Fluid Mouse Playback", self.fluid_mouse, self.set_fluid_mouse)
+        self.bezier_toggle = add_setting_toggle(f_mouse, "Human Bézier Curves", self.human_bezier, lambda s: setattr(self, 'human_bezier', s))
+        self.filter_toggle = add_setting_toggle(f_mouse, "Clicks & Keys Only", self.clicks_and_keys_only, lambda s: setattr(self, 'clicks_and_keys_only', s))
+        self.win_rel_toggle = add_setting_toggle(f_mouse, "Window Anchoring", self.window_relative, lambda s: setattr(self, 'window_relative', s))
+
+        # --- SECTION 4: SYSTEM & WORKSPACE ---
+        tk.Label(scroll_container, text="SYSTEM & WORKSPACE", font=("Segoe UI", 8, "bold"), bg=BG_APP, fg=TEXT_MUTED).pack(anchor="w", padx=22, pady=(0, 4))
+        card_sys = ModernCard(scroll_container, bg_card=BG_PANEL)
+        card_sys.pack(fill=tk.X, padx=20, pady=(0, 16))
+        f_sys = tk.Frame(card_sys, bg=BG_PANEL, padx=16, pady=14)
+        f_sys.pack(fill=tk.X)
+
+        self.audio_toggle = add_setting_toggle(f_sys, "Audio Cues (Beeps)", self.audio_cues, lambda s: setattr(self, 'audio_cues', s))
+
+        folder_row = tk.Frame(f_sys, bg=BG_PANEL)
+        folder_row.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(folder_row, text="Preset Directory", font=("Segoe UI", 9, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
         folder_controls = tk.Frame(folder_row, bg=BG_PANEL)
         folder_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.folder_display = tk.Label(folder_controls, text=self.shorten_path(self.presets_dir), font=("Consolas", 9), bg=BG_INPUT, fg=TEXT_MUTED, anchor="w", padx=8, pady=4, highlightbackground=BG_BORDER, highlightthickness=1)
+        self.folder_display = tk.Label(
+            folder_controls, text=self.shorten_path(self.presets_dir), font=("Consolas", 8),
+            bg=BG_INPUT, fg=TEXT_MUTED, anchor="w", padx=8, pady=4,
+            highlightbackground=BG_BORDER, highlightthickness=1
+        )
         self.folder_display.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        btn_browse = tk.Label(folder_controls, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_PRIMARY, cursor="hand2", padx=10, pady=4)
+        btn_browse = tk.Label(
+            folder_controls, text="Browse", font=("Segoe UI", 8, "bold"),
+            bg=COLOR_ACCENT, fg="#ffffff", cursor="hand2", padx=10, pady=4
+        )
         btn_browse.pack(side=tk.RIGHT)
         btn_browse.bind("<Button-1>", lambda e: self.choose_presets_folder())
 
-        # Hotkeys Section
-        tk.Label(scroll_container, text="Hotkeys", font=("Segoe UI", 16, "bold"), bg=BG_APP, fg=TEXT_PRIMARY).pack(anchor="w", padx=20, pady=(15, 10))
+        # --- SECTION 5: GLOBAL KEYBINDINGS ---
+        tk.Label(scroll_container, text="GLOBAL HOTKEYS", font=("Segoe UI", 8, "bold"), bg=BG_APP, fg=TEXT_MUTED).pack(anchor="w", padx=22, pady=(0, 4))
         keys_card = ModernCard(scroll_container, bg_card=BG_PANEL)
         keys_card.pack(fill=tk.X, padx=20, pady=(0, 20))
-        keys_frame = tk.Frame(keys_card, bg=BG_PANEL, padx=20, pady=20)
+        keys_frame = tk.Frame(keys_card, bg=BG_PANEL, padx=16, pady=14)
         keys_frame.pack(fill=tk.X)
 
         self.create_hotkey_row(keys_frame, "Start Recording", "start_rec")
         self.create_hotkey_row(keys_frame, "Stop Recording", "stop_rec")
         self.create_hotkey_row(keys_frame, "Start Playback", "start_play")
         self.create_hotkey_row(keys_frame, "Stop Playback", "stop_play")
-    
+
+
+    def build_entertain_me_toggle(self, parent):
+        row = tk.Frame(parent, bg=BG_PANEL)
+        row.pack(fill=tk.X, pady=(0, 2))
+
+        self.sparkle_canvas = tk.Canvas(row, height=28, bg=BG_PANEL, highlightthickness=0, bd=0)
+        self.sparkle_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.sparkle_label_id = self.sparkle_canvas.create_text(
+            0, 14, text="Entertain me", font=("Segoe UI", 9, "bold"),
+            fill=TEXT_PRIMARY, anchor="w"
+        )
+
+        self.entertain_pill = ModernPillToggle(
+            self.sparkle_canvas, initial_state=self.entertain_me,
+            command=self.toggle_entertain_me
+        )
+        self.sparkle_canvas.create_window(195, 14, window=self.entertain_pill, anchor="w")
+
+        if self.entertain_me:
+            self._tick_sparkles()
+
+        return self.entertain_pill
+
+    def set_light_mode(self, enabled):
+        self.light_mode = bool(enabled)
+        self.apply_theme("light" if self.light_mode else "dark")
+
+    def apply_theme(self, theme_name):
+        global BG_APP, BG_SIDEBAR, BG_HEADER, BG_PANEL, BG_INPUT, BG_GUTTER
+        global BG_SCROLL_TRACK, BG_BORDER, BG_HOVER, TRACK_INACTIVE, TRACK_HOVER
+        global TEXT_PRIMARY, TEXT_MUTED, TEXT_HEADER
+
+        if theme_name == "light":
+            BG_APP = "#f2f3f5"
+            BG_SIDEBAR = "#e3e5e8"
+            BG_HEADER = "#e0e2e5"
+            BG_PANEL = "#ffffff"
+            BG_INPUT = "#e9ebed"
+            BG_GUTTER = "#e3e5e8"
+            BG_SCROLL_TRACK = "#e0e2e5"
+            BG_BORDER = "#d1d4d8"
+            BG_HOVER = "#e8eaed"
+            TRACK_INACTIVE = "#c4c9ce"
+            TRACK_HOVER = "#99a0a8"
+            TEXT_PRIMARY = "#2b2d31"
+            TEXT_MUTED = "#656a73"
+            TEXT_HEADER = "#1e1f22"
+        else:
+            BG_APP = "#313338"
+            BG_SIDEBAR = "#2b2d31"
+            BG_HEADER = "#1e1f22"
+            BG_PANEL = "#2b2d31"
+            BG_INPUT = "#1e1f22"
+            BG_GUTTER = "#16171a"
+            BG_SCROLL_TRACK = "#141517"
+            BG_BORDER = "#383a40"
+            BG_HOVER = "#35373c"
+            TRACK_INACTIVE = "#3f4147"
+            TRACK_HOVER = "#585b64"
+            TEXT_PRIMARY = "#f2f3f5"
+            TEXT_MUTED = "#949ba4"
+            TEXT_HEADER = "#ffffff"
+
+        self.root.configure(bg=BG_APP)
+
+        # Teardown existing tree and rebuild with selected theme
+        if hasattr(self, 'main_container') and self.main_container.winfo_exists():
+            self.main_container.destroy()
+        if hasattr(self, 'sidebar_frame') and self.sidebar_frame.winfo_exists():
+            self.sidebar_frame.destroy()
+        if hasattr(self, 'overlay') and self.overlay.winfo_exists():
+            self.overlay.destroy()
+
+        self.setup_ui()
+        if self.recorded_actions:
+            self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+        self.show_tab("settings")
+
+        
+    def toggle_entertain_me(self, state):
+        self.entertain_me = bool(state)
+        BuiltInMacroApp.entertain_mode = bool(state)
+
+        if self._sparkle_anim_id:
+            try:
+                self.root.after_cancel(self._sparkle_anim_id)
+            except Exception:
+                pass
+            self._sparkle_anim_id = None
+
+        if self.entertain_me:
+            self.sparkle_canvas.itemconfigure(self.sparkle_label_id, fill="#ffffff")
+            # Immediate particle burst
+            sparkle_chars = ['✦', '✧', '⋆', '✨', '★']
+            sparkle_colors = ['#FFE066', '#FFD166', '#70D6FF', '#FF70A6', '#E0AAFF', '#FFFFFF', '#06D6A0']
+            for _ in range(8):
+                sx = random.uniform(8, 230)
+                sy = random.uniform(2, 26)
+                char = random.choice(sparkle_chars)
+                color = random.choice(sparkle_colors)
+                item_id = self.sparkle_canvas.create_text(
+                    sx, sy, text=char, fill=color,
+                    font=("Segoe UI", random.randint(8, 12), "bold"), tags="sparkle"
+                )
+                self._sparkle_particles.append({
+                    "id": item_id,
+                    "vx": random.uniform(-0.4, 0.4),
+                    "vy": random.uniform(-0.7, -0.2),
+                    "life": 0,
+                    "max_life": random.randint(14, 22)
+                })
+            self._tick_sparkles()
+        else:
+            self.sparkle_canvas.itemconfigure(self.sparkle_label_id, fill=TEXT_PRIMARY)
+            self.sparkle_canvas.delete("sparkle")
+            self._sparkle_particles.clear()
+
+    def _tick_sparkles(self):
+        if not getattr(self, 'entertain_me', True) or not hasattr(self, 'sparkle_canvas'):
+            return
+
+        sparkle_chars = ['✦', '✧', '⋆', '✨', '★']
+        sparkle_colors = ['#FFE066', '#FFD166', '#70D6FF', '#FF70A6', '#E0AAFF', '#FFFFFF', '#06D6A0']
+
+        # Spawn new particles up to threshold
+        if len(self._sparkle_particles) < 14 and random.random() < 0.65:
+            sx = random.uniform(6, 235)
+            sy = random.uniform(3, 25)
+            char = random.choice(sparkle_chars)
+            color = random.choice(sparkle_colors)
+            size = random.randint(7, 12)
+            item_id = self.sparkle_canvas.create_text(
+                sx, sy, text=char, fill=color,
+                font=("Segoe UI", size, "bold"), tags="sparkle"
+            )
+            self._sparkle_particles.append({
+                "id": item_id,
+                "vx": random.uniform(-0.35, 0.35),
+                "vy": random.uniform(-0.65, -0.2),
+                "life": 0,
+                "max_life": random.randint(12, 24)
+            })
+
+        # Update floating particle physics and age
+        surviving = []
+        for p in self._sparkle_particles:
+            p["life"] += 1
+            self.sparkle_canvas.move(p["id"], p["vx"], p["vy"])
+
+            if p["life"] >= p["max_life"]:
+                self.sparkle_canvas.delete(p["id"])
+            else:
+                surviving.append(p)
+        self._sparkle_particles = surviving
+
+        self._sparkle_anim_id = self.root.after(35, self._tick_sparkles)
+            
     def choose_presets_folder(self):
         self.root.attributes('-topmost', False)
         try:
@@ -4150,18 +4698,96 @@ try {{
             self.active_hotkey_field.focus_out()
         self.is_binding = False
 
+        # Dismiss the blur overlay immediately so the tab animation is visible
+        if hasattr(self, 'overlay') and self.overlay.winfo_ismapped():
+            self.overlay.place_forget()
+            self.overlay.delete("all")
+            self.blur_image = None
+
         self.close_sidebar()
         self.btn_tab_playback.set_active(tab_name == "playback")
         self.btn_tab_sequencer.set_active(tab_name == "sequencer")
         self.btn_tab_settings.set_active(tab_name == "settings")
 
-        if tab_name == "playback":
-            self.frame_playback.tkraise()
-        elif tab_name == "sequencer":
+        if tab_name == "sequencer":
             self.refresh_sequencer_preset_dropdown()
-            self.frame_sequencer.tkraise()
-        elif tab_name == "settings":
-            self.frame_settings.tkraise()
+
+        if getattr(self, 'current_tab_name', None) == tab_name:
+            return
+
+        old_tab = getattr(self, 'current_tab_name', None)
+        self.current_tab_name = tab_name
+
+        tab_frames = {
+            "playback": self.frame_playback,
+            "sequencer": self.frame_sequencer,
+            "settings": self.frame_settings
+        }
+
+        # Instant switch if animations are disabled or on application startup
+        if not getattr(self, 'entertain_me', True) or old_tab is None or old_tab not in tab_frames:
+            for name, frame in tab_frames.items():
+                if name == tab_name:
+                    frame.place(x=0, y=0, relwidth=1, relheight=1)
+                    frame.tkraise()
+                else:
+                    frame.place_forget()
+            return
+
+        if getattr(self, '_tab_anim_id', None):
+            try:
+                self.root.after_cancel(self._tab_anim_id)
+            except Exception:
+                pass
+            self._tab_anim_id = None
+
+        outgoing_frame = tab_frames[old_tab]
+        incoming_frame = tab_frames[tab_name]
+
+        tab_order = {"playback": 0, "sequencer": 1, "settings": 2}
+        direction = 1 if tab_order.get(tab_name, 0) > tab_order.get(old_tab, 0) else -1
+
+        for name, frame in tab_frames.items():
+            if name != old_tab and name != tab_name:
+                frame.place_forget()
+
+        self.animate_tab_transition(outgoing_frame, incoming_frame, direction)
+
+
+    def animate_tab_transition(self, outgoing_frame, incoming_frame, direction, step=0, total_steps=18):
+        def _back_out(t, s=1.5):
+            t -= 1.0
+            return t * t * ((s + 1.0) * t + s) + 1.0
+
+        def _ease_out_quad(t):
+            return 1.0 - (1.0 - t) * (1.0 - t)
+
+        dpi = getattr(self, 'dpi_scale', 1.0)
+        # 220px travel distance ensures noticeable movement across the window
+        start_distance = int(220 * dpi) * direction
+        exit_distance = int(120 * dpi) * direction
+
+        t = min(1.0, step / total_steps)
+        in_offset = int((1.0 - _back_out(t, s=1.5)) * start_distance)
+        out_offset = int(-_ease_out_quad(t) * exit_distance)
+
+        outgoing_frame.place(x=out_offset, y=0, relwidth=1, relheight=1)
+        incoming_frame.place(x=in_offset, y=0, relwidth=1, relheight=1)
+        incoming_frame.tkraise()
+
+        # Ensure the closing sidebar stays above sliding tab content
+        if hasattr(self, 'sidebar_frame'):
+            self.sidebar_frame.tkraise()
+
+        if step < total_steps:
+            self._tab_anim_id = self.root.after(
+                14, lambda: self.animate_tab_transition(outgoing_frame, incoming_frame, direction, step + 1, total_steps)
+            )
+        else:
+            self._tab_anim_id = None
+            outgoing_frame.place_forget()
+            incoming_frame.place(x=0, y=0, relwidth=1, relheight=1)
+
 
     def toggle_sidebar(self):
         if self.sidebar_open: self.close_sidebar()
@@ -4170,10 +4796,133 @@ try {{
     def open_sidebar(self):
         if not self.sidebar_open:
             self.sidebar_open = True
+            if getattr(self, 'entertain_me', True):
+                self.generate_blur_overlay()
+            else:
+                self.overlay.delete("all")
+                self.overlay.create_rectangle(0, 0, 3000, 3000, fill="#1e1f22")
             self.overlay.place(x=0, y=0, relwidth=1, relheight=1)
             tk.Misc.tkraise(self.overlay)
             self.sidebar_frame.tkraise()
             self.animate_sidebar(0)
+
+
+    def generate_blur_overlay(self):
+        try:
+            self.root.update_idletasks()
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            rw = max(10, self.root.winfo_width())
+            rh = max(10, self.root.winfo_height())
+
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+
+            h_screen_dc = user32.GetDC(0)
+            if not h_screen_dc:
+                raise RuntimeError("Failed to acquire screen DC")
+
+            # 12x downsample for smooth, authentic frosted-glass blur
+            scale_factor = 12
+            sw = max(2, rw // scale_factor)
+            sh = max(2, rh // scale_factor)
+
+            # Step 1: Downsample window area into small memory DC (Halftone area average)
+            h_dc_small = gdi32.CreateCompatibleDC(h_screen_dc)
+            h_bmp_small = gdi32.CreateCompatibleBitmap(h_screen_dc, sw, sh)
+            h_old_small = gdi32.SelectObject(h_dc_small, h_bmp_small)
+
+            pt = POINT()
+            gdi32.SetStretchBltMode(h_dc_small, 4)  # 4 = HALFTONE
+            gdi32.SetBrushOrgEx(h_dc_small, 0, 0, ctypes.byref(pt))
+            gdi32.StretchBlt(h_dc_small, 0, 0, sw, sh, h_screen_dc, rx, ry, rw, rh, 0x00CC0020)
+
+            # Step 2: Upsample back to full size (Halftone smooth bicubic/bilinear interpolation)
+            h_dc_full = gdi32.CreateCompatibleDC(h_screen_dc)
+            h_bmp_full = gdi32.CreateCompatibleBitmap(h_screen_dc, rw, rh)
+            h_old_full = gdi32.SelectObject(h_dc_full, h_bmp_full)
+
+            gdi32.SetStretchBltMode(h_dc_full, 4)  # 4 = HALFTONE
+            gdi32.SetBrushOrgEx(h_dc_full, 0, 0, ctypes.byref(pt))
+            gdi32.StretchBlt(h_dc_full, 0, 0, rw, rh, h_dc_small, 0, 0, sw, sh, 0x00CC0020)
+
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize", ctypes.c_uint32),
+                    ("biWidth", ctypes.c_int32),
+                    ("biHeight", ctypes.c_int32),
+                    ("biPlanes", ctypes.c_uint16),
+                    ("biBitCount", ctypes.c_uint16),
+                    ("biCompression", ctypes.c_uint32),
+                    ("biSizeImage", ctypes.c_uint32),
+                    ("biXPelsPerMeter", ctypes.c_int32),
+                    ("biYPelsPerMeter", ctypes.c_int32),
+                    ("biClrUsed", ctypes.c_uint32),
+                    ("biClrImportant", ctypes.c_uint32),
+                ]
+
+            stride = ((rw * 24 + 31) // 32) * 4
+            image_size = stride * rh
+            buf = (ctypes.c_char * image_size)()
+
+            bmi = BITMAPINFOHEADER()
+            bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.biWidth = rw
+            bmi.biHeight = -rh  # Top-down DIB
+            bmi.biPlanes = 1
+            bmi.biBitCount = 24
+            bmi.biCompression = 0
+            bmi.biSizeImage = image_size
+
+            res = gdi32.GetDIBits(h_dc_full, h_bmp_full, 0, rh, buf, ctypes.byref(bmi), 0)
+            top_down = True
+            if res == 0:
+                # Fallback to bottom-up DIB if display driver requires positive height
+                bmi.biHeight = rh
+                res = gdi32.GetDIBits(h_dc_full, h_bmp_full, 0, rh, buf, ctypes.byref(bmi), 0)
+                top_down = False
+
+            # Cleanup native GDI objects
+            gdi32.SelectObject(h_dc_small, h_old_small)
+            gdi32.DeleteObject(h_bmp_small)
+            gdi32.DeleteDC(h_dc_small)
+
+            gdi32.SelectObject(h_dc_full, h_old_full)
+            gdi32.DeleteObject(h_bmp_full)
+            gdi32.DeleteDC(h_dc_full)
+            user32.ReleaseDC(0, h_screen_dc)
+
+            if res == 0:
+                raise RuntimeError("Failed to extract bitmap bits")
+
+            raw_buf = bytes(buf)
+            # Reconstruct row order (top-down) removing byte-alignment padding
+            row_order = range(rh) if top_down else reversed(range(rh))
+            raw_bgr = b"".join(raw_buf[y * stride : y * stride + rw * 3] for y in row_order)
+
+            # Apply dark frosted tint LUT (dim to ~40% and blend with deep theme)
+            lut_r = bytes(min(255, int(i * 0.38 + 14)) for i in range(256))
+            lut_g = bytes(min(255, int(i * 0.38 + 16)) for i in range(256))
+            lut_b = bytes(min(255, int(i * 0.42 + 22)) for i in range(256))
+
+            b = raw_bgr[0::3].translate(lut_b)
+            g = raw_bgr[1::3].translate(lut_g)
+            r = raw_bgr[2::3].translate(lut_r)
+
+            rgb = bytearray(rw * rh * 3)
+            rgb[0::3] = r
+            rgb[1::3] = g
+            rgb[2::3] = b
+
+            ppm_data = f"P6 {rw} {rh} 255\n".encode("ascii") + rgb
+            self.blur_image = tk.PhotoImage(data=ppm_data)
+
+            self.overlay.delete("all")
+            self.overlay.create_image(0, 0, anchor="nw", image=self.blur_image)
+        except Exception:
+            self.blur_image = None
+            self.overlay.delete("all")
+            self.overlay.create_rectangle(0, 0, 3000, 3000, fill="#1e1f22")
 
     def close_sidebar(self):
         if self.sidebar_open:
@@ -4181,20 +4930,40 @@ try {{
             self.animate_sidebar(-self.sidebar_width)
 
     def animate_sidebar(self, target_x):
-        speed = 25
-        if self.current_sidebar_x < target_x:
-            self.current_sidebar_x = min(self.current_sidebar_x + speed, target_x)
+        if not getattr(self, 'entertain_me', True):
+            self.current_sidebar_x = target_x
             self.sidebar_frame.place(x=self.current_sidebar_x, y=0, relheight=1)
-            if self.current_sidebar_x < target_x:
-                self.root.after(10, lambda: self.animate_sidebar(target_x))
-        elif self.current_sidebar_x > target_x:
-            self.current_sidebar_x = max(self.current_sidebar_x - speed, target_x)
-            self.sidebar_frame.place(x=self.current_sidebar_x, y=0, relheight=1)
-            if self.current_sidebar_x > target_x:
-                self.root.after(10, lambda: self.animate_sidebar(target_x))
-            else:
+            self.sidebar_frame.tkraise()
+            if target_x < 0:
                 self.overlay.place_forget()
+                self.overlay.delete("all")
+                self.blur_image = None
+            return
 
+        diff = target_x - self.current_sidebar_x
+
+        if abs(diff) <= 2:
+            self.current_sidebar_x = target_x
+            self.sidebar_frame.place(x=self.current_sidebar_x, y=0, relheight=1)
+            self.sidebar_frame.tkraise()
+            if target_x < 0:
+                self.overlay.place_forget()
+                self.overlay.delete("all")
+                self.blur_image = None
+            return
+
+        step = int(diff * 0.34)
+        if step == 0:
+            step = 1 if diff > 0 else -1
+
+        self.current_sidebar_x += step
+        self.sidebar_frame.place(x=self.current_sidebar_x, y=0, relheight=1)
+        # Keep sidebar rendered above content while sliding closed
+        self.sidebar_frame.tkraise()
+        self.root.after(12, lambda: self.animate_sidebar(target_x))
+
+
+    
     def on_hotkey_change(self, action_key, vk, mod_vks, name):
         self.hotkeys[action_key] = {"vk": vk, "mod_vks": mod_vks, "name": name}
         self.update_main_buttons()
