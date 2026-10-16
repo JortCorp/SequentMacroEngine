@@ -1,0 +1,12 @@
+[
+  {
+    "preset": "TestPreset",
+    "loops": 1,
+    "delay_after": 1.0
+  },
+  {
+    "preset": "TestSequenceChain",
+    "loops": 1,
+    "delay_after": 1.0
+  }
+]
