@@ -13,24 +13,64 @@ from tkinter import filedialog
 from threading import Thread
 import math
 import random
+import winsound
 
-# --- Native Audio Feedback (Non-Blocking Kernel32 Beeps) ---
+ACTIVE_SOUND_THEME = "Classic"
+CUSTOM_SOUND_PATHS = {
+    "start_rec": "",
+    "pause": "",
+    "start": ""  # Used for Run Macro
+}
+
+# --- Native Audio Feedback (Non-Blocking Kernel32 Beeps & WAVs) ---
 def play_cue(cue_type):
+    global ACTIVE_SOUND_THEME, CUSTOM_SOUND_PATHS
     def _beep():
+        # 1. Play custom WAV if set
+        custom_path = CUSTOM_SOUND_PATHS.get(cue_type, "")
+        if custom_path and os.path.exists(custom_path) and custom_path.lower().endswith(".wav"):
+            try:
+                winsound.PlaySound(custom_path, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+                return
+            except Exception:
+                pass
+
+        # 2. Fallback to Theme Beeps
+        themes = {
+            "Classic": {
+                "start": [(520, 60), (700, 80)],
+                "stop": [(700, 60), (520, 80)],
+                "pause": [(440, 100)],
+                "resume": [(880, 100)],
+                "match": [(750, 60), (1050, 80)],
+                "error": [(320, 200)]
+            },
+            "Subtle": {
+                "start": [(300, 40), (400, 40)],
+                "stop": [(400, 40), (300, 40)],
+                "pause": [(250, 60)],
+                "resume": [(500, 60)],
+                "match": [(600, 40)],
+                "error": [(200, 100)]
+            },
+            "Sci-Fi": {
+                "start": [(1200, 40), (1600, 40), (2000, 60)],
+                "stop": [(2000, 40), (1600, 40), (1200, 60)],
+                "pause": [(1800, 80)],
+                "resume": [(2400, 80)],
+                "match": [(1500, 30), (2000, 30), (2500, 40)],
+                "error": [(100, 150), (100, 150)]
+            }
+        }
         try:
             b = ctypes.windll.kernel32.Beep
-            if cue_type == "start":
-                b(520, 60); b(700, 80)
-            elif cue_type == "stop":
-                b(700, 60); b(520, 80)
-            elif cue_type == "pause":
-                b(440, 100)
-            elif cue_type == "resume":
-                b(880, 100)
-            elif cue_type == "match":
-                b(750, 60); b(1050, 80)
-            elif cue_type == "error":
-                b(320, 200)
+            theme = themes.get(ACTIVE_SOUND_THEME, themes["Classic"])
+            
+            # Fallback for start_rec to use 'start' theme notes if no custom file exists
+            theme_cue = "start" if cue_type == "start_rec" else cue_type
+            
+            for freq, dur in theme.get(theme_cue, []):
+                b(freq, dur)
         except Exception:
             pass
     Thread(target=_beep, daemon=True).start()
@@ -295,9 +335,22 @@ def click(button="left"):
         ctypes.windll.user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
         ctypes.windll.user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
 
+def send_unicode_char(char):
+    """Dispatches raw Unicode characters that lack a standard Virtual Key code."""
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_UNICODE = 0x0004
+    char_code = ord(char)
+    ctypes.windll.user32.keybd_event(0, char_code, KEYEVENTF_UNICODE, 0)
+    ctypes.windll.user32.keybd_event(0, char_code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0)
+
 def type_string(text, speed_multiplier=1.0):
     for char in text:
         res = ctypes.windll.user32.VkKeyScanW(ord(char))
+        if res == -1 or res == 0xFFFF:
+            send_unicode_char(char)
+            time.sleep(max(0.001, 0.02 / speed_multiplier))
+            continue
+
         vk = res & 0xFF
         shift = bool(res & 0x100)
         ctrl = bool(res & 0x200)
@@ -315,6 +368,7 @@ def type_string(text, speed_multiplier=1.0):
         if shift: ctypes.windll.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
 
         time.sleep(max(0.001, 0.02 / speed_multiplier))
+
 
 def get_char_from_vk(vk):
     shift_pressed = bool((ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000) or 
@@ -456,13 +510,20 @@ class ModernTooltip:
 
 # --- Lightweight Bordered Container ---
 class ModernCard(tk.Frame):
-    def __init__(self, parent, bg_card=BG_PANEL, border_color=BG_BORDER, **kwargs):
+    def __init__(self, parent, bg_card=None, border_color=None, **kwargs):
+        bg_card = bg_card or BG_PANEL
+        border_color = border_color or BG_BORDER
         super().__init__(parent, bg=bg_card, highlightbackground=border_color, highlightthickness=1, **kwargs)
 
 # --- Thick Custom Dark Mode Scrollbar ---
 class ModernScrollBar(tk.Canvas):
-    def __init__(self, parent, command=None, width=18, bg_trough=BG_SCROLL_TRACK,
-                 thumb_color=TRACK_INACTIVE, hover_color=TRACK_HOVER, active_color=TRACK_ACTIVE, **kwargs):
+    def __init__(self, parent, command=None, width=18, bg_trough=None,
+                 thumb_color=None, hover_color=None, active_color=None, **kwargs):
+        bg_trough = bg_trough or BG_SCROLL_TRACK
+        thumb_color = thumb_color or TRACK_INACTIVE
+        hover_color = hover_color or TRACK_HOVER
+        active_color = active_color or TRACK_ACTIVE
+        
         super().__init__(parent, width=width, bg=bg_trough, highlightthickness=0, bd=0, cursor="hand2", **kwargs)
         self.command = command
         self.w = width
@@ -509,51 +570,46 @@ class ModernScrollBar(tk.Canvas):
         self.draw()
 
     def draw(self):
+        if not self.winfo_exists(): return
         self.delete("all")
+        h = self.winfo_height()
+        w = self.winfo_width()
+        if h <= 2 or w <= 2:
+            return
 
-        def _hex_to_rgb(h):
-            h = h.lstrip("#")
-            return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        # Render scroll trough background
+        self.create_rectangle(0, 0, w, h, fill=self.bg_trough, outline="")
 
-        try:
-            r1, g1, b1 = _hex_to_rgb(BG_BORDER)
-            r2, g2, b2 = _hex_to_rgb(COLOR_ACCENT)
-            r = int(r1 + (r2 - r1) * self.anim_pos)
-            g = int(g1 + (g2 - g1) * self.anim_pos)
-            b = int(b1 + (b2 - b1) * self.anim_pos)
-            bg_color = f"#{r:02x}{g:02x}{b:02x}"
-        except Exception:
-            bg_color = COLOR_ACCENT if self.state else BG_BORDER
+        # Compute max scrollable span
+        span = min(1.0, max(0.01, self.last - self.first))
+        thumb_h = max(24, int(span * h))
+        travel = max(1, h - thumb_h)
+        max_first = max(0.0001, 1.0 - span)
+        
+        # Determine exact thumb location relative to travel to fix wheel scrolling
+        first_clamped = min(self.first, max_first)
+        y0 = int((first_clamped / max_first) * travel)
+        y1 = y0 + thumb_h
 
-        radius = self.h / 2
-        self.create_arc(0, 0, self.h, self.h, start=90, extent=180, fill=bg_color, outline=bg_color)
-        self.create_arc(self.w - self.h, 0, self.w, self.h, start=-90, extent=180, fill=bg_color, outline=bg_color)
-        self.create_rectangle(radius, 0, self.w - radius, self.h, fill=bg_color, outline=bg_color)
-
-        pad = 3
-        knob_size = self.h - (pad * 2)
-        x_min = pad
-        x_max = self.w - pad - knob_size
-        x0 = x_min + ((x_max - x_min) * self.anim_pos)
-        y0 = pad
-        x1 = x0 + knob_size
-        y1 = y0 + knob_size
-
-        knob_color = "#ffffff" if self.anim_pos > 0.5 else TEXT_MUTED
-        self.create_oval(x0, y0, x1, y1, fill=knob_color, outline=knob_color)
-
+        pad = 5
+        cx = w / 2
+        
+        # Draw rounded modern thumb
+        self.create_line(
+            cx, y0 + pad, cx, y1 - pad, 
+            fill=self.current_color, width=w - (pad * 2), capstyle="round"
+        )
 
     def _on_click(self, event):
         h = self.winfo_height()
         if h <= 2: return
 
-        y0 = self.first * h
-        y1 = self.last * h
-        min_thumb_h = 32
-        if (y1 - y0) < min_thumb_h:
-            center = (y0 + y1) / 2
-            y0 = max(0, center - min_thumb_h / 2)
-            y1 = min(h, y0 + min_thumb_h)
+        span = max(0.01, self.last - self.first)
+        thumb_h = max(24, int(span * h))
+        travel = max(1, h - thumb_h)
+        max_first = max(0.0001, 1.0 - span)
+        y0 = int((self.first / max_first) * travel)
+        y1 = y0 + thumb_h
 
         if y0 <= event.y <= y1:
             self.is_dragging = True
@@ -562,16 +618,25 @@ class ModernScrollBar(tk.Canvas):
             self.drag_start_first = self.first
             self.draw()
         else:
-            span = self.last - self.first
-            target_first = max(0.0, min(1.0 - span, (event.y / h) - (span / 2)))
+            # Jump thumb center to click location
+            target_first = max(0.0, min(max_first, ((event.y - thumb_h / 2) / travel) * max_first))
+            self.is_dragging = True
+            self.current_color = self.active_color
+            self.drag_start_y = event.y
+            self.drag_start_first = target_first
             if self.command:
                 self.command("moveto", f"{target_first:.6f}")
+
 
     def _on_drag(self, event):
         h = self.winfo_height()
         if h <= 2: return
 
-        span = self.last - self.first
+        span = max(0.01, self.last - self.first)
+        thumb_h = max(24, int(span * h))
+        travel = max(1, h - thumb_h)
+        max_first = max(0.0001, 1.0 - span)
+
         if not self.is_dragging:
             self.is_dragging = True
             self.current_color = self.active_color
@@ -579,15 +644,17 @@ class ModernScrollBar(tk.Canvas):
             self.drag_start_first = self.first
 
         dy = event.y - self.drag_start_y
-        delta_ratio = dy / h
-        new_first = max(0.0, min(1.0 - span, self.drag_start_first + delta_ratio))
+        delta_first = (dy / travel) * max_first
+        new_first = max(0.0, min(max_first, self.drag_start_first + delta_first))
 
         if self.command:
             self.command("moveto", f"{new_first:.6f}")
 
+            
 # --- VS Code-Style Playback Queue Viewer ---
 class VSCodeQueueViewer(tk.Frame):
-    def __init__(self, parent, app_instance, bg=BG_INPUT, **kwargs):
+    def __init__(self, parent, app_instance, bg=None, **kwargs):
+        bg = bg or BG_INPUT
         super().__init__(parent, bg=bg, highlightbackground=BG_BORDER, highlightthickness=1, **kwargs)
         self.app = app_instance
         self.line_count = 0
@@ -658,7 +725,6 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.bind("<Button-1>", self._on_code_click)
         self.bind("<MouseWheel>", self._on_mousewheel)
 
-        # Bind double-click events to trigger in-place action editing
         self.gutter.bind("<Double-Button-1>", self._on_double_click)
         self.code_text.bind("<Double-Button-1>", self._on_double_click)
 
@@ -1994,7 +2060,8 @@ class VSCodeQueueViewer(tk.Frame):
             
 # --- Modern-Styled Scrollable Frame ---
 class ModernScrollableFrame(tk.Frame):
-    def __init__(self, parent, bg=BG_APP, **kwargs):
+    def __init__(self, parent, bg=None, **kwargs):
+        bg = bg or BG_APP
         super().__init__(parent, bg=bg, **kwargs)
 
         self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
@@ -2008,7 +2075,9 @@ class ModernScrollableFrame(tk.Frame):
         self.canvas.configure(yscrollcommand=self._on_canvas_scroll)
 
         self.canvas.pack(side="left", fill="both", expand=True)
-        # Scrollbar is auto-managed and hidden until content exceeds view bounds
+
+        # Bind globally, filter dynamically by cursor location
+        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
 
 
     def _on_canvas_configure(self, event):
@@ -2021,7 +2090,8 @@ class ModernScrollableFrame(tk.Frame):
                 self.scrollbar.pack_forget()
         else:
             if not self.scrollbar.winfo_ismapped():
-                self.scrollbar.pack(side="right", fill="y", before=self.canvas)
+                # Add 2px right padding to ensure it stays exactly centered against the new 2px resize grip
+                self.scrollbar.pack(side="right", fill="y", padx=(0, 2), before=self.canvas)
         self.scrollbar.set(first, last)
 
     def _bind_mousewheel(self, event):
@@ -2031,9 +2101,25 @@ class ModernScrollableFrame(tk.Frame):
         self.canvas.unbind_all("<MouseWheel>")
 
     def _on_mousewheel(self, event):
-        if self.scrollbar.winfo_ismapped():
-            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        if not self.winfo_exists(): return
+        try:
+            # Check what widget the cursor is physically hovering over
+            x, y = self.winfo_pointerxy()
+            widget = self.winfo_containing(x, y)
+            
+            if widget:
+                self_str = str(self)
+                wid_str = str(widget)
+                
+                # Only scroll if the hovered widget is this frame or a child of this frame
+                if wid_str == self_str or wid_str.startswith(self_str + "."):
+                    if self.scrollbar.winfo_ismapped():
+                        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                        return "break"
+        except Exception:
+            pass
 
+        
 # --- Custom Modern UI Components ---
 class ModernButton(tk.Frame):
     def __init__(self, parent, text, bg_color, hover_color, command, **kwargs):
@@ -2045,7 +2131,8 @@ class ModernButton(tk.Frame):
         self.disabled = False
         self._fade_job = None
 
-        self.label = tk.Label(self, text=text, bg=bg_color, fg=TEXT_PRIMARY, font=("Segoe UI", 10, "bold"), cursor="hand2")
+        fg_color = self._get_contrast_fg(bg_color)
+        self.label = tk.Label(self, text=text, bg=bg_color, fg=fg_color, font=("Segoe UI", 10, "bold"), cursor="hand2")
         self.label.pack(expand=True, fill=tk.BOTH, padx=16, pady=9)
 
         for widget in (self, self.label):
@@ -2053,6 +2140,19 @@ class ModernButton(tk.Frame):
             widget.bind("<Leave>", self.on_leave)
             widget.bind("<Button-1>", self.on_click)
 
+
+    def _get_contrast_fg(self, hex_color):
+        """Calculates perceptual luminance and returns high-contrast text color."""
+        if self.disabled:
+            return TEXT_MUTED
+        try:
+            h = hex_color.lstrip("#")
+            r, g, b = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+            # Relative luminance formula (YIQ)
+            lum = (0.299 * r + 0.587 * g + 0.114 * b)
+            return "#111214" if lum >= 155 else "#ffffff"
+        except Exception:
+            return "#ffffff"
             
     def on_hover(self, event):
         if not self.disabled:
@@ -2073,6 +2173,7 @@ class ModernButton(tk.Frame):
                 self.current_color = self.bg_color
     
     def _fade_to(self, target_hex, step=1, total_steps=5):
+        if not self.winfo_exists(): return
         if self._fade_job:
             try:
                 self.after_cancel(self._fade_job)
@@ -2099,7 +2200,7 @@ class ModernButton(tk.Frame):
             interpolated = target_hex
 
         self.configure(bg=interpolated)
-        self.label.configure(bg=interpolated)
+        self.label.configure(bg=interpolated, fg=self._get_contrast_fg(interpolated))
         self.current_color = interpolated
 
         if step < total_steps:
@@ -2107,7 +2208,8 @@ class ModernButton(tk.Frame):
         else:
             self.current_color = target_hex
             self.configure(bg=target_hex)
-            self.label.configure(bg=target_hex)
+            self.label.configure(bg=target_hex, fg=self._get_contrast_fg(target_hex))
+
 
     def on_click(self, event):
         if not self.disabled and self.command:
@@ -2124,7 +2226,8 @@ class ModernButton(tk.Frame):
         cursor = "arrow" if self.disabled else "hand2"
         self.configure(cursor=cursor)
         self.label.configure(cursor=cursor)
-        self.label.config(fg=TEXT_MUTED if self.disabled else TEXT_PRIMARY)
+        self.label.config(fg=self._get_contrast_fg(active_bg))
+
 
 class ModernPillToggle(tk.Canvas):
     def __init__(self, parent, initial_state=True, command=None, width=44, height=22, **kwargs):
@@ -2141,14 +2244,23 @@ class ModernPillToggle(tk.Canvas):
     
 
     def draw(self):
+        if not self.winfo_exists(): return
         self.delete("all")
-        
-        # Smoothly interpolate track color from BG_BORDER (#383a40) to COLOR_ACCENT (#5865f2)
-        r = int(56 + (88 - 56) * self.anim_pos)
-        g = int(58 + (101 - 58) * self.anim_pos)
-        b = int(64 + (242 - 64) * self.anim_pos)
-        bg_color = f"#{r:02x}{g:02x}{b:02x}"
-        
+
+        def _hex_to_rgb(h):
+            h = h.lstrip("#")
+            return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+        try:
+            r1, g1, b1 = _hex_to_rgb(TRACK_INACTIVE)
+            r2, g2, b2 = _hex_to_rgb(COLOR_ACCENT)
+            r = int(r1 + (r2 - r1) * self.anim_pos)
+            g = int(g1 + (g2 - g1) * self.anim_pos)
+            b = int(b1 + (b2 - b1) * self.anim_pos)
+            bg_color = f"#{r:02x}{g:02x}{b:02x}"
+        except Exception:
+            bg_color = COLOR_ACCENT if self.state else TRACK_INACTIVE
+
         radius = self.h / 2
         self.create_arc(0, 0, self.h, self.h, start=90, extent=180, fill=bg_color, outline=bg_color)
         self.create_arc(self.w - self.h, 0, self.w, self.h, start=-90, extent=180, fill=bg_color, outline=bg_color)
@@ -2163,26 +2275,15 @@ class ModernPillToggle(tk.Canvas):
         x1 = x0 + knob_size
         y1 = y0 + knob_size
 
-        # Knob tone transitions from TEXT_MUTED (#949ba4) to crisp white (#ffffff)
-        kr = int(148 + (255 - 148) * self.anim_pos)
-        kg = int(155 + (255 - 155) * self.anim_pos)
-        kb = int(164 + (255 - 164) * self.anim_pos)
-        knob_color = f"#{kr:02x}{kg:02x}{kb:02x}"
-
-        self.create_oval(x0, y0, x1, y1, fill=knob_color, outline=knob_color)
+        self.create_oval(x0, y0, x1, y1, fill="#ffffff", outline="#d1d4d8" if self.anim_pos < 0.5 else "#ffffff")
 
 
     def toggle(self, event=None):
         self.state = not self.state
-        if getattr(BuiltInMacroApp, 'entertain_mode', True):
-            self._animate()
-        else:
-            self.anim_pos = 1.0 if self.state else 0.0
-            self.draw()
-        if self.command:
-            self.command(self.state)
+        self._animate(trigger_command=True)
 
-    def _animate(self):
+    def _animate(self, trigger_command=False):
+        if not self.winfo_exists(): return
         if self._anim_id:
             try:
                 self.after_cancel(self._anim_id)
@@ -2193,20 +2294,22 @@ class ModernPillToggle(tk.Canvas):
         target = 1.0 if self.state else 0.0
         diff = target - self.anim_pos
 
-        if abs(diff) <= 0.04:
+        if abs(diff) <= 0.05:
             self.anim_pos = target
             self.draw()
+            if trigger_command and self.command:
+                self.command(self.state)
             return
 
-        # Ease-out dampening step
-        self.anim_pos += diff * 0.38
+        self.anim_pos += diff * 0.40
         self.draw()
-        self._anim_id = self.after(14, self._animate)
+        self._anim_id = self.after(14, lambda: self._animate(trigger_command=trigger_command))
 
 
 class ModernSlider(tk.Canvas):
-    def __init__(self, parent, min_val=1.0, max_val=10.0, step=0.5, initial_val=1.0, command=None, width=180, height=24, **kwargs):
-        super().__init__(parent, width=width, height=height, bg=BG_PANEL, highlightthickness=0, cursor="hand2", **kwargs)
+    def __init__(self, parent, min_val=1.0, max_val=10.0, step=0.5, initial_val=1.0, command=None, width=180, height=24, bg=None, **kwargs):
+        bg = bg or BG_PANEL
+        super().__init__(parent, width=width, height=height, bg=bg, highlightthickness=0, cursor="hand2", **kwargs)
         self.min_val = min_val
         self.max_val = max_val
         self.step = step
@@ -2214,44 +2317,68 @@ class ModernSlider(tk.Canvas):
         self.command = command
         self.w = width
         self.h = height
-
-        self.track_h = 8
-        self.knob_r = 9
+        self.bg_trough = BG_SCROLL_TRACK
+        self.current_color = COLOR_ACCENT
+        self.track_h = 6
+        self.knob_r = 8
         self.padding = 12
 
+        self.bind("<Configure>", lambda e: self.draw())
         self.bind("<Button-1>", self.on_click)
         self.bind("<B1-Motion>", self.on_drag)
         self.draw()
 
     def draw(self):
+        if not self.winfo_exists(): return
         self.delete("all")
-        cy = self.h / 2
+        
+        w = self.winfo_width()
+        h = self.winfo_height()
+        
+        if w <= 2 or h <= 2:
+            return
+
         x_start = self.padding
-        x_end = self.w - self.padding
-        track_w = x_end - x_start
-
-        ratio = (self.val - self.min_val) / (self.max_val - self.min_val)
-        knob_x = x_start + ratio * track_w
-
-        self.create_line(x_start, cy, x_end, cy, fill=TRACK_INACTIVE, width=self.track_h, capstyle="round")
-
-        if knob_x > x_start:
-            self.create_line(x_start, cy, knob_x, cy, fill=COLOR_ACCENT, width=self.track_h, capstyle="round")
-
+        x_end = w - self.padding
+        usable_w = x_end - x_start
+        
+        span = self.max_val - self.min_val
+        if span == 0: span = 1
+        
+        ratio = (self.val - self.min_val) / span
+        ratio = max(0.0, min(1.0, ratio))
+        
+        knob_cx = x_start + (ratio * usable_w)
+        cy = h / 2
+        
+        # Trough (Rounded Capstyle)
+        self.create_line(x_start, cy, x_end, cy, fill=self.bg_trough, width=self.track_h, capstyle="round")
+        
+        # Active filled track (Rounded Capstyle)
+        if knob_cx > x_start:
+            self.create_line(x_start, cy, knob_cx, cy, fill=self.current_color, width=self.track_h, capstyle="round")
+            
+        # Knob
         self.create_oval(
-            knob_x - self.knob_r, cy - self.knob_r,
-            knob_x + self.knob_r, cy + self.knob_r,
-            fill="#ffffff", outline="#ffffff"
+            knob_cx - self.knob_r, cy - self.knob_r,
+            knob_cx + self.knob_r, cy + self.knob_r,
+            fill="#ffffff", outline=self.current_color
         )
 
+
     def set_val_from_x(self, x):
+        w = self.winfo_width()
+        if w <= 2: return
+        
         x_start = self.padding
-        x_end = self.w - self.padding
+        x_end = w - self.padding
+        
         x_clamped = max(x_start, min(x, x_end))
-        ratio = (x_clamped - x_start) / (x_end - x_start)
+        ratio = (x_clamped - x_start) / max(1, x_end - x_start)
 
         raw_val = self.min_val + ratio * (self.max_val - self.min_val)
         steps = round((raw_val - self.min_val) / self.step)
+        
         decimals = 2 if ("." in str(self.step) and len(str(self.step).split(".")[1]) >= 2) else 1
         stepped_val = round(self.min_val + steps * self.step, decimals)
         stepped_val = max(self.min_val, min(stepped_val, self.max_val))
@@ -2269,7 +2396,8 @@ class ModernSlider(tk.Canvas):
         self.draw()
 
 class ModernScrubberTrack(tk.Canvas):
-    def __init__(self, parent, command=None, height=22, bg=BG_INPUT, **kwargs):
+    def __init__(self, parent, command=None, height=22, bg=None, **kwargs):
+        bg = bg or BG_INPUT
         super().__init__(parent, height=height, bg=bg, highlightthickness=0, cursor="hand2", **kwargs)
         self.command = command
         self.height = height
@@ -2286,6 +2414,7 @@ class ModernScrubberTrack(tk.Canvas):
         self.bind("<Button-1>", self._on_click)
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<ButtonRelease-1>", self._on_release)
+
 
     def set_position(self, current_idx, total_count):
         self.total_count = max(0, total_count)
@@ -2651,6 +2780,8 @@ class BuiltInMacroApp:
             "stop_play": {"vk": 0x79, "mod_vks": [], "name": "F10"}
         }
 
+        self.load_settings()
+
         self.setup_ui()
         self.ghost_reticle = GhostReticle(self.root)
         self.refresh_preset_menu()
@@ -2691,17 +2822,19 @@ class BuiltInMacroApp:
         self.root.overrideredirect(True)
 
     def setup_resizing_handles(self):
+        # Use minimal 2px invisible frames to allow edge resizing without covering UI elements
         self.grip_e = tk.Frame(self.root, bg=BG_APP, cursor="size_we")
-        self.grip_e.place(relx=1.0, rely=0, x=-5, y=35, relheight=1.0, width=5)
+        self.grip_e.place(relx=1.0, rely=0, x=-2, y=35, relheight=1.0, width=2)
 
         self.grip_s = tk.Frame(self.root, bg=BG_APP, cursor="size_ns")
-        self.grip_s.place(relx=0, rely=1.0, x=0, y=-5, relwidth=1.0, height=5)
+        self.grip_s.place(relx=0, rely=1.0, x=0, y=-2, relwidth=1.0, height=2)
 
         self.grip_w = tk.Frame(self.root, bg=BG_APP, cursor="size_we")
-        self.grip_w.place(relx=0, rely=0, x=0, y=35, relheight=1.0, width=5)
+        self.grip_w.place(relx=0, rely=0, x=0, y=35, relheight=1.0, width=2)
 
-        self.grip_se = tk.Label(self.root, text="◢", font=("Segoe UI", 10), bg=BG_APP, fg=TEXT_MUTED, cursor="size_nw_se")
-        self.grip_se.place(relx=1.0, rely=1.0, x=-14, y=-16)
+        # Replace the text-based triangle with an invisible 6x6 square in the corner
+        self.grip_se = tk.Frame(self.root, bg=BG_APP, cursor="size_nw_se")
+        self.grip_se.place(relx=1.0, rely=1.0, x=-6, y=-6, width=6, height=6)
 
         handles = [
             (self.grip_e, "e"),
@@ -2762,10 +2895,14 @@ class BuiltInMacroApp:
         btn_expand.bind("<Button-1>", lambda e: self.toggle_mini_hud())
 
     def update_status(self, text, fg_color=TEXT_MUTED):
-        self.status_text.config(text=f"\u25cf {text}", fg=fg_color)
-        if self.mini_hud and self.mini_hud.winfo_exists() and hasattr(self, 'hud_status_lbl'):
-            trunc = (text[:14] + "..") if len(text) > 16 else text
-            self.hud_status_lbl.config(text=f"● {trunc}", fg=fg_color)
+        def _apply():
+            if hasattr(self, 'status_text') and self.status_text.winfo_exists():
+                self.status_text.config(text=f"● {text}", fg=fg_color)
+            if self.mini_hud and self.mini_hud.winfo_exists() and hasattr(self, 'hud_status_lbl'):
+                trunc = (text[:14] + "..") if len(text) > 16 else text
+                self.hud_status_lbl.config(text=f"● {trunc}", fg=fg_color)
+        self.root.after(0, _apply)
+
 
     def _start_resize(self, event, edge):
         self._resize_edge = edge
@@ -2815,7 +2952,7 @@ class BuiltInMacroApp:
             return sorted([os.path.splitext(f)[0] for f in os.listdir(self.presets_dir) if f.lower().endswith(".json")])
         except Exception: return []
 
-    def setup_ui(self):
+    def setup_ui(self, initial_tab="playback", animate=True):
         self.main_container = tk.Frame(self.root, bg=BG_APP)
         self.main_container.pack(fill=tk.BOTH, expand=True)
 
@@ -2902,7 +3039,7 @@ class BuiltInMacroApp:
         btn_refresh.bind("<Leave>", lambda e: btn_refresh.config(fg=TEXT_MUTED, bg=BG_INPUT))
         ModernTooltip(btn_refresh, "Reload presets directory", "Sync")
 
-        tk.Frame(self.main_container, bg="#1f2023", height=1).pack(fill=tk.X)
+        tk.Frame(self.main_container, bg=BG_BORDER, height=1).pack(fill=tk.X)
 
         self.content_frame = tk.Frame(self.main_container, bg=BG_APP)
         self.content_frame.pack(fill=tk.BOTH, expand=True)
@@ -2910,7 +3047,6 @@ class BuiltInMacroApp:
         self.current_tab_name = None
         self._tab_anim_id = None
 
-        # Clean frames managed exclusively via place geometry
         self.frame_playback = tk.Frame(self.content_frame, bg=BG_APP)
         self.frame_sequencer = tk.Frame(self.content_frame, bg=BG_APP)
         self.frame_settings = tk.Frame(self.content_frame, bg=BG_APP)
@@ -2926,7 +3062,8 @@ class BuiltInMacroApp:
         self.sidebar_frame.pack_propagate(False)
         self.build_sidebar()
 
-        self.show_tab("playback")
+        self.show_tab(initial_tab, animate=animate)
+
 
 
     def _on_scrub_nav(self, action):
@@ -4061,58 +4198,60 @@ class BuiltInMacroApp:
         h_bitmap = gdi32.CreateCompatibleBitmap(h_screen_dc, tw, th)
         h_old = gdi32.SelectObject(h_mem_dc, h_bitmap)
 
-        gdi32.SetStretchBltMode(h_mem_dc, 4)
-        pt = POINT()
-        gdi32.SetBrushOrgEx(h_mem_dc, 0, 0, ctypes.byref(pt))
+        try:
+            gdi32.SetStretchBltMode(h_mem_dc, 4)
+            pt = POINT()
+            gdi32.SetBrushOrgEx(h_mem_dc, 0, 0, ctypes.byref(pt))
 
-        gdi32.StretchBlt(
-            h_mem_dc, 0, 0, tw, th,
-            h_screen_dc, x, y, w, h,
-            0x00CC0020 | 0x40000000
-        )
+            gdi32.StretchBlt(
+                h_mem_dc, 0, 0, tw, th,
+                h_screen_dc, x, y, w, h,
+                0x00CC0020 | 0x40000000
+            )
 
-        class BITMAPINFOHEADER(ctypes.Structure):
-            _fields_ = [
-                ("biSize", ctypes.c_uint32),
-                ("biWidth", ctypes.c_int32),
-                ("biHeight", ctypes.c_int32),
-                ("biPlanes", ctypes.c_uint16),
-                ("biBitCount", ctypes.c_uint16),
-                ("biCompression", ctypes.c_uint32),
-                ("biSizeImage", ctypes.c_uint32),
-                ("biXPelsPerMeter", ctypes.c_int32),
-                ("biYPelsPerMeter", ctypes.c_int32),
-                ("biClrUsed", ctypes.c_uint32),
-                ("biClrImportant", ctypes.c_uint32),
-            ]
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize", ctypes.c_uint32),
+                    ("biWidth", ctypes.c_int32),
+                    ("biHeight", ctypes.c_int32),
+                    ("biPlanes", ctypes.c_uint16),
+                    ("biBitCount", ctypes.c_uint16),
+                    ("biCompression", ctypes.c_uint32),
+                    ("biSizeImage", ctypes.c_uint32),
+                    ("biXPelsPerMeter", ctypes.c_int32),
+                    ("biYPelsPerMeter", ctypes.c_int32),
+                    ("biClrUsed", ctypes.c_uint32),
+                    ("biClrImportant", ctypes.c_uint32),
+                ]
 
-        row_size = ((tw * 24 + 31) // 32) * 4
-        image_size = row_size * th
-        buf = (ctypes.c_char * image_size)()
+            row_size = ((tw * 24 + 31) // 32) * 4
+            image_size = row_size * th
+            buf = (ctypes.c_char * image_size)()
 
-        bmi = BITMAPINFOHEADER()
-        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.biWidth = tw
-        bmi.biHeight = th
-        bmi.biPlanes = 1
-        bmi.biBitCount = 24
-        bmi.biCompression = 0
-        bmi.biSizeImage = image_size
+            bmi = BITMAPINFOHEADER()
+            bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.biWidth = tw
+            bmi.biHeight = th
+            bmi.biPlanes = 1
+            bmi.biBitCount = 24
+            bmi.biCompression = 0
+            bmi.biSizeImage = image_size
 
-        gdi32.GetDIBits(h_mem_dc, h_bitmap, 0, th, buf, ctypes.byref(bmi), 0)
+            gdi32.GetDIBits(h_mem_dc, h_bitmap, 0, th, buf, ctypes.byref(bmi), 0)
 
-        gdi32.SelectObject(h_mem_dc, h_old)
-        gdi32.DeleteObject(h_bitmap)
-        gdi32.DeleteDC(h_mem_dc)
-        user32.ReleaseDC(0, h_screen_dc)
+            file_header = struct.pack('<2sIHHI', b'BM', 54 + image_size, 0, 0, 54)
+            dib_header = struct.pack('<IiiHHIIiiII', 40, tw, th, 1, 24, 0, image_size, 2835, 2835, 0, 0)
 
-        file_header = struct.pack('<2sIHHI', b'BM', 54 + image_size, 0, 0, 54)
-        dib_header = struct.pack('<IiiHHIIiiII', 40, tw, th, 1, 24, 0, image_size, 2835, 2835, 0, 0)
+            with open(filepath, 'wb') as f:
+                f.write(file_header)
+                f.write(dib_header)
+                f.write(buf)
+        finally:
+            gdi32.SelectObject(h_mem_dc, h_old)
+            gdi32.DeleteObject(h_bitmap)
+            gdi32.DeleteDC(h_mem_dc)
+            user32.ReleaseDC(0, h_screen_dc)
 
-        with open(filepath, 'wb') as f:
-            f.write(file_header)
-            f.write(dib_header)
-            f.write(buf)
 
     def ocr_screen_area(self, x, y, w, h):
         x = int(x)
@@ -4239,6 +4378,63 @@ try {{
         self.update_status(f"Switching to '{stem}'...", COLOR_ACCENT)
         self.root.after(150, self.start_macro)
 
+    def on_sound_theme_change(self, val):
+        global ACTIVE_SOUND_THEME
+        ACTIVE_SOUND_THEME = val
+        if self.audio_cues:
+            play_cue("start")
+
+    def load_settings(self):
+        global ACTIVE_SOUND_THEME, CUSTOM_SOUND_PATHS
+        try:
+            if os.path.exists("settings.json"):
+                with open("settings.json", "r") as f:
+                    config = json.load(f)
+                self.light_mode = config.get("light_mode", False)
+                self.entertain_me = config.get("entertain_me", True)
+                BuiltInMacroApp.entertain_mode = self.entertain_me
+                self.playback_speed = config.get("playback_speed", 1.0)
+                self.action_delay = config.get("action_delay", 0.20)
+                self.fluid_mouse = config.get("fluid_mouse", True)
+                self.human_bezier = config.get("human_bezier", False)
+                self.clicks_and_keys_only = config.get("clicks_and_keys_only", False)
+                self.window_relative = config.get("window_relative", False)
+                self.audio_cues = config.get("audio_cues", True)
+                self.delay_jitter = config.get("delay_jitter", False)
+                self.natural_timing = config.get("natural_timing", False)
+                ACTIVE_SOUND_THEME = config.get("sound_theme", "Classic")
+                
+                saved_sounds = config.get("custom_sounds", {})
+                for k in CUSTOM_SOUND_PATHS.keys():
+                    if k in saved_sounds:
+                        CUSTOM_SOUND_PATHS[k] = saved_sounds[k]
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+
+    def save_settings(self):
+        global ACTIVE_SOUND_THEME, CUSTOM_SOUND_PATHS
+        config = {
+            "light_mode": self.light_mode,
+            "entertain_me": self.entertain_me,
+            "playback_speed": self.playback_speed,
+            "action_delay": self.action_delay,
+            "fluid_mouse": self.fluid_mouse,
+            "human_bezier": self.human_bezier,
+            "clicks_and_keys_only": self.clicks_and_keys_only,
+            "window_relative": self.window_relative,
+            "audio_cues": self.audio_cues,
+            "delay_jitter": self.delay_jitter,
+            "natural_timing": self.natural_timing,
+            "sound_theme": ACTIVE_SOUND_THEME,
+            "custom_sounds": CUSTOM_SOUND_PATHS
+        }
+        try:
+            with open("settings.json", "w") as f:
+                json.dump(config, f, indent=4)
+            self.update_status("Settings saved as default", COLOR_SUCCESS)
+        except Exception as e:
+            self.update_status(f"Error saving settings: {e}", COLOR_DANGER)
+
     def build_settings_view(self):
         self.settings_scroll = ModernScrollableFrame(self.frame_settings, bg=BG_APP)
         self.settings_scroll.pack(fill=tk.BOTH, expand=True)
@@ -4322,10 +4518,64 @@ try {{
         f_sys = tk.Frame(card_sys, bg=BG_PANEL, padx=16, pady=14)
         f_sys.pack(fill=tk.X)
 
-        self.audio_toggle = add_setting_toggle(f_sys, "Audio Cues (Beeps)", self.audio_cues, lambda s: setattr(self, 'audio_cues', s))
+        self.audio_toggle = add_setting_toggle(f_sys, "Audio Cues", self.audio_cues, lambda s: setattr(self, 'audio_cues', s))
+
+        global ACTIVE_SOUND_THEME, CUSTOM_SOUND_PATHS
+        theme_row = tk.Frame(f_sys, bg=BG_PANEL)
+        theme_row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(theme_row, text="Sound Theme", font=("Segoe UI", 9, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        self.sound_theme_var = tk.StringVar(value=ACTIVE_SOUND_THEME)
+        theme_menu = tk.OptionMenu(theme_row, self.sound_theme_var, "Classic", "Subtle", "Sci-Fi", command=self.on_sound_theme_change)
+        theme_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER, font=("Segoe UI", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+        theme_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
+        theme_menu.pack(side=tk.LEFT)
+
+        def add_custom_sound_row(parent, label_text, cue_key):
+            row = tk.Frame(parent, bg=BG_PANEL)
+            row.pack(fill=tk.X, pady=(4, 0))
+            tk.Label(row, text=label_text, font=("Segoe UI", 9, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+            
+            controls = tk.Frame(row, bg=BG_PANEL)
+            controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            
+            path_box = tk.Frame(controls, bg=BG_INPUT, highlightbackground=BG_BORDER, highlightthickness=1)
+            path_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+            
+            current_path = CUSTOM_SOUND_PATHS.get(cue_key, "")
+            disp_text = self.shorten_path(current_path) if current_path else "Default Theme Sound"
+            lbl_path = tk.Label(path_box, text=disp_text, font=("Consolas", 8), bg=BG_INPUT, fg=SYNTAX_GREEN if current_path else TEXT_MUTED, anchor="w", padx=8, pady=4)
+            lbl_path.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            
+            def _browse():
+                self.root.attributes('-topmost', False)
+                try:
+                    path = filedialog.askopenfilename(parent=self.root, title=f"Select Sound for {label_text}", filetypes=[("WAV Audio", "*.wav")])
+                finally:
+                    self.root.attributes('-topmost', True)
+                if path:
+                    CUSTOM_SOUND_PATHS[cue_key] = path
+                    lbl_path.config(text=self.shorten_path(path), fg=SYNTAX_GREEN)
+            
+            def _clear():
+                CUSTOM_SOUND_PATHS[cue_key] = ""
+                lbl_path.config(text="Default Theme Sound", fg=TEXT_MUTED)
+
+            btn_clear = tk.Label(path_box, text=" ✕ ", font=("Segoe UI", 9, "bold"), bg=BG_INPUT, fg=TEXT_MUTED, cursor="hand2")
+            btn_clear.pack(side=tk.RIGHT, padx=(2, 0))
+            btn_clear.bind("<Button-1>", lambda e: _clear())
+            btn_clear.bind("<Enter>", lambda e: btn_clear.config(fg=COLOR_DANGER))
+            btn_clear.bind("<Leave>", lambda e: btn_clear.config(fg=TEXT_MUTED))
+            
+            btn_browse = tk.Label(controls, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg="#ffffff", cursor="hand2", padx=10, pady=4)
+            btn_browse.pack(side=tk.RIGHT)
+            btn_browse.bind("<Button-1>", lambda e: _browse())
+
+        add_custom_sound_row(f_sys, "Start Recording Sound", "start_rec")
+        add_custom_sound_row(f_sys, "Pause Sequence Sound", "pause")
+        add_custom_sound_row(f_sys, "Run Macro Sound", "start")
 
         folder_row = tk.Frame(f_sys, bg=BG_PANEL)
-        folder_row.pack(fill=tk.X, pady=(2, 0))
+        folder_row.pack(fill=tk.X, pady=(10, 0))
         tk.Label(folder_row, text="Preset Directory", font=("Segoe UI", 9, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
         folder_controls = tk.Frame(folder_row, bg=BG_PANEL)
         folder_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -4335,12 +4585,12 @@ try {{
             highlightbackground=BG_BORDER, highlightthickness=1
         )
         self.folder_display.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        btn_browse = tk.Label(
+        btn_browse_folder = tk.Label(
             folder_controls, text="Browse", font=("Segoe UI", 8, "bold"),
             bg=COLOR_ACCENT, fg="#ffffff", cursor="hand2", padx=10, pady=4
         )
-        btn_browse.pack(side=tk.RIGHT)
-        btn_browse.bind("<Button-1>", lambda e: self.choose_presets_folder())
+        btn_browse_folder.pack(side=tk.RIGHT)
+        btn_browse_folder.bind("<Button-1>", lambda e: self.choose_presets_folder())
 
         # --- SECTION 5: GLOBAL KEYBINDINGS ---
         tk.Label(scroll_container, text="GLOBAL HOTKEYS", font=("Segoe UI", 8, "bold"), bg=BG_APP, fg=TEXT_MUTED).pack(anchor="w", padx=22, pady=(0, 4))
@@ -4354,54 +4604,60 @@ try {{
         self.create_hotkey_row(keys_frame, "Start Playback", "start_play")
         self.create_hotkey_row(keys_frame, "Stop Playback", "stop_play")
 
+        # --- SECTION 6: SET DEFAULTS ---
+        btn_save_def = ModernButton(scroll_container, text="Save Settings as Default", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=self.save_settings)
+        btn_save_def.pack(padx=20, pady=(10, 30), fill=tk.X)
+
 
     def build_entertain_me_toggle(self, parent):
         row = tk.Frame(parent, bg=BG_PANEL)
         row.pack(fill=tk.X, pady=(0, 2))
 
-        self.sparkle_canvas = tk.Canvas(row, height=28, bg=BG_PANEL, highlightthickness=0, bd=0)
-        self.sparkle_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            row, text="Entertain me", font=("Segoe UI", 9, "bold"),
+            bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w"
+        ).pack(side=tk.LEFT)
 
-        self.sparkle_label_id = self.sparkle_canvas.create_text(
-            0, 14, text="Entertain me", font=("Segoe UI", 9, "bold"),
-            fill=TEXT_PRIMARY, anchor="w"
-        )
+        self.sparkle_canvas = tk.Canvas(row, width=80, height=28, bg=BG_PANEL, highlightthickness=0, bd=0)
+        self.sparkle_canvas.pack(side=tk.LEFT)
 
         self.entertain_pill = ModernPillToggle(
             self.sparkle_canvas, initial_state=self.entertain_me,
             command=self.toggle_entertain_me
         )
-        self.sparkle_canvas.create_window(195, 14, window=self.entertain_pill, anchor="w")
-
-        if self.entertain_me:
-            self._tick_sparkles()
+        self.sparkle_canvas.create_window(0, 14, window=self.entertain_pill, anchor="w")
 
         return self.entertain_pill
+
 
     def set_light_mode(self, enabled):
         self.light_mode = bool(enabled)
         self.apply_theme("light" if self.light_mode else "dark")
 
     def apply_theme(self, theme_name):
+        if getattr(self, '_theme_lock', False): return
+        self._theme_lock = True
+
         global BG_APP, BG_SIDEBAR, BG_HEADER, BG_PANEL, BG_INPUT, BG_GUTTER
-        global BG_SCROLL_TRACK, BG_BORDER, BG_HOVER, TRACK_INACTIVE, TRACK_HOVER
-        global TEXT_PRIMARY, TEXT_MUTED, TEXT_HEADER
+        global BG_SCROLL_TRACK, BG_BORDER, BG_HOVER, TRACK_INACTIVE, TRACK_HOVER, TRACK_ACTIVE
+        global TEXT_PRIMARY, TEXT_MUTED, TEXT_HEADER, COLOR_ACCENT, COLOR_ACCENT_HOV
 
         if theme_name == "light":
-            BG_APP = "#f2f3f5"
-            BG_SIDEBAR = "#e3e5e8"
-            BG_HEADER = "#e0e2e5"
+            BG_APP = "#f0f2f5"
+            BG_SIDEBAR = "#e2e5e9"
+            BG_HEADER = "#d3d7de"
             BG_PANEL = "#ffffff"
-            BG_INPUT = "#e9ebed"
-            BG_GUTTER = "#e3e5e8"
-            BG_SCROLL_TRACK = "#e0e2e5"
-            BG_BORDER = "#d1d4d8"
-            BG_HOVER = "#e8eaed"
-            TRACK_INACTIVE = "#c4c9ce"
-            TRACK_HOVER = "#99a0a8"
-            TEXT_PRIMARY = "#2b2d31"
-            TEXT_MUTED = "#656a73"
-            TEXT_HEADER = "#1e1f22"
+            BG_INPUT = "#e4e7eb"
+            BG_GUTTER = "#e2e5e9"
+            BG_SCROLL_TRACK = "#dcdfe4"
+            BG_BORDER = "#b8bcc4"
+            BG_HOVER = "#d1d5db"
+            TRACK_INACTIVE = "#b0b5be"
+            TRACK_HOVER = "#888e99"
+            TRACK_ACTIVE = "#4752c4"
+            TEXT_PRIMARY = "#111214"
+            TEXT_MUTED = "#4a4f57"
+            TEXT_HEADER = "#111214"
         else:
             BG_APP = "#313338"
             BG_SIDEBAR = "#2b2d31"
@@ -4410,17 +4666,37 @@ try {{
             BG_INPUT = "#1e1f22"
             BG_GUTTER = "#16171a"
             BG_SCROLL_TRACK = "#141517"
-            BG_BORDER = "#383a40"
+            BG_BORDER = "#3f4147"
             BG_HOVER = "#35373c"
             TRACK_INACTIVE = "#3f4147"
             TRACK_HOVER = "#585b64"
-            TEXT_PRIMARY = "#f2f3f5"
-            TEXT_MUTED = "#949ba4"
+            TRACK_ACTIVE = "#5865f2"
+            TEXT_PRIMARY = "#ffffff"
+            TEXT_MUTED = "#a6acb5"
             TEXT_HEADER = "#ffffff"
+
+        if getattr(self, '_sparkle_anim_id', None):
+            try: self.root.after_cancel(self._sparkle_anim_id)
+            except Exception: pass
+            self._sparkle_anim_id = None
+        self._sparkle_particles.clear()
+
+        if getattr(self, '_tab_anim_id', None):
+            try: self.root.after_cancel(self._tab_anim_id)
+            except Exception: pass
+            self._tab_anim_id = None
+
+        active_tab = getattr(self, 'current_tab_name', "settings") or "settings"
 
         self.root.configure(bg=BG_APP)
 
-        # Teardown existing tree and rebuild with selected theme
+        # Sync persistent grip backgrounds to the new theme so they don't leave ghost lines
+        if hasattr(self, 'grip_e'):
+            self.grip_e.config(bg=BG_APP)
+            self.grip_s.config(bg=BG_APP)
+            self.grip_w.config(bg=BG_APP)
+            self.grip_se.config(bg=BG_APP)
+
         if hasattr(self, 'main_container') and self.main_container.winfo_exists():
             self.main_container.destroy()
         if hasattr(self, 'sidebar_frame') and self.sidebar_frame.winfo_exists():
@@ -4428,77 +4704,65 @@ try {{
         if hasattr(self, 'overlay') and self.overlay.winfo_exists():
             self.overlay.destroy()
 
-        self.setup_ui()
+        self.setup_ui(initial_tab=active_tab, animate=False)
         if self.recorded_actions:
             self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-        self.show_tab("settings")
+
+        self.root.after(350, lambda: setattr(self, '_theme_lock', False))
+
 
         
     def toggle_entertain_me(self, state):
         self.entertain_me = bool(state)
         BuiltInMacroApp.entertain_mode = bool(state)
 
+        # Clear any ongoing animation jobs and particles
         if self._sparkle_anim_id:
-            try:
-                self.root.after_cancel(self._sparkle_anim_id)
-            except Exception:
-                pass
+            try: self.root.after_cancel(self._sparkle_anim_id)
+            except Exception: pass
             self._sparkle_anim_id = None
 
-        if self.entertain_me:
-            self.sparkle_canvas.itemconfigure(self.sparkle_label_id, fill="#ffffff")
-            # Immediate particle burst
+        if hasattr(self, 'sparkle_canvas') and self.sparkle_canvas.winfo_exists():
+            self.sparkle_canvas.delete("sparkle")
+        self._sparkle_particles.clear()
+
+        if self.entertain_me and hasattr(self, 'sparkle_canvas') and self.sparkle_canvas.winfo_exists():
+            # Center of the pill toggle relative to the new constrained canvas is x=22, y=14
+            btn_cx, btn_cy = 22, 14
             sparkle_chars = ['✦', '✧', '⋆', '✨', '★']
             sparkle_colors = ['#FFE066', '#FFD166', '#70D6FF', '#FF70A6', '#E0AAFF', '#FFFFFF', '#06D6A0']
-            for _ in range(8):
-                sx = random.uniform(8, 230)
-                sy = random.uniform(2, 26)
-                char = random.choice(sparkle_chars)
-                color = random.choice(sparkle_colors)
+
+            for _ in range(16):
+                angle = random.uniform(0, 2 * math.pi)
+                rx = 22 + random.uniform(2, 8)
+                ry = 11 + random.uniform(2, 6)
+                sx = btn_cx + (rx * math.cos(angle))
+                sy = btn_cy + (ry * math.sin(angle))
+
+                speed = random.uniform(0.35, 0.95)
+                vx = math.cos(angle) * speed
+                vy = (math.sin(angle) * speed) - 0.25
+
                 item_id = self.sparkle_canvas.create_text(
-                    sx, sy, text=char, fill=color,
-                    font=("Segoe UI", random.randint(8, 12), "bold"), tags="sparkle"
+                    sx, sy, text=random.choice(sparkle_chars), fill=random.choice(sparkle_colors),
+                    font=("Segoe UI", random.randint(7, 10), "bold"), tags="sparkle"
                 )
                 self._sparkle_particles.append({
                     "id": item_id,
-                    "vx": random.uniform(-0.4, 0.4),
-                    "vy": random.uniform(-0.7, -0.2),
+                    "vx": vx,
+                    "vy": vy,
                     "life": 0,
                     "max_life": random.randint(14, 22)
                 })
+
             self._tick_sparkles()
-        else:
-            self.sparkle_canvas.itemconfigure(self.sparkle_label_id, fill=TEXT_PRIMARY)
-            self.sparkle_canvas.delete("sparkle")
-            self._sparkle_particles.clear()
+
 
     def _tick_sparkles(self):
-        if not getattr(self, 'entertain_me', True) or not hasattr(self, 'sparkle_canvas'):
+        if not hasattr(self, 'sparkle_canvas') or not self.sparkle_canvas.winfo_exists():
+            self._sparkle_anim_id = None
             return
 
-        sparkle_chars = ['✦', '✧', '⋆', '✨', '★']
-        sparkle_colors = ['#FFE066', '#FFD166', '#70D6FF', '#FF70A6', '#E0AAFF', '#FFFFFF', '#06D6A0']
-
-        # Spawn new particles up to threshold
-        if len(self._sparkle_particles) < 14 and random.random() < 0.65:
-            sx = random.uniform(6, 235)
-            sy = random.uniform(3, 25)
-            char = random.choice(sparkle_chars)
-            color = random.choice(sparkle_colors)
-            size = random.randint(7, 12)
-            item_id = self.sparkle_canvas.create_text(
-                sx, sy, text=char, fill=color,
-                font=("Segoe UI", size, "bold"), tags="sparkle"
-            )
-            self._sparkle_particles.append({
-                "id": item_id,
-                "vx": random.uniform(-0.35, 0.35),
-                "vy": random.uniform(-0.65, -0.2),
-                "life": 0,
-                "max_life": random.randint(12, 24)
-            })
-
-        # Update floating particle physics and age
         surviving = []
         for p in self._sparkle_particles:
             p["life"] += 1
@@ -4508,10 +4772,16 @@ try {{
                 self.sparkle_canvas.delete(p["id"])
             else:
                 surviving.append(p)
+
         self._sparkle_particles = surviving
 
-        self._sparkle_anim_id = self.root.after(35, self._tick_sparkles)
-            
+        # Cease recursion when all burst particles have dissipated
+        if self._sparkle_particles:
+            self._sparkle_anim_id = self.root.after(35, self._tick_sparkles)
+        else:
+            self._sparkle_anim_id = None
+
+
     def choose_presets_folder(self):
         self.root.attributes('-topmost', False)
         try:
@@ -4692,19 +4962,15 @@ try {{
         self.update_scrubber_ui()
         self.queue_viewer.redraw_breakpoints()
     
-    def show_tab(self, tab_name):
+    def show_tab(self, tab_name, animate=True):
         self.root.focus_set()
         if hasattr(self, 'active_hotkey_field') and self.active_hotkey_field:
             self.active_hotkey_field.focus_out()
         self.is_binding = False
 
-        # Dismiss the blur overlay immediately so the tab animation is visible
-        if hasattr(self, 'overlay') and self.overlay.winfo_ismapped():
-            self.overlay.place_forget()
-            self.overlay.delete("all")
-            self.blur_image = None
-
+        # Retract sidebar smoothly
         self.close_sidebar()
+
         self.btn_tab_playback.set_active(tab_name == "playback")
         self.btn_tab_sequencer.set_active(tab_name == "sequencer")
         self.btn_tab_settings.set_active(tab_name == "settings")
@@ -4724,8 +4990,13 @@ try {{
             "settings": self.frame_settings
         }
 
-        # Instant switch if animations are disabled or on application startup
-        if not getattr(self, 'entertain_me', True) or old_tab is None or old_tab not in tab_frames:
+        # Keep overlay and sidebar elevated without canvas method conflict
+        if hasattr(self, 'overlay') and self.overlay.winfo_exists() and self.overlay.winfo_ismapped():
+            tk.Misc.tkraise(self.overlay)
+        if hasattr(self, 'sidebar_frame') and self.sidebar_frame.winfo_exists():
+            self.sidebar_frame.lift()
+
+        if not animate or not getattr(self, 'entertain_me', True) or old_tab is None or old_tab not in tab_frames:
             for name, frame in tab_frames.items():
                 if name == tab_name:
                     frame.place(x=0, y=0, relwidth=1, relheight=1)
@@ -4735,10 +5006,8 @@ try {{
             return
 
         if getattr(self, '_tab_anim_id', None):
-            try:
-                self.root.after_cancel(self._tab_anim_id)
-            except Exception:
-                pass
+            try: self.root.after_cancel(self._tab_anim_id)
+            except Exception: pass
             self._tab_anim_id = None
 
         outgoing_frame = tab_frames[old_tab]
@@ -4763,7 +5032,6 @@ try {{
             return 1.0 - (1.0 - t) * (1.0 - t)
 
         dpi = getattr(self, 'dpi_scale', 1.0)
-        # 220px travel distance ensures noticeable movement across the window
         start_distance = int(220 * dpi) * direction
         exit_distance = int(120 * dpi) * direction
 
@@ -4775,9 +5043,11 @@ try {{
         incoming_frame.place(x=in_offset, y=0, relwidth=1, relheight=1)
         incoming_frame.tkraise()
 
-        # Ensure the closing sidebar stays above sliding tab content
-        if hasattr(self, 'sidebar_frame'):
-            self.sidebar_frame.tkraise()
+        # Lift overlay and sidebar using clean hierarchy calls
+        if hasattr(self, 'overlay') and self.overlay.winfo_exists() and self.overlay.winfo_ismapped():
+            tk.Misc.tkraise(self.overlay)
+        if hasattr(self, 'sidebar_frame') and self.sidebar_frame.winfo_exists():
+            self.sidebar_frame.lift()
 
         if step < total_steps:
             self._tab_anim_id = self.root.after(
@@ -4796,18 +5066,39 @@ try {{
     def open_sidebar(self):
         if not self.sidebar_open:
             self.sidebar_open = True
+            if getattr(self, '_sidebar_anim_id', None):
+                try: self.root.after_cancel(self._sidebar_anim_id)
+                except Exception: pass
+                self._sidebar_anim_id = None
+
             if getattr(self, 'entertain_me', True):
                 self.generate_blur_overlay()
             else:
                 self.overlay.delete("all")
                 self.overlay.create_rectangle(0, 0, 3000, 3000, fill="#1e1f22")
+
+            # Place the overlay across the window and place the sidebar above it
             self.overlay.place(x=0, y=0, relwidth=1, relheight=1)
+            self.sidebar_frame.place(x=self.current_sidebar_x, y=0, width=self.sidebar_width, relheight=1)
+            
+            # Use tk.Misc.tkraise to elevate the canvas without triggering Canvas.tag_raise
             tk.Misc.tkraise(self.overlay)
-            self.sidebar_frame.tkraise()
+            self.sidebar_frame.lift()
+            
             self.animate_sidebar(0)
-
-
+    
     def generate_blur_overlay(self):
+        h_screen_dc = None
+        h_dc_small = None
+        h_bmp_small = None
+        h_old_small = None
+        h_dc_full = None
+        h_bmp_full = None
+        h_old_full = None
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
         try:
             self.root.update_idletasks()
             rx = self.root.winfo_rootx()
@@ -4815,34 +5106,28 @@ try {{
             rw = max(10, self.root.winfo_width())
             rh = max(10, self.root.winfo_height())
 
-            user32 = ctypes.windll.user32
-            gdi32 = ctypes.windll.gdi32
-
             h_screen_dc = user32.GetDC(0)
             if not h_screen_dc:
                 raise RuntimeError("Failed to acquire screen DC")
 
-            # 12x downsample for smooth, authentic frosted-glass blur
             scale_factor = 12
             sw = max(2, rw // scale_factor)
             sh = max(2, rh // scale_factor)
 
-            # Step 1: Downsample window area into small memory DC (Halftone area average)
             h_dc_small = gdi32.CreateCompatibleDC(h_screen_dc)
             h_bmp_small = gdi32.CreateCompatibleBitmap(h_screen_dc, sw, sh)
             h_old_small = gdi32.SelectObject(h_dc_small, h_bmp_small)
 
             pt = POINT()
-            gdi32.SetStretchBltMode(h_dc_small, 4)  # 4 = HALFTONE
+            gdi32.SetStretchBltMode(h_dc_small, 4)
             gdi32.SetBrushOrgEx(h_dc_small, 0, 0, ctypes.byref(pt))
             gdi32.StretchBlt(h_dc_small, 0, 0, sw, sh, h_screen_dc, rx, ry, rw, rh, 0x00CC0020)
 
-            # Step 2: Upsample back to full size (Halftone smooth bicubic/bilinear interpolation)
             h_dc_full = gdi32.CreateCompatibleDC(h_screen_dc)
             h_bmp_full = gdi32.CreateCompatibleBitmap(h_screen_dc, rw, rh)
             h_old_full = gdi32.SelectObject(h_dc_full, h_bmp_full)
 
-            gdi32.SetStretchBltMode(h_dc_full, 4)  # 4 = HALFTONE
+            gdi32.SetStretchBltMode(h_dc_full, 4)
             gdi32.SetBrushOrgEx(h_dc_full, 0, 0, ctypes.byref(pt))
             gdi32.StretchBlt(h_dc_full, 0, 0, rw, rh, h_dc_small, 0, 0, sw, sh, 0x00CC0020)
 
@@ -4868,7 +5153,7 @@ try {{
             bmi = BITMAPINFOHEADER()
             bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
             bmi.biWidth = rw
-            bmi.biHeight = -rh  # Top-down DIB
+            bmi.biHeight = -rh
             bmi.biPlanes = 1
             bmi.biBitCount = 24
             bmi.biCompression = 0
@@ -4877,30 +5162,17 @@ try {{
             res = gdi32.GetDIBits(h_dc_full, h_bmp_full, 0, rh, buf, ctypes.byref(bmi), 0)
             top_down = True
             if res == 0:
-                # Fallback to bottom-up DIB if display driver requires positive height
                 bmi.biHeight = rh
                 res = gdi32.GetDIBits(h_dc_full, h_bmp_full, 0, rh, buf, ctypes.byref(bmi), 0)
                 top_down = False
-
-            # Cleanup native GDI objects
-            gdi32.SelectObject(h_dc_small, h_old_small)
-            gdi32.DeleteObject(h_bmp_small)
-            gdi32.DeleteDC(h_dc_small)
-
-            gdi32.SelectObject(h_dc_full, h_old_full)
-            gdi32.DeleteObject(h_bmp_full)
-            gdi32.DeleteDC(h_dc_full)
-            user32.ReleaseDC(0, h_screen_dc)
 
             if res == 0:
                 raise RuntimeError("Failed to extract bitmap bits")
 
             raw_buf = bytes(buf)
-            # Reconstruct row order (top-down) removing byte-alignment padding
             row_order = range(rh) if top_down else reversed(range(rh))
             raw_bgr = b"".join(raw_buf[y * stride : y * stride + rw * 3] for y in row_order)
 
-            # Apply dark frosted tint LUT (dim to ~40% and blend with deep theme)
             lut_r = bytes(min(255, int(i * 0.38 + 14)) for i in range(256))
             lut_g = bytes(min(255, int(i * 0.38 + 16)) for i in range(256))
             lut_b = bytes(min(255, int(i * 0.42 + 22)) for i in range(256))
@@ -4923,19 +5195,43 @@ try {{
             self.blur_image = None
             self.overlay.delete("all")
             self.overlay.create_rectangle(0, 0, 3000, 3000, fill="#1e1f22")
+        finally:
+            if h_dc_small and h_old_small:
+                gdi32.SelectObject(h_dc_small, h_old_small)
+            if h_bmp_small:
+                gdi32.DeleteObject(h_bmp_small)
+            if h_dc_small:
+                gdi32.DeleteDC(h_dc_small)
 
+            if h_dc_full and h_old_full:
+                gdi32.SelectObject(h_dc_full, h_old_full)
+            if h_bmp_full:
+                gdi32.DeleteObject(h_bmp_full)
+            if h_dc_full:
+                gdi32.DeleteDC(h_dc_full)
+
+            if h_screen_dc:
+                user32.ReleaseDC(0, h_screen_dc)
+
+                
     def close_sidebar(self):
         if self.sidebar_open:
             self.sidebar_open = False
+            if getattr(self, '_sidebar_anim_id', None):
+                try: self.root.after_cancel(self._sidebar_anim_id)
+                except Exception: pass
+                self._sidebar_anim_id = None
             self.animate_sidebar(-self.sidebar_width)
+
 
     def animate_sidebar(self, target_x):
         if not getattr(self, 'entertain_me', True):
             self.current_sidebar_x = target_x
-            self.sidebar_frame.place(x=self.current_sidebar_x, y=0, relheight=1)
-            self.sidebar_frame.tkraise()
+            self.sidebar_frame.place(x=self.current_sidebar_x, y=0, width=self.sidebar_width, relheight=1)
+            self.sidebar_frame.lift()
             if target_x < 0:
                 self.overlay.place_forget()
+                self.sidebar_frame.place_forget()
                 self.overlay.delete("all")
                 self.blur_image = None
             return
@@ -4944,12 +5240,14 @@ try {{
 
         if abs(diff) <= 2:
             self.current_sidebar_x = target_x
-            self.sidebar_frame.place(x=self.current_sidebar_x, y=0, relheight=1)
-            self.sidebar_frame.tkraise()
+            self.sidebar_frame.place(x=self.current_sidebar_x, y=0, width=self.sidebar_width, relheight=1)
+            self.sidebar_frame.lift()
             if target_x < 0:
                 self.overlay.place_forget()
+                self.sidebar_frame.place_forget()
                 self.overlay.delete("all")
                 self.blur_image = None
+            self._sidebar_anim_id = None
             return
 
         step = int(diff * 0.34)
@@ -4957,11 +5255,10 @@ try {{
             step = 1 if diff > 0 else -1
 
         self.current_sidebar_x += step
-        self.sidebar_frame.place(x=self.current_sidebar_x, y=0, relheight=1)
-        # Keep sidebar rendered above content while sliding closed
-        self.sidebar_frame.tkraise()
-        self.root.after(12, lambda: self.animate_sidebar(target_x))
+        self.sidebar_frame.place(x=self.current_sidebar_x, y=0, width=self.sidebar_width, relheight=1)
+        self.sidebar_frame.lift()
 
+        self._sidebar_anim_id = self.root.after(12, lambda: self.animate_sidebar(target_x))        
 
     
     def on_hotkey_change(self, action_key, vk, mod_vks, name):
@@ -5029,7 +5326,7 @@ try {{
         self.preset_var.set("-- Select Preset --")
         self.show_tab("playback")
         self.update_status("Recording...", COLOR_DANGER)
-        if self.audio_cues: play_cue("start")
+        if self.audio_cues: play_cue("start_rec")
 
         self.queue_viewer.set_interactive(False)
         self.record_btn.set_state("normal", text=self.get_btn_text("stop_rec"), bg=BG_BORDER, hover=BG_HOVER)
