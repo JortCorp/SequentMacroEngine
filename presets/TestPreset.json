@@ -1,0 +1,102 @@
+[
+  {
+    "type": "combo",
+    "mods": [
+      16
+    ],
+    "vk": 84,
+    "name": "Shift + T"
+  },
+  {
+    "type": "key",
+    "key": "h"
+  },
+  {
+    "type": "key",
+    "key": "i"
+  },
+  {
+    "type": "key",
+    "key": "s"
+  },
+  {
+    "type": "press",
+    "vk": 32,
+    "name": "Space"
+  },
+  {
+    "type": "key",
+    "key": "i"
+  },
+  {
+    "type": "key",
+    "key": "s"
+  },
+  {
+    "type": "press",
+    "vk": 32,
+    "name": "Space"
+  },
+  {
+    "type": "key",
+    "key": "a"
+  },
+  {
+    "type": "press",
+    "vk": 32,
+    "name": "Space"
+  },
+  {
+    "type": "combo",
+    "mods": [
+      16
+    ],
+    "vk": 84,
+    "name": "Shift + T"
+  },
+  {
+    "type": "key",
+    "key": "e"
+  },
+  {
+    "type": "key",
+    "key": "s"
+  },
+  {
+    "type": "key",
+    "key": "t"
+  },
+  {
+    "type": "press",
+    "vk": 32,
+    "name": "Space"
+  },
+  {
+    "type": "combo",
+    "mods": [
+      16
+    ],
+    "vk": 80,
+    "name": "Shift + P"
+  },
+  {
+    "type": "key",
+    "key": "r"
+  },
+  {
+    "type": "key",
+    "key": "e"
+  },
+  {
+    "type": "key",
+    "key": "s"
+  },
+  {
+    "type": "key",
+    "key": "e"
+  },
+  {
+    "type": "key",
+    "key": "t"
+  }
+]
