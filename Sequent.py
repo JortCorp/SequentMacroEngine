@@ -100,6 +100,28 @@ def calculate_bezier_trajectory(start_pt, end_pt, steps=25):
     return points
 
 # --- Activate Windows Per-Monitor DPI Awareness ---
+
+def get_dpi_scale():
+    """Calculates the active display DPI scaling ratio (e.g., 1.0 for 100%, 1.25 for 125%, 1.5 for 150%)."""
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetDpiForSystem.restype = ctypes.c_uint
+        dpi = user32.GetDpiForSystem()
+        if dpi > 0:
+            return dpi / 96.0
+    except Exception:
+        pass
+    try:
+        hdc = ctypes.windll.user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX = 88
+        ctypes.windll.user32.ReleaseDC(0, hdc)
+        if dpi > 0:
+            return dpi / 96.0
+    except Exception:
+        pass
+    return 1.0
+
+
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2) # PROCESS_PER_MONITOR_DPI_AWARE
 except Exception:
@@ -2124,7 +2146,17 @@ class BuiltInMacroApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Sequent")
-        self.root.geometry("740x600")
+
+        # Dynamic DPI Scaling & Centering
+        self.dpi_scale = get_dpi_scale()
+        win_w = int(780 * self.dpi_scale)
+        win_h = int(640 * self.dpi_scale)
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        pos_x = max(0, (sw - win_w) // 2)
+        pos_y = max(0, (sh - win_h) // 2)
+
+        self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
         self.root.configure(bg=BG_APP)
         self.root.attributes('-topmost', True)
 
@@ -2150,6 +2182,10 @@ class BuiltInMacroApp:
         self.current_source_label = "Recorded Sequence"
         self.switching_preset = False
         
+        # Playback Thread Synchronization IDs
+        self.playback_run_id = 0
+        self._playback_ui_pending = False
+
         # Track mouse movements by default
         self.clicks_and_keys_only = False
         self.natural_timing = False
@@ -2187,7 +2223,7 @@ class BuiltInMacroApp:
             except Exception: pass
 
         self.sidebar_open = False
-        self.sidebar_width = 220
+        self.sidebar_width = int(220 * self.dpi_scale)
         self.current_sidebar_x = -self.sidebar_width
 
         self.hotkeys = {
@@ -2202,7 +2238,8 @@ class BuiltInMacroApp:
         self.refresh_preset_menu()
         self.setup_resizing_handles()
         Thread(target=self.global_hotkey_listener, daemon=True).start()
-        
+
+
     def set_app_window(self):
         hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
         style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
@@ -2326,7 +2363,10 @@ class BuiltInMacroApp:
         dy = event.y_root - self._resize_start_y
         w, h = self._resize_start_w, self._resize_start_h
         x, y = self._resize_start_win_x, self._resize_start_win_y
-        min_w, min_h = 580, 450
+
+        scale = getattr(self, 'dpi_scale', 1.0)
+        min_w = int(600 * scale)
+        min_h = int(480 * scale)
 
         if "e" in self._resize_edge: w = max(min_w, self._resize_start_w + dx)
         if "s" in self._resize_edge: h = max(min_h, self._resize_start_h + dy)
@@ -2338,6 +2378,7 @@ class BuiltInMacroApp:
 
         self.root.geometry(f"{int(w)}x{int(h)}+{int(x)}+{int(y)}")
 
+        
     def get_btn_text(self, action_type):
         hk = self.hotkeys[action_type]["name"]
         suffix = f" ({hk})" if hk and hk != "None" else ""
@@ -2539,7 +2580,7 @@ class BuiltInMacroApp:
     
     def build_playback_view(self):
         playback_header = tk.Frame(self.frame_playback, bg=BG_APP)
-        playback_header.pack(fill=tk.X, padx=20, pady=(15, 8))
+        playback_header.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(15, 8))
 
         left_header = tk.Frame(playback_header, bg=BG_APP)
         left_header.pack(side=tk.LEFT)
@@ -2565,14 +2606,13 @@ class BuiltInMacroApp:
         btn_save_file.bind("<Leave>", lambda e: btn_save_file.config(bg=BG_INPUT))
         DiscordTooltip(btn_save_file, "Export current queue", ".json")
 
-        # --- Interactive Playback Scrubber Header ---
+        # Scrubber Header Card
         self.scrub_card = DiscordCard(self.frame_playback, bg_card=BG_PANEL)
-        self.scrub_card.pack(fill=tk.X, padx=20, pady=(0, 10))
+        self.scrub_card.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(0, 10))
 
         top_scrub_row = tk.Frame(self.scrub_card, bg=BG_PANEL, padx=8, pady=6)
         top_scrub_row.pack(fill=tk.X)
 
-        # Stepper Buttons
         btn_reset = tk.Label(top_scrub_row, text="⏮", font=("Segoe UI", 10), bg=BG_PANEL, fg=TEXT_MUTED, cursor="hand2", padx=6, pady=2)
         btn_reset.pack(side=tk.LEFT, padx=(0, 2))
         btn_reset.bind("<Button-1>", lambda e: self.jump_to_start())
@@ -2601,11 +2641,9 @@ class BuiltInMacroApp:
         btn_step_run.bind("<Leave>", lambda e: btn_step_run.config(bg=BG_INPUT))
         DiscordTooltip(btn_step_run, "Execute Selected Step", "Space")
 
-        # Scrubber Slider Track
         self.scrubber = DiscordScrubberTrack(top_scrub_row, command=self.on_scrub)
         self.scrubber.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
 
-        # Counter Badge
         self.scrub_badge = tk.Label(
             top_scrub_row, text="[ 0 / 0 ]", font=("Consolas", 8, "bold"),
             bg=BG_INPUT, fg=SYNTAX_BLUE, padx=8, pady=3,
@@ -2614,7 +2652,6 @@ class BuiltInMacroApp:
         self.scrub_badge.pack(side=tk.RIGHT)
         DiscordTooltip(self.scrub_badge, "Nudge Selected Coordinates", "Alt + Arrows")
 
-        # Integrated Loop Selector
         self.loop_var = tk.StringVar(value=self.loop_mode)
         self.loop_menu = tk.OptionMenu(
             top_scrub_row, self.loop_var, *self.loop_options,
@@ -2631,7 +2668,6 @@ class BuiltInMacroApp:
         self.loop_menu.pack(side=tk.RIGHT, padx=(0, 6))
         DiscordTooltip(self.loop_menu, "Loop Repetitions", "Cycle")
 
-        # Action Preview Bar
         bot_preview_row = tk.Frame(self.scrub_card, bg=BG_HEADER, padx=10, pady=4)
         bot_preview_row.pack(fill=tk.X)
 
@@ -2643,22 +2679,9 @@ class BuiltInMacroApp:
         )
         self.lbl_active_action.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Queue Viewer
-        self.queue_viewer = VSCodeQueueViewer(self.frame_playback, app_instance=self)
-        self.queue_viewer.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 15))
-        self.queue_viewer.append_line("// Awaiting input...", SYNTAX_GREEN)
-
-        nudge_keys = [
-            ("<Alt-Left>", -1, 0), ("<Alt-Right>", 1, 0),
-            ("<Alt-Up>", 0, -1), ("<Alt-Down>", 0, 1),
-            ("<Alt-Shift-Left>", -5, 0), ("<Alt-Shift-Right>", 5, 0),
-            ("<Alt-Shift-Up>", 0, -5), ("<Alt-Shift-Down>", 0, 5),
-        ]
-        for seq, dx, dy in nudge_keys:
-            self.queue_viewer.code_text.bind(seq, lambda e, x=dx, y=dy: self.nudge_active_coordinate(x, y))
-
+        # Bottom Action Buttons - Packed to BOTTOM first to prevent truncation
         controls_frame = tk.Frame(self.frame_playback, bg=BG_APP)
-        controls_frame.pack(fill=tk.X, padx=20, pady=(0, 20))
+        controls_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(0, 20))
 
         self.record_btn = ModernButton(
             controls_frame, text=self.get_btn_text("start_rec"), 
@@ -2681,12 +2704,26 @@ class BuiltInMacroApp:
         )
         self.play_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
         DiscordTooltip(self.play_btn, "Run Active Sequence", self.hotkeys["start_play"]["name"])
-        
+
+        # Center Queue Viewer - Expands into all remaining vertical space
+        self.queue_viewer = VSCodeQueueViewer(self.frame_playback, app_instance=self)
+        self.queue_viewer.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=20, pady=(0, 15))
+        self.queue_viewer.append_line("// Awaiting input...", SYNTAX_GREEN)
+
+        nudge_keys = [
+            ("<Alt-Left>", -1, 0), ("<Alt-Right>", 1, 0),
+            ("<Alt-Up>", 0, -1), ("<Alt-Down>", 0, 1),
+            ("<Alt-Shift-Left>", -5, 0), ("<Alt-Shift-Right>", 5, 0),
+            ("<Alt-Shift-Up>", 0, -5), ("<Alt-Shift-Down>", 0, 5),
+        ]
+        for seq, dx, dy in nudge_keys:
+            self.queue_viewer.code_text.bind(seq, lambda e, x=dx, y=dy: self.nudge_active_coordinate(x, y))
+
+
         
     def build_sequencer_view(self):
-        # Header
         seq_header = tk.Frame(self.frame_sequencer, bg=BG_APP)
-        seq_header.pack(fill=tk.X, padx=20, pady=(15, 8))
+        seq_header.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(15, 8))
 
         left_header = tk.Frame(seq_header, bg=BG_APP)
         left_header.pack(side=tk.LEFT)
@@ -2712,7 +2749,7 @@ class BuiltInMacroApp:
 
         # Add Stage Card Builder
         add_card = DiscordCard(self.frame_sequencer, bg_card=BG_PANEL)
-        add_card.pack(fill=tk.X, padx=20, pady=(0, 10))
+        add_card.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(0, 10))
 
         add_row = tk.Frame(add_card, bg=BG_PANEL, padx=10, pady=8)
         add_row.pack(fill=tk.X)
@@ -2742,19 +2779,21 @@ class BuiltInMacroApp:
         btn_add_stage = ModernButton(add_row, text="+ Add Stage", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=self.add_chain_stage)
         btn_add_stage.pack(side=tk.RIGHT)
 
-        # Scrollable Chain Stages Timeline
-        self.chain_scroll = DiscordScrollableFrame(self.frame_sequencer, bg=BG_APP)
-        self.chain_scroll.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 15))
-
-        # Bottom Chain Controls
+        # Bottom Chain Controls - Packed to BOTTOM first to prevent truncation
         chain_controls = tk.Frame(self.frame_sequencer, bg=BG_APP)
-        chain_controls.pack(fill=tk.X, padx=20, pady=(0, 20))
+        chain_controls.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(0, 20))
 
         btn_clear_chain = ModernButton(chain_controls, text="Clear All Stages", bg_color=BG_BORDER, hover_color=DISCORD_RED, command=self.clear_chain)
         btn_clear_chain.pack(side=tk.LEFT, padx=(0, 6))
 
         self.btn_run_chain = ModernButton(chain_controls, text="▶ Run Macro Chain (F9)", bg_color=DISCORD_GREEN, hover_color="#1d8a4b", command=self.toggle_chain_run)
         self.btn_run_chain.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(6, 0))
+
+        # Scrollable Chain Stages Timeline - Expands into all remaining vertical space
+        self.chain_scroll = DiscordScrollableFrame(self.frame_sequencer, bg=BG_APP)
+        self.chain_scroll.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=20, pady=(0, 15))
+
+
     def refresh_sequencer_preset_dropdown(self):
         menu = self.seq_preset_menu["menu"]
         menu.delete(0, "end")
@@ -3053,7 +3092,7 @@ class BuiltInMacroApp:
                 self.display_actions_in_queue(self.recorded_actions, "Recorded Sequence")
                 if self.recorded_actions:
                     self.current_action_idx = len(self.recorded_actions) - 1
-                self.update_scrubber_ui()
+                self.update_scrubber_ui(show_reticle=True)
             else:
                 self.queue_viewer.close_sub_menu()
                 self.queue_viewer.set_interactive(False)
@@ -3069,12 +3108,18 @@ class BuiltInMacroApp:
             return
 
         self.is_paused = not self.is_paused
+        # Invalidate any backlogged UI callbacks from the running thread
+        self.playback_run_id = time.time()
+        self._playback_ui_pending = False
+
         if self.is_paused:
             self.update_status("Paused", SYNTAX_ORANGE)
             if self.audio_cues: play_cue("pause")
             self.pause_btn.set_state("normal", text="Resume (F9)", bg=DISCORD_GREEN, hover="#1d8a4b")
             self.queue_viewer.set_interactive(True)
-            self.update_scrubber_ui()
+            if hasattr(self, 'ghost_reticle'):
+                self.ghost_reticle.hide()
+            self.update_scrubber_ui(show_reticle=False)
         else:
             self.queue_viewer.close_sub_menu()
             self.queue_viewer.set_interactive(False)
@@ -3083,7 +3128,8 @@ class BuiltInMacroApp:
             self.update_status(f"Resuming #{self.current_action_idx + 1}...", DISCORD_BLURPLE)
             if self.audio_cues: play_cue("resume")
             self.pause_btn.set_state("normal", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
-            
+
+
     def trigger_action(self, action):
         if action == "start_play":
             if self.recording or self.playing or self.chain_running:
@@ -3176,7 +3222,7 @@ class BuiltInMacroApp:
         return TEXT_PRIMARY
 
 
-    def update_scrubber_ui(self):
+    def update_scrubber_ui(self, show_reticle=True):
         total = len(self.recorded_actions)
         if total == 0:
             self.current_action_idx = 0
@@ -3198,20 +3244,45 @@ class BuiltInMacroApp:
         self.queue_viewer.highlight_action(self.current_action_idx)
 
         if hasattr(self, 'ghost_reticle'):
-            # Only show reticle when genuinely idle (stopped) or paused
+            # Only display reticle during explicit manual inspection/scrubbing, never during playback
             is_active_running = (self.playing and not self.is_paused) or (self.recording and not self.recording_paused)
-            if not is_active_running:
+            if not is_active_running and not self.playing and show_reticle:
                 self.ghost_reticle.update(self.recorded_actions, self.current_action_idx)
             else:
                 self.ghost_reticle.hide()
-    
-            
+
     def set_active_action_index(self, index):
         # Ignore delayed queue dispatches if macro playback has already been stopped
         if not self.playing and not self.recording and not self.chain_running:
             return
         self.current_action_idx = index
         self.update_scrubber_ui()
+
+    def set_playback_step(self, index):
+        if not self.playing and not self.chain_running:
+            return
+        total = len(self.recorded_actions)
+        if total == 0: return
+
+        self.current_action_idx = max(0, min(index, total - 1))
+        self.scrubber.set_position(self.current_action_idx, total)
+        self.scrub_badge.config(text=f"[ {self.current_action_idx + 1} / {total} ]", fg=SYNTAX_BLUE)
+
+        current_act = self.recorded_actions[self.current_action_idx]
+        desc = self.get_action_summary(current_act)
+        self.lbl_active_action.config(text=f"Action #{self.current_action_idx + 1}: {desc}", fg=SYNTAX_GREEN)
+        self.queue_viewer.highlight_action(self.current_action_idx)
+
+        # The ghost reticle must remain completely suppressed during active playback updates
+        if hasattr(self, 'ghost_reticle'):
+            self.ghost_reticle.hide()
+
+    def _on_playback_step(self, index, run_id):
+        self._playback_ui_pending = False
+        # Drop stale updates from prior loops or invalidated runs
+        if run_id != self.playback_run_id or not self.playing:
+            return
+        self.set_playback_step(index)
 
     def on_scrub(self, index):
         if (self.recording and not self.recording_paused) or self.playing: return
@@ -4503,6 +4574,9 @@ try {{
         Thread(target=self.run_sequence, daemon=True).start()
 
     def stop_macro(self):
+        # Immediately invalidate all pending playback callbacks
+        self.playback_run_id = time.time()
+        self._playback_ui_pending = False
         self.playing = False
         self.is_paused = False
         self.update_status("Stopped by user", SYNTAX_ORANGE)
@@ -4516,7 +4590,8 @@ try {{
         self.play_btn.set_state("normal", text=self.get_btn_text("start_play"), bg=DISCORD_BLURPLE, hover=DISCORD_BLURPLE_HOV)
         self.record_btn.set_state("normal", text=self.get_btn_text("start_rec"), bg=DISCORD_RED, hover=DISCORD_RED_HOV)
         self.queue_viewer.set_interactive(True)
-        self.update_scrubber_ui()
+        self.update_scrubber_ui(show_reticle=False)
+
 
     def prompt_user_input(self, prompt_text, default_val=""):
         import threading
@@ -4652,6 +4727,10 @@ try {{
             start_idx = 0
             self.current_action_idx = 0
 
+        self.playback_run_id = time.time()
+        self._playback_ui_pending = False
+        run_id = self.playback_run_id
+
         self.root.after(0, lambda: self.update_status(f"Running (from #{start_idx + 1})...", DISCORD_BLURPLE))
         if self.audio_cues: play_cue("start")
         time.sleep(0.3) 
@@ -4678,6 +4757,8 @@ try {{
                     if step_ptr in self.breakpoints:
                         if self.audio_cues: play_cue("pause")
                         self.is_paused = True
+                        self.playback_run_id = time.time()
+                        self._playback_ui_pending = False
                         bp_line = step_ptr + 2
                         self.root.after(0, lambda l=bp_line: self.update_status(f"Breakpoint hit at Line {l}", DISCORD_RED))
                         self.root.after(0, lambda: self.pause_btn.set_state("normal", text="Resume (F9)", bg=DISCORD_GREEN, hover="#1d8a4b"))
@@ -4686,10 +4767,13 @@ try {{
                         if not self.playing: break
 
                     action = self.recorded_actions[step_ptr]
-
-                    i = step_ptr
-                    self.root.after(0, lambda idx=i: self.set_active_action_index(idx))
                     act_type = action.get("type")
+
+                    # Synchronized UI step notification (prevents flooding Tkinter event loop)
+                    i = step_ptr
+                    if not self._playback_ui_pending or act_type != "move":
+                        self._playback_ui_pending = True
+                        self.root.after(0, lambda idx=i, rid=run_id: self._on_playback_step(idx, rid))
 
                     # Flow Labels & Goto Jumps
                     if act_type == "label":
@@ -5008,8 +5092,10 @@ try {{
             if not self.switching_preset:
                 self.root.after(0, self.finish_macro)
 
-    
+
     def finish_macro(self):
+        self.playback_run_id = time.time()
+        self._playback_ui_pending = False
         self.playing = False
         self.is_paused = False
         self.update_status("Finished", DISCORD_GREEN)
@@ -5024,7 +5110,8 @@ try {{
         self.record_btn.set_state("normal", text=self.get_btn_text("start_rec"), bg=DISCORD_RED, hover=DISCORD_RED_HOV)
         self.play_btn.set_state("normal", text=self.get_btn_text("start_play"), bg=DISCORD_BLURPLE, hover=DISCORD_BLURPLE_HOV)
         self.pause_btn.set_state("disabled", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
-        self.update_scrubber_ui()
+        self.update_scrubber_ui(show_reticle=False)
+
 
 
 if __name__ == "__main__":
