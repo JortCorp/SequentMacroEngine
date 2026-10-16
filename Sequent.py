@@ -358,7 +358,7 @@ def press_key_combo(mods, vk, hold_time=0.06):
         m_scan = ctypes.windll.user32.MapVirtualKeyW(m, 0)
         ctypes.windll.user32.keybd_event(m, m_scan, m_flags | KEYEVENTF_KEYUP, 0)
 
-# --- Discord Theme Palette ---
+# --- Modern Theme Palette ---
 BG_APP = "#313338"
 BG_SIDEBAR = "#2b2d31"
 BG_HEADER = "#1e1f22"
@@ -376,11 +376,11 @@ TEXT_PRIMARY = "#f2f3f5"
 TEXT_MUTED = "#949ba4"
 TEXT_HEADER = "#ffffff"
 
-DISCORD_BLURPLE = "#5865f2"
-DISCORD_BLURPLE_HOV = "#4752c4"
-DISCORD_RED = "#da373c"
-DISCORD_RED_HOV = "#a12828"
-DISCORD_GREEN = "#23a55a"
+COLOR_ACCENT = "#5865f2"
+COLOR_ACCENT_HOV = "#4752c4"
+COLOR_DANGER = "#da373c"
+COLOR_DANGER_HOV = "#a12828"
+COLOR_SUCCESS = "#23a55a"
 DISABLED = "#383a40"
 
 SYNTAX_BLUE = "#00a8fc"
@@ -388,8 +388,8 @@ SYNTAX_ORANGE = "#f0b232"
 SYNTAX_PURPLE = "#c586c0"
 SYNTAX_GREEN = "#23a55a"
 
-class DiscordTooltip:
-    """Renders a sleek Discord-themed floating micro-tooltip with hotkey badges."""
+class ModernTooltip:
+    """Renders a sleek Modern-themed floating micro-tooltip with hotkey badges."""
     def __init__(self, widget, text, hotkey=None, delay_ms=350):
         self.widget = widget
         self.text = text
@@ -455,12 +455,12 @@ class DiscordTooltip:
         self.tip_win.geometry(f"+{final_x}+{y}")
 
 # --- Lightweight Bordered Container ---
-class DiscordCard(tk.Frame):
+class ModernCard(tk.Frame):
     def __init__(self, parent, bg_card=BG_PANEL, border_color=BG_BORDER, **kwargs):
         super().__init__(parent, bg=bg_card, highlightbackground=border_color, highlightthickness=1, **kwargs)
 
 # --- Thick Custom Dark Mode Scrollbar ---
-class DiscordScrollBar(tk.Canvas):
+class ModernScrollBar(tk.Canvas):
     def __init__(self, parent, command=None, width=18, bg_trough=BG_SCROLL_TRACK,
                  thumb_color=TRACK_INACTIVE, hover_color=TRACK_HOVER, active_color=TRACK_ACTIVE, **kwargs):
         super().__init__(parent, width=width, bg=bg_trough, highlightthickness=0, bd=0, cursor="hand2", **kwargs)
@@ -613,7 +613,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.sep.pack(side=tk.LEFT, fill=tk.Y)
 
         # Dynamic scrollbar and separator (packed dynamically only when content overflows)
-        self.scrollbar = DiscordScrollBar(
+        self.scrollbar = ModernScrollBar(
             self, command=self._on_scrollbar_scroll,
             width=18, bg_trough=BG_SCROLL_TRACK
         )
@@ -632,7 +632,7 @@ class VSCodeQueueViewer(tk.Frame):
             bg=BG_GUTTER, fg=TEXT_MUTED, cursor="hand2", padx=0, pady=0,
             anchor="center"
         )
-        self.plus_btn.bind("<Enter>", lambda e: self.plus_btn.config(fg="#ffffff", bg=DISCORD_BLURPLE))
+        self.plus_btn.bind("<Enter>", lambda e: self.plus_btn.config(fg="#ffffff", bg=COLOR_ACCENT))
         self.plus_btn.bind("<Leave>", lambda e: self.plus_btn.config(fg=TEXT_MUTED, bg=BG_GUTTER))
         self.plus_btn.bind("<Button-1>", self._on_plus_btn_click)
 
@@ -655,7 +655,7 @@ class VSCodeQueueViewer(tk.Frame):
 
         self.code_text.tag_configure("active_line", background="#36394a")
         self.code_text.tag_lower("active_line")
-        self.gutter.tag_configure("active_line", background=DISCORD_BLURPLE, foreground="#ffffff")
+        self.gutter.tag_configure("active_line", background=COLOR_ACCENT, foreground="#ffffff")
         self.gutter.tag_raise("active_line")
 
 
@@ -684,7 +684,7 @@ class VSCodeQueueViewer(tk.Frame):
                 cy = gy + gh // 2
                 self.gutter_margin.create_oval(
                     cx - r, cy - r, cx + r, cy + r,
-                    fill=DISCORD_RED, outline="#ff7b7b", width=1, tags="bp_dot"
+                    fill=COLOR_DANGER, outline="#ff7b7b", width=1, tags="bp_dot"
                 )
 
     def _on_gutter_margin_click(self, event):
@@ -852,7 +852,7 @@ class VSCodeQueueViewer(tk.Frame):
             return
 
         self.code_text.mark_set("insert", f"{line_num}.0")
-        menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE, activeforeground=TEXT_PRIMARY, bd=1, relief="flat", font=("Segoe UI", 9))
+        menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, activeforeground=TEXT_PRIMARY, bd=1, relief="flat", font=("Segoe UI", 9))
 
         if line_num >= 2 and (line_num - 2) < len(self.app.recorded_actions):
             act_idx = line_num - 2
@@ -1046,7 +1046,7 @@ class VSCodeQueueViewer(tk.Frame):
         action_var = tk.StringVar(value="Delay")
         action_menu = tk.OptionMenu(top_row, action_var, *action_options, command=lambda val: self._switch_action_view(val, line_num))
         action_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER, font=("Segoe UI", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        action_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE, bd=1, relief="flat")
+        action_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
         action_menu.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.action_content_frame = tk.Frame(card, bg=BG_PANEL, padx=12, pady=4)
@@ -1107,7 +1107,7 @@ class VSCodeQueueViewer(tk.Frame):
         name_entry.focus_set()
         name_entry.select_range(0, "end")
 
-        lbl_error = tk.Label(body, text="", font=("Segoe UI", 8), bg=BG_PANEL, fg=DISCORD_RED, anchor="w")
+        lbl_error = tk.Label(body, text="", font=("Segoe UI", 8), bg=BG_PANEL, fg=COLOR_DANGER, anchor="w")
         lbl_error.pack(fill=tk.X, pady=(0, 6))
 
         def clear_error(event=None):
@@ -1119,7 +1119,7 @@ class VSCodeQueueViewer(tk.Frame):
         def submit():
             name = name_entry.get().strip()
             if not name:
-                name_entry.config(highlightbackground=DISCORD_RED)
+                name_entry.config(highlightbackground=COLOR_DANGER)
                 lbl_error.config(text="Label name cannot be empty.")
                 return
 
@@ -1131,9 +1131,9 @@ class VSCodeQueueViewer(tk.Frame):
             }
 
             if name.lower() in current_existing:
-                name_entry.config(highlightbackground=DISCORD_RED)
+                name_entry.config(highlightbackground=COLOR_DANGER)
                 lbl_error.config(text=f"Label '{name}' already exists!")
-                self.app.update_status(f"Duplicate label '{name}' rejected", DISCORD_RED)
+                self.app.update_status(f"Duplicate label '{name}' rejected", COLOR_DANGER)
                 if self.app.audio_cues:
                     play_cue("error")
                 return
@@ -1141,11 +1141,11 @@ class VSCodeQueueViewer(tk.Frame):
             idx = max(0, min(line_num - 1, len(self.app.recorded_actions)))
             self.app.recorded_actions.insert(idx, {"type": "label", "name": name})
             self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.update_status(f"Added label '{name}'", DISCORD_GREEN)
+            self.app.update_status(f"Added label '{name}'", COLOR_SUCCESS)
             self.close_sub_menu()
 
         name_entry.bind("<Return>", lambda e: submit())
-        ModernButton(body, text="Add Label Marker", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=submit).pack(fill=tk.X)
+        ModernButton(body, text="Add Label Marker", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
     def _render_goto_view(self, line_num):
         body = self.action_content_frame
@@ -1167,7 +1167,7 @@ class VSCodeQueueViewer(tk.Frame):
                 font=("Consolas", 9, "bold"), highlightthickness=1, highlightbackground=BG_BORDER,
                 bd=0, relief="flat", cursor="hand2"
             )
-            lbl_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE, bd=1, relief="flat")
+            lbl_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
             lbl_menu.pack(fill=tk.X, pady=(0, 10))
 
             def submit():
@@ -1178,7 +1178,7 @@ class VSCodeQueueViewer(tk.Frame):
                 self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.close_sub_menu()
 
-            ModernButton(body, text="Add Jump Instruction", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=submit).pack(fill=tk.X)
+            ModernButton(body, text="Add Jump Instruction", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
         else:
             target_entry = tk.Entry(
                 body, bg=BG_INPUT, fg=SYNTAX_PURPLE,
@@ -1201,7 +1201,7 @@ class VSCodeQueueViewer(tk.Frame):
                 self.close_sub_menu()
 
             target_entry.bind("<Return>", lambda e: submit())
-            ModernButton(body, text="Add Jump Instruction", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=submit).pack(fill=tk.X)
+            ModernButton(body, text="Add Jump Instruction", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
     
     def _render_wait_pixel_view(self, line_num):
         body = self.action_content_frame
@@ -1232,13 +1232,13 @@ class VSCodeQueueViewer(tk.Frame):
             if self.sub_menu: self.sub_menu.withdraw()
             self.app.start_pixel_inspection(on_pixel_sampled)
 
-        btn_inspect = ModernButton(body, text="⌖ Inspect Desktop Pixel", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=trigger_inspect)
+        btn_inspect = ModernButton(body, text="⌖ Inspect Desktop Pixel", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=trigger_inspect)
         btn_inspect.pack(fill=tk.X, pady=(0, 8))
 
         pos_var = tk.StringVar(value=f"Before Line {line_num}")
         pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
         pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE)
+        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         pos_menu.pack(fill=tk.X, pady=(0, 8))
 
         def submit_wait_pixel():
@@ -1248,7 +1248,7 @@ class VSCodeQueueViewer(tk.Frame):
                 color = col_entry.get().strip().upper()
                 if not re.match(r"^#[0-9A-F]{6}$", color): raise ValueError
             except ValueError:
-                col_entry.config(highlightbackground=DISCORD_RED)
+                col_entry.config(highlightbackground=COLOR_DANGER)
                 return
 
             is_after = "After" in pos_var.get()
@@ -1262,7 +1262,7 @@ class VSCodeQueueViewer(tk.Frame):
             self.app.set_active_action_index(insert_idx)
             self.close_sub_menu()
 
-        ModernButton(body, text="Add Wait Pixel", bg_color=DISCORD_GREEN, hover_color="#1d8a4b", command=submit_wait_pixel).pack(fill=tk.X)
+        ModernButton(body, text="Add Wait Pixel", bg_color=COLOR_SUCCESS, hover_color="#1d8a4b", command=submit_wait_pixel).pack(fill=tk.X)
 
     def _render_read_clipboard_view(self, line_num):
         body = self.action_content_frame
@@ -1292,7 +1292,7 @@ class VSCodeQueueViewer(tk.Frame):
         pos_var = tk.StringVar(value=f"Before Line {line_num}")
         pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
         pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE)
+        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         pos_menu.pack(fill=tk.X, pady=(4, 10))
 
         def submit():
@@ -1314,10 +1314,10 @@ class VSCodeQueueViewer(tk.Frame):
                 "value": v_val
             })
             self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.update_status(f"Added Clipboard Check for '{v_name}'", DISCORD_GREEN)
+            self.app.update_status(f"Added Clipboard Check for '{v_name}'", COLOR_SUCCESS)
             self.close_sub_menu()
 
-        ModernButton(body, text="Add Clipboard Search", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=submit).pack(fill=tk.X)
+        ModernButton(body, text="Add Clipboard Search", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
     def _render_type_variable_view(self, line_num):
         body = self.action_content_frame
@@ -1331,7 +1331,7 @@ class VSCodeQueueViewer(tk.Frame):
         pos_var = tk.StringVar(value=f"Before Line {line_num}")
         pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
         pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE)
+        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         pos_menu.pack(fill=tk.X, pady=(0, 10))
 
         def submit():
@@ -1347,11 +1347,11 @@ class VSCodeQueueViewer(tk.Frame):
                 "var_name": v_name
             })
             self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.update_status(f"Added Type Variable '{v_name}'", DISCORD_GREEN)
+            self.app.update_status(f"Added Type Variable '{v_name}'", COLOR_SUCCESS)
             self.close_sub_menu()
 
         var_entry.bind("<Return>", lambda e: submit())
-        ModernButton(body, text="Add Type Variable", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=submit).pack(fill=tk.X)
+        ModernButton(body, text="Add Type Variable", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
     def _render_if_var_view(self, line_num):
         body = self.action_content_frame
@@ -1373,7 +1373,7 @@ class VSCodeQueueViewer(tk.Frame):
         op_var = tk.StringVar(value="==")
         op_menu = tk.OptionMenu(v_mid, op_var, "==", "!=", "contains", "not empty")
         op_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-        op_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE, bd=1, relief="flat")
+        op_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
         op_menu.pack(fill=tk.X)
 
         v_right = tk.Frame(cond_row, bg=BG_PANEL)
@@ -1389,7 +1389,7 @@ class VSCodeQueueViewer(tk.Frame):
         action_mode_var = tk.StringVar(value="Switch to Preset")
         mode_menu = tk.OptionMenu(body, action_mode_var, "Switch to Preset", "Browse & Run File", "Jump to Label", command=lambda m: render_target_input(m))
         mode_menu.config(bg=BG_INPUT, fg=SYNTAX_BLUE, font=("Segoe UI", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-        mode_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE, bd=1, relief="flat")
+        mode_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
         mode_menu.pack(fill=tk.X, pady=(0, 6))
 
         # Dynamic Target Input Area
@@ -1411,7 +1411,7 @@ class VSCodeQueueViewer(tk.Frame):
                 def on_p_select(val): target_state["target"] = val
                 p_menu = tk.OptionMenu(target_container, p_var, *(presets if presets else ["-- No Presets Found --"]), command=on_p_select)
                 p_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-                p_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE, bd=1, relief="flat")
+                p_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
                 p_menu.pack(fill=tk.X)
 
             elif mode == "Browse & Run File":
@@ -1435,7 +1435,7 @@ class VSCodeQueueViewer(tk.Frame):
                         target_state["target"] = os.path.abspath(chosen)
                         lbl_file.config(text=os.path.basename(chosen), fg=SYNTAX_GREEN)
 
-                btn_b = tk.Label(f_row, text="Browse", font=("Segoe UI", 8, "bold"), bg=DISCORD_BLURPLE, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3)
+                btn_b = tk.Label(f_row, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3)
                 btn_b.pack(side=tk.RIGHT)
                 btn_b.bind("<Button-1>", lambda e: browse_file())
 
@@ -1448,7 +1448,7 @@ class VSCodeQueueViewer(tk.Frame):
                     def on_l_select(val): target_state["target"] = val
                     l_menu = tk.OptionMenu(target_container, l_var, *labels, command=on_l_select)
                     l_menu.config(bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-                    l_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE, bd=1, relief="flat")
+                    l_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
                     l_menu.pack(fill=tk.X)
                 else:
                     l_entry = tk.Entry(target_container, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
@@ -1463,7 +1463,7 @@ class VSCodeQueueViewer(tk.Frame):
         pos_var = tk.StringVar(value=f"Before Line {line_num}")
         pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
         pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE)
+        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         pos_menu.pack(fill=tk.X, pady=(2, 8))
 
         def submit():
@@ -1489,10 +1489,10 @@ class VSCodeQueueViewer(tk.Frame):
                 "target": t_val
             })
             self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.update_status(f"Added Conditional Branch for '{v_name}'", DISCORD_GREEN)
+            self.app.update_status(f"Added Conditional Branch for '{v_name}'", COLOR_SUCCESS)
             self.close_sub_menu()
 
-        ModernButton(body, text="Add Conditional Branch", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=submit).pack(fill=tk.X)
+        ModernButton(body, text="Add Conditional Branch", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
     def _render_request_input_view(self, line_num):
         body = self.action_content_frame
@@ -1522,7 +1522,7 @@ class VSCodeQueueViewer(tk.Frame):
         pos_var = tk.StringVar(value=f"Before Line {line_num}")
         pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
         pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE)
+        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         pos_menu.pack(fill=tk.X, pady=(4, 8))
 
         def submit():
@@ -1541,12 +1541,12 @@ class VSCodeQueueViewer(tk.Frame):
                 "default": d_val
             })
             self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.update_status(f"Added Request Input for '{v_name}'", DISCORD_GREEN)
+            self.app.update_status(f"Added Request Input for '{v_name}'", COLOR_SUCCESS)
             self.close_sub_menu()
 
         prompt_entry.bind("<Return>", lambda e: submit())
         var_entry.bind("<Return>", lambda e: submit())
-        ModernButton(body, text="Add Request Input", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=submit).pack(fill=tk.X)
+        ModernButton(body, text="Add Request Input", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
     
     def _render_delay_view(self, line_num):
         body = self.action_content_frame
@@ -1578,7 +1578,7 @@ class VSCodeQueueViewer(tk.Frame):
         pos_var = tk.StringVar(value=f"Before Line {line_num}")
         pos_menu = tk.OptionMenu(pos_frame, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
         pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE)
+        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         pos_menu.pack(fill=tk.X)
 
         def submit_delay(event=None):
@@ -1586,7 +1586,7 @@ class VSCodeQueueViewer(tk.Frame):
                 sec_val = float(delay_entry.get().strip())
                 if sec_val < 0.001: raise ValueError
             except ValueError:
-                delay_entry.config(highlightbackground=DISCORD_RED)
+                delay_entry.config(highlightbackground=COLOR_DANGER)
                 return
 
             is_after = "After" in pos_var.get()
@@ -1596,7 +1596,7 @@ class VSCodeQueueViewer(tk.Frame):
             self.close_sub_menu()
 
         delay_entry.bind("<Return>", submit_delay)
-        ModernButton(body, text="Add Delay", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=submit_delay).pack(fill=tk.X)
+        ModernButton(body, text="Add Delay", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit_delay).pack(fill=tk.X)
 
     def _render_search_area_view(self, line_num):
         body = self.action_content_frame
@@ -1616,7 +1616,7 @@ class VSCodeQueueViewer(tk.Frame):
                 text_entry.config(state="normal")
                 text_entry.delete(0, "end")
 
-        any_toggle = DiscordPillToggle(any_row, initial_state=False, command=toggle_match_any)
+        any_toggle = ModernPillToggle(any_row, initial_state=False, command=toggle_match_any)
         any_toggle.pack(side=tk.RIGHT)
 
         tk.Label(body, text="Target Text:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
@@ -1640,7 +1640,7 @@ class VSCodeQueueViewer(tk.Frame):
             if self.sub_menu: self.sub_menu.withdraw()
             self.app.start_screen_selection(lambda a: (on_area_snip_completed(a), self.sub_menu.deiconify() if self.sub_menu else None))
 
-        btn_snip = tk.Label(area_row, text="⛶ Snip", font=("Segoe UI", 8, "bold"), bg=DISCORD_BLURPLE, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3)
+        btn_snip = tk.Label(area_row, text="⛶ Snip", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3)
         btn_snip.pack(side=tk.RIGHT)
         btn_snip.bind("<Button-1>", lambda e: trigger_snip())
 
@@ -1650,23 +1650,23 @@ class VSCodeQueueViewer(tk.Frame):
 
         opt_preset = tk.OptionMenu(body, preset_var, *(preset_names if preset_names else ["-- No Presets Found --"]))
         opt_preset.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        opt_preset["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE)
+        opt_preset["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         opt_preset.pack(fill=tk.X, pady=(0, 8))
 
         pos_var = tk.StringVar(value=f"Before Line {line_num}")
         pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
         pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE)
+        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         pos_menu.pack(fill=tk.X, pady=(0, 10))
 
         def submit_search_area(event=None):
             is_match_any = match_any_state["val"]
             search_str = text_entry.get().strip()
             if not is_match_any and not search_str:
-                text_entry.config(highlightbackground=DISCORD_RED)
+                text_entry.config(highlightbackground=COLOR_DANGER)
                 return
             if not selected_box["area"]:
-                lbl_area_status.config(highlightbackground=DISCORD_RED, text="Area Required!")
+                lbl_area_status.config(highlightbackground=COLOR_DANGER, text="Area Required!")
                 return
             target_preset = preset_var.get()
             if target_preset == "-- No Presets Found --": return
@@ -1679,7 +1679,7 @@ class VSCodeQueueViewer(tk.Frame):
             self.close_sub_menu()
 
         text_entry.bind("<Return>", submit_search_area)
-        ModernButton(body, text="Add Search Action", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=submit_search_area).pack(fill=tk.X)
+        ModernButton(body, text="Add Search Action", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit_search_area).pack(fill=tk.X)
 
     def close_sub_menu(self):
         if self.sub_menu:
@@ -1687,13 +1687,13 @@ class VSCodeQueueViewer(tk.Frame):
             except Exception: pass
             self.sub_menu = None
             
-# --- Discord-Styled Scrollable Frame ---
-class DiscordScrollableFrame(tk.Frame):
+# --- Modern-Styled Scrollable Frame ---
+class ModernScrollableFrame(tk.Frame):
     def __init__(self, parent, bg=BG_APP, **kwargs):
         super().__init__(parent, bg=bg, **kwargs)
 
         self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
-        self.scrollbar = DiscordScrollBar(self, command=self.canvas.yview, width=18, bg_trough=BG_SCROLL_TRACK)
+        self.scrollbar = ModernScrollBar(self, command=self.canvas.yview, width=18, bg_trough=BG_SCROLL_TRACK)
         self.scrollable_frame = tk.Frame(self.canvas, bg=bg)
 
         self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
@@ -1729,7 +1729,7 @@ class DiscordScrollableFrame(tk.Frame):
         if self.scrollbar.winfo_ismapped():
             self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-# --- Custom Discord UI Components ---
+# --- Custom Modern UI Components ---
 class ModernButton(tk.Frame):
     def __init__(self, parent, text, bg_color, hover_color, command, **kwargs):
         super().__init__(parent, bg=bg_color, cursor="hand2", **kwargs)
@@ -1773,7 +1773,7 @@ class ModernButton(tk.Frame):
         self.label.configure(cursor=cursor)
         self.label.config(fg=TEXT_MUTED if self.disabled else TEXT_PRIMARY)
 
-class DiscordPillToggle(tk.Canvas):
+class ModernPillToggle(tk.Canvas):
     def __init__(self, parent, initial_state=True, command=None, width=44, height=22, **kwargs):
         super().__init__(parent, width=width, height=height, bg=BG_PANEL, highlightthickness=0, cursor="hand2", **kwargs)
         self.state = initial_state
@@ -1786,7 +1786,7 @@ class DiscordPillToggle(tk.Canvas):
 
     def draw(self):
         self.delete("all")
-        bg_color = DISCORD_BLURPLE if self.state else BG_BORDER
+        bg_color = COLOR_ACCENT if self.state else BG_BORDER
         
         r = self.h / 2
         self.create_arc(0, 0, self.h, self.h, start=90, extent=180, fill=bg_color, outline=bg_color)
@@ -1809,7 +1809,7 @@ class DiscordPillToggle(tk.Canvas):
         if self.command:
             self.command(self.state)
 
-class DiscordSlider(tk.Canvas):
+class ModernSlider(tk.Canvas):
     def __init__(self, parent, min_val=1.0, max_val=10.0, step=0.5, initial_val=1.0, command=None, width=180, height=24, **kwargs):
         super().__init__(parent, width=width, height=height, bg=BG_PANEL, highlightthickness=0, cursor="hand2", **kwargs)
         self.min_val = min_val
@@ -1841,7 +1841,7 @@ class DiscordSlider(tk.Canvas):
         self.create_line(x_start, cy, x_end, cy, fill=TRACK_INACTIVE, width=self.track_h, capstyle="round")
 
         if knob_x > x_start:
-            self.create_line(x_start, cy, knob_x, cy, fill=DISCORD_BLURPLE, width=self.track_h, capstyle="round")
+            self.create_line(x_start, cy, knob_x, cy, fill=COLOR_ACCENT, width=self.track_h, capstyle="round")
 
         self.create_oval(
             knob_x - self.knob_r, cy - self.knob_r,
@@ -1873,7 +1873,7 @@ class DiscordSlider(tk.Canvas):
         self.val = max(self.min_val, min(val, self.max_val))
         self.draw()
 
-class DiscordScrubberTrack(tk.Canvas):
+class ModernScrubberTrack(tk.Canvas):
     def __init__(self, parent, command=None, height=22, bg=BG_INPUT, **kwargs):
         super().__init__(parent, height=height, bg=bg, highlightthickness=0, cursor="hand2", **kwargs)
         self.command = command
@@ -1918,7 +1918,7 @@ class DiscordScrubberTrack(tk.Canvas):
         knob_x = x0 + (ratio * usable_w)
 
         if knob_x > x0:
-            self.create_line(x0, cy, knob_x, cy, fill=DISCORD_BLURPLE, width=self.track_h, capstyle="round")
+            self.create_line(x0, cy, knob_x, cy, fill=COLOR_ACCENT, width=self.track_h, capstyle="round")
 
         knob_color = "#ffffff" if self.total_count > 0 else TEXT_MUTED
         self.create_oval(
@@ -1973,7 +1973,7 @@ class OBSHotkeyField(tk.Frame):
         self.lbl.bind("<Button-1>", self.focus_in)
         
         self.clear_btn.bind("<Button-1>", self.clear_hotkey)
-        self.clear_btn.bind("<Enter>", lambda e: self.clear_btn.config(fg=DISCORD_RED))
+        self.clear_btn.bind("<Enter>", lambda e: self.clear_btn.config(fg=COLOR_DANGER))
         self.clear_btn.bind("<Leave>", lambda e: self.clear_btn.config(fg=TEXT_MUTED))
         
         self.bind("<FocusOut>", self.focus_out)
@@ -1983,7 +1983,7 @@ class OBSHotkeyField(tk.Frame):
     def focus_in(self, event=None):
         if self.app.recording or self.app.playing: return
         self.focus_set()
-        self.config(highlightbackground=DISCORD_BLURPLE)
+        self.config(highlightbackground=COLOR_ACCENT)
         self.app.is_binding = True
         self.app.active_hotkey_field = self
 
@@ -2043,15 +2043,15 @@ class SidebarButton(tk.Frame):
         self.indicator = tk.Frame(self, bg=BG_SIDEBAR, width=4)
         self.indicator.pack(side=tk.LEFT, fill=tk.Y)
         
-        channel_text = f"#  {text.lower()}"
-        self.label = tk.Label(self, text=channel_text, bg=BG_SIDEBAR, fg=TEXT_MUTED, font=("Segoe UI", 10, "bold"), cursor="hand2", anchor="w")
+        nav_text = f"  {text.title()}"
+        self.label = tk.Label(self, text=nav_text, bg=BG_SIDEBAR, fg=TEXT_MUTED, font=("Segoe UI", 10, "bold"), cursor="hand2", anchor="w")
         self.label.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=12, pady=8)
 
         for widget in (self, self.label, self.indicator):
             widget.bind("<Enter>", self.on_hover)
             widget.bind("<Leave>", self.on_leave)
             widget.bind("<Button-1>", self.on_click)
-
+    
     def on_hover(self, event):
         if not self.active:
             self.configure(bg=BG_HOVER)
@@ -2116,7 +2116,7 @@ class GhostReticle:
         size = 28
         for i, (x, y, is_click, alpha) in enumerate(items):
             win, canvas = self.pool[i]
-            color = DISCORD_RED if is_click else SYNTAX_BLUE
+            color = COLOR_DANGER if is_click else SYNTAX_BLUE
 
             canvas.delete("all")
             canvas.config(highlightbackground=color)
@@ -2334,7 +2334,7 @@ class BuiltInMacroApp:
         self.mini_hud.attributes("-topmost", True)
         self.mini_hud.configure(bg=BG_HEADER)
 
-        card = tk.Frame(self.mini_hud, bg=BG_HEADER, highlightbackground=DISCORD_BLURPLE, highlightthickness=1)
+        card = tk.Frame(self.mini_hud, bg=BG_HEADER, highlightbackground=COLOR_ACCENT, highlightthickness=1)
         card.pack(fill=tk.BOTH, expand=True)
 
         lbl_drag = tk.Label(card, text="⠇", font=("Segoe UI", 11), bg=BG_HEADER, fg=TEXT_MUTED, cursor="fleur")
@@ -2351,11 +2351,11 @@ class BuiltInMacroApp:
         btn_pause.pack(side=tk.LEFT, padx=(0, 4))
         btn_pause.bind("<Button-1>", lambda e: self.toggle_pause())
 
-        btn_stop = tk.Label(card, text="⏹", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=DISCORD_RED, cursor="hand2", padx=6, pady=2)
+        btn_stop = tk.Label(card, text="⏹", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=COLOR_DANGER, cursor="hand2", padx=6, pady=2)
         btn_stop.pack(side=tk.LEFT, padx=(0, 6))
         btn_stop.bind("<Button-1>", lambda e: self.stop_macro())
 
-        btn_expand = tk.Label(card, text="⤢", font=("Segoe UI", 9, "bold"), bg=DISCORD_BLURPLE, fg="#ffffff", cursor="hand2", padx=7, pady=2)
+        btn_expand = tk.Label(card, text="⤢", font=("Segoe UI", 9, "bold"), bg=COLOR_ACCENT, fg="#ffffff", cursor="hand2", padx=7, pady=2)
         btn_expand.pack(side=tk.RIGHT, padx=6)
         btn_expand.bind("<Button-1>", lambda e: self.toggle_mini_hud())
 
@@ -2442,9 +2442,9 @@ class BuiltInMacroApp:
         self.hamburger.bind("<Button-1>", lambda e: self.toggle_sidebar())
         self.hamburger.bind("<Enter>", lambda e: self.hamburger.config(bg=BG_HOVER, fg=TEXT_PRIMARY))
         self.hamburger.bind("<Leave>", lambda e: self.hamburger.config(bg=BG_HEADER, fg=TEXT_MUTED))
-        DiscordTooltip(self.hamburger, "Open Channels & Settings", "Tab Menu")
+        ModernTooltip(self.hamburger, "Open Navigation & Settings", "Menu")
 
-        title_lbl = tk.Label(top_bar, text="✦ sequent", font=("Segoe UI", 10, "bold"), bg=BG_HEADER, fg=TEXT_PRIMARY)
+        title_lbl = tk.Label(top_bar, text="Sequent", font=("Segoe UI", 10, "bold"), bg=BG_HEADER, fg=TEXT_PRIMARY)
         title_lbl.pack(side=tk.LEFT, padx=(6, 8))
         title_lbl.bind("<Button-1>", self.start_drag)
         title_lbl.bind("<B1-Motion>", self.drag_window)
@@ -2454,7 +2454,7 @@ class BuiltInMacroApp:
         btn_hud.bind("<Button-1>", lambda e: self.toggle_mini_hud())
         btn_hud.bind("<Enter>", lambda e: btn_hud.config(bg=BG_HOVER, fg=TEXT_PRIMARY))
         btn_hud.bind("<Leave>", lambda e: btn_hud.config(bg=BG_INPUT, fg=SYNTAX_BLUE))
-        DiscordTooltip(btn_hud, "Collapse to Floating HUD", "Compact")
+        ModernTooltip(btn_hud, "Collapse to Floating HUD", "Compact")
 
         win_controls = tk.Frame(top_bar, bg=BG_HEADER)
         win_controls.pack(side=tk.RIGHT)
@@ -2462,7 +2462,7 @@ class BuiltInMacroApp:
         btn_close = tk.Label(win_controls, text=" ✕ ", font=("Segoe UI", 9), bg=BG_HEADER, fg=TEXT_MUTED, cursor="hand2", padx=12, pady=6)
         btn_close.pack(side=tk.RIGHT)
         btn_close.bind("<Button-1>", lambda e: self.root.destroy())
-        btn_close.bind("<Enter>", lambda e: btn_close.config(bg=DISCORD_RED, fg="white"))
+        btn_close.bind("<Enter>", lambda e: btn_close.config(bg=COLOR_DANGER, fg="white"))
         btn_close.bind("<Leave>", lambda e: btn_close.config(bg=BG_HEADER, fg=TEXT_MUTED))
 
         btn_min = tk.Label(win_controls, text=" — ", font=("Segoe UI", 9), bg=BG_HEADER, fg=TEXT_MUTED, cursor="hand2", padx=12, pady=6)
@@ -2471,12 +2471,12 @@ class BuiltInMacroApp:
         btn_min.bind("<Enter>", lambda e: btn_min.config(bg=BG_HOVER, fg=TEXT_PRIMARY))
         btn_min.bind("<Leave>", lambda e: btn_min.config(bg=BG_HEADER, fg=TEXT_MUTED))
 
-        self.status_text = tk.Label(top_bar, text="● Ready", font=("Segoe UI", 9, "bold"), bg=BG_HEADER, fg=DISCORD_GREEN)
+        self.status_text = tk.Label(top_bar, text="● Ready", font=("Segoe UI", 9, "bold"), bg=BG_HEADER, fg=COLOR_SUCCESS)
         self.status_text.pack(side=tk.RIGHT, padx=(10, 15))
         self.status_text.bind("<Button-1>", self.start_drag)
         self.status_text.bind("<B1-Motion>", self.drag_window)
 
-        preset_card = DiscordCard(top_bar, bg_card=BG_INPUT)
+        preset_card = ModernCard(top_bar, bg_card=BG_INPUT)
         preset_card.pack(side=tk.RIGHT, padx=(0, 10), pady=4)
 
         tk.Label(preset_card, text="📁 PRESET", font=("Segoe UI", 7, "bold"), bg=BG_INPUT, fg=TEXT_MUTED).pack(side=tk.LEFT, padx=(8, 2))
@@ -2488,7 +2488,7 @@ class BuiltInMacroApp:
             font=("Segoe UI", 8, "bold"), highlightthickness=0, bd=0, relief="flat", cursor="hand2"
         )
         self.preset_menu["menu"].config(
-            bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE, activeforeground=TEXT_PRIMARY,
+            bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, activeforeground=TEXT_PRIMARY,
             font=("Segoe UI", 9), bd=1, relief="flat"
         )
         self.preset_menu.pack(side=tk.LEFT, padx=(2, 2), pady=2)
@@ -2498,7 +2498,7 @@ class BuiltInMacroApp:
         btn_refresh.bind("<Button-1>", lambda e: self.refresh_preset_menu())
         btn_refresh.bind("<Enter>", lambda e: btn_refresh.config(fg=TEXT_PRIMARY, bg=BG_HOVER))
         btn_refresh.bind("<Leave>", lambda e: btn_refresh.config(fg=TEXT_MUTED, bg=BG_INPUT))
-        DiscordTooltip(btn_refresh, "Reload presets directory", "Sync")
+        ModernTooltip(btn_refresh, "Reload presets directory", "Sync")
 
         tk.Frame(self.main_container, bg="#1f2023", height=1).pack(fill=tk.X)
 
@@ -2605,7 +2605,7 @@ class BuiltInMacroApp:
         self.action_badge = tk.Label(left_header, text="0 Actions", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_MUTED, padx=8, pady=2)
         self.action_badge.pack(side=tk.LEFT, padx=(10, 0))
 
-        file_card = DiscordCard(playback_header, bg_card=BG_PANEL)
+        file_card = ModernCard(playback_header, bg_card=BG_PANEL)
         file_card.pack(side=tk.RIGHT)
 
         btn_load_file = tk.Label(file_card, text="📥 Import", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=10, pady=4)
@@ -2613,17 +2613,17 @@ class BuiltInMacroApp:
         btn_load_file.bind("<Button-1>", lambda e: self.load_macro_from_file())
         btn_load_file.bind("<Enter>", lambda e: btn_load_file.config(bg=BG_HOVER))
         btn_load_file.bind("<Leave>", lambda e: btn_load_file.config(bg=BG_INPUT))
-        DiscordTooltip(btn_load_file, "Import external macro routine", ".json")
+        ModernTooltip(btn_load_file, "Import external macro routine", ".json")
 
         btn_save_file = tk.Label(file_card, text="📤 Export", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=10, pady=4)
         btn_save_file.pack(side=tk.LEFT, padx=(2, 3), pady=3)
         btn_save_file.bind("<Button-1>", lambda e: self.save_macro_to_file())
         btn_save_file.bind("<Enter>", lambda e: btn_save_file.config(bg=BG_HOVER))
         btn_save_file.bind("<Leave>", lambda e: btn_save_file.config(bg=BG_INPUT))
-        DiscordTooltip(btn_save_file, "Export current queue", ".json")
+        ModernTooltip(btn_save_file, "Export current queue", ".json")
 
         # Scrubber Header Card
-        self.scrub_card = DiscordCard(self.frame_playback, bg_card=BG_PANEL)
+        self.scrub_card = ModernCard(self.frame_playback, bg_card=BG_PANEL)
         self.scrub_card.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(0, 10))
 
         top_scrub_row = tk.Frame(self.scrub_card, bg=BG_PANEL, padx=8, pady=6)
@@ -2634,30 +2634,30 @@ class BuiltInMacroApp:
         btn_reset.bind("<Button-1>", lambda e: self.jump_to_start())
         btn_reset.bind("<Enter>", lambda e: btn_reset.config(fg=TEXT_PRIMARY, bg=BG_HOVER))
         btn_reset.bind("<Leave>", lambda e: btn_reset.config(fg=TEXT_MUTED, bg=BG_PANEL))
-        DiscordTooltip(btn_reset, "Reset to Start", "Home")
+        ModernTooltip(btn_reset, "Reset to Start", "Home")
 
         btn_step_back = tk.Label(top_scrub_row, text="◀ Step", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
         btn_step_back.pack(side=tk.LEFT, padx=(0, 4))
         btn_step_back.bind("<Button-1>", lambda e: self.step_backward())
         btn_step_back.bind("<Enter>", lambda e: btn_step_back.config(bg=BG_HOVER))
         btn_step_back.bind("<Leave>", lambda e: btn_step_back.config(bg=BG_INPUT))
-        DiscordTooltip(btn_step_back, "Previous Action", "Left Arrow")
+        ModernTooltip(btn_step_back, "Previous Action", "Left Arrow")
 
         btn_step_fwd = tk.Label(top_scrub_row, text="Step ▶", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
         btn_step_fwd.pack(side=tk.LEFT, padx=(0, 6))
         btn_step_fwd.bind("<Button-1>", lambda e: self.step_forward())
         btn_step_fwd.bind("<Enter>", lambda e: btn_step_fwd.config(bg=BG_HOVER))
         btn_step_fwd.bind("<Leave>", lambda e: btn_step_fwd.config(bg=BG_INPUT))
-        DiscordTooltip(btn_step_fwd, "Next Action", "Right Arrow")
+        ModernTooltip(btn_step_fwd, "Next Action", "Right Arrow")
 
         btn_step_run = tk.Label(top_scrub_row, text="⚡ Run Step", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=SYNTAX_GREEN, cursor="hand2", padx=8, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
         btn_step_run.pack(side=tk.LEFT, padx=(0, 10))
         btn_step_run.bind("<Button-1>", lambda e: self.run_single_step())
         btn_step_run.bind("<Enter>", lambda e: btn_step_run.config(bg=BG_HOVER))
         btn_step_run.bind("<Leave>", lambda e: btn_step_run.config(bg=BG_INPUT))
-        DiscordTooltip(btn_step_run, "Execute Selected Step", "Space")
+        ModernTooltip(btn_step_run, "Execute Selected Step", "Space")
 
-        self.scrubber = DiscordScrubberTrack(top_scrub_row, command=self.on_scrub)
+        self.scrubber = ModernScrubberTrack(top_scrub_row, command=self.on_scrub)
         self.scrubber.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
 
         self.scrub_badge = tk.Label(
@@ -2666,7 +2666,7 @@ class BuiltInMacroApp:
             highlightbackground=BG_BORDER, highlightthickness=1
         )
         self.scrub_badge.pack(side=tk.RIGHT)
-        DiscordTooltip(self.scrub_badge, "Nudge Selected Coordinates", "Alt + Arrows")
+        ModernTooltip(self.scrub_badge, "Nudge Selected Coordinates", "Alt + Arrows")
 
         self.loop_var = tk.StringVar(value=self.loop_mode)
         self.loop_menu = tk.OptionMenu(
@@ -2679,10 +2679,10 @@ class BuiltInMacroApp:
             bd=0, relief="flat", cursor="hand2"
         )
         self.loop_menu["menu"].config(
-            bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE, bd=1, relief="flat"
+            bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat"
         )
         self.loop_menu.pack(side=tk.RIGHT, padx=(0, 6))
-        DiscordTooltip(self.loop_menu, "Loop Repetitions", "Cycle")
+        ModernTooltip(self.loop_menu, "Loop Repetitions", "Cycle")
 
         bot_preview_row = tk.Frame(self.scrub_card, bg=BG_HEADER, padx=10, pady=4)
         bot_preview_row.pack(fill=tk.X)
@@ -2701,10 +2701,10 @@ class BuiltInMacroApp:
 
         self.record_btn = ModernButton(
             controls_frame, text=self.get_btn_text("start_rec"), 
-            bg_color=DISCORD_RED, hover_color=DISCORD_RED_HOV, command=self.toggle_recording
+            bg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOV, command=self.toggle_recording
         )
         self.record_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        DiscordTooltip(self.record_btn, "Toggle Recording", self.hotkeys["start_rec"]["name"])
+        ModernTooltip(self.record_btn, "Toggle Recording", self.hotkeys["start_rec"]["name"])
 
         self.pause_btn = ModernButton(
             controls_frame, text="Pause (F9)",
@@ -2712,14 +2712,14 @@ class BuiltInMacroApp:
         )
         self.pause_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         self.pause_btn.set_state("disabled")
-        DiscordTooltip(self.pause_btn, "Pause / Resume Execution", "F9")
+        ModernTooltip(self.pause_btn, "Pause / Resume Execution", "F9")
 
         self.play_btn = ModernButton(
             controls_frame, text=self.get_btn_text("start_play"), 
-            bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=self.toggle_playback
+            bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=self.toggle_playback
         )
         self.play_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
-        DiscordTooltip(self.play_btn, "Run Active Sequence", self.hotkeys["start_play"]["name"])
+        ModernTooltip(self.play_btn, "Run Active Sequence", self.hotkeys["start_play"]["name"])
 
         # Center Queue Viewer - Expands into all remaining vertical space
         self.queue_viewer = VSCodeQueueViewer(self.frame_playback, app_instance=self)
@@ -2748,7 +2748,7 @@ class BuiltInMacroApp:
         self.chain_badge = tk.Label(left_header, text="0 Stages", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_MUTED, padx=8, pady=2)
         self.chain_badge.pack(side=tk.LEFT, padx=(10, 0))
 
-        file_card = DiscordCard(seq_header, bg_card=BG_PANEL)
+        file_card = ModernCard(seq_header, bg_card=BG_PANEL)
         file_card.pack(side=tk.RIGHT)
 
         btn_load_chain = tk.Label(file_card, text="↑ Import Chain", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=10, pady=3)
@@ -2764,7 +2764,7 @@ class BuiltInMacroApp:
         btn_save_chain.bind("<Leave>", lambda e: btn_save_chain.config(bg=BG_INPUT))
 
         # Add Stage Card Builder
-        add_card = DiscordCard(self.frame_sequencer, bg_card=BG_PANEL)
+        add_card = ModernCard(self.frame_sequencer, bg_card=BG_PANEL)
         add_card.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(0, 10))
 
         add_row = tk.Frame(add_card, bg=BG_PANEL, padx=10, pady=8)
@@ -2779,7 +2779,7 @@ class BuiltInMacroApp:
             font=("Segoe UI", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER,
             bd=0, relief="flat", cursor="hand2"
         )
-        self.seq_preset_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=DISCORD_BLURPLE, bd=1, relief="flat")
+        self.seq_preset_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
         self.seq_preset_menu.pack(side=tk.LEFT, padx=(0, 10))
 
         tk.Label(add_row, text="Loops:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT, padx=(0, 4))
@@ -2792,21 +2792,21 @@ class BuiltInMacroApp:
         self.seq_delay_entry.insert(0, "1.0")
         self.seq_delay_entry.pack(side=tk.LEFT, padx=(0, 12), ipady=2)
 
-        btn_add_stage = ModernButton(add_row, text="+ Add Stage", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=self.add_chain_stage)
+        btn_add_stage = ModernButton(add_row, text="+ Add Stage", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=self.add_chain_stage)
         btn_add_stage.pack(side=tk.RIGHT)
 
         # Bottom Chain Controls - Packed to BOTTOM first to prevent truncation
         chain_controls = tk.Frame(self.frame_sequencer, bg=BG_APP)
         chain_controls.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(0, 20))
 
-        btn_clear_chain = ModernButton(chain_controls, text="Clear All Stages", bg_color=BG_BORDER, hover_color=DISCORD_RED, command=self.clear_chain)
+        btn_clear_chain = ModernButton(chain_controls, text="Clear All Stages", bg_color=BG_BORDER, hover_color=COLOR_DANGER, command=self.clear_chain)
         btn_clear_chain.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.btn_run_chain = ModernButton(chain_controls, text="▶ Run Macro Chain (F9)", bg_color=DISCORD_GREEN, hover_color="#1d8a4b", command=self.toggle_chain_run)
+        self.btn_run_chain = ModernButton(chain_controls, text="▶ Run Macro Chain (F9)", bg_color=COLOR_SUCCESS, hover_color="#1d8a4b", command=self.toggle_chain_run)
         self.btn_run_chain.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(6, 0))
 
         # Scrollable Chain Stages Timeline - Expands into all remaining vertical space
-        self.chain_scroll = DiscordScrollableFrame(self.frame_sequencer, bg=BG_APP)
+        self.chain_scroll = ModernScrollableFrame(self.frame_sequencer, bg=BG_APP)
         self.chain_scroll.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=20, pady=(0, 15))
 
 
@@ -2828,19 +2828,19 @@ class BuiltInMacroApp:
     def add_chain_stage(self):
         preset = self.seq_preset_var.get()
         if preset in ("-- Select Preset --", "-- No Presets Found --", ""):
-            self.update_status("Select a preset first", DISCORD_RED)
+            self.update_status("Select a preset first", COLOR_DANGER)
             return
 
         try:
             loops = max(1, int(self.seq_loops_entry.get().strip()))
             delay = max(0.0, float(self.seq_delay_entry.get().strip()))
         except ValueError:
-            self.update_status("Invalid loop count or delay", DISCORD_RED)
+            self.update_status("Invalid loop count or delay", COLOR_DANGER)
             return
 
         self.chain_steps.append({"preset": preset, "loops": loops, "delay_after": delay})
         self.refresh_chain_ui()
-        self.update_status(f"Added '{preset}' to Chain", DISCORD_GREEN)
+        self.update_status(f"Added '{preset}' to Chain", COLOR_SUCCESS)
 
     def remove_chain_stage(self, idx):
         if self.chain_running: return
@@ -2870,7 +2870,7 @@ class BuiltInMacroApp:
         count = len(self.chain_steps)
         self.chain_badge.config(
             text=f"{count} Stage{'s' if count != 1 else ''}",
-            fg=DISCORD_GREEN if count > 0 else TEXT_MUTED
+            fg=COLOR_SUCCESS if count > 0 else TEXT_MUTED
         )
 
         if not self.chain_steps:
@@ -2883,9 +2883,9 @@ class BuiltInMacroApp:
         for idx, stage in enumerate(self.chain_steps):
             is_active = (self.chain_running and self.current_chain_stage == idx)
             card_bg = BG_HEADER if is_active else BG_PANEL
-            border = DISCORD_GREEN if is_active else BG_BORDER
+            border = COLOR_SUCCESS if is_active else BG_BORDER
 
-            card = DiscordCard(container, bg_card=card_bg, border_color=border)
+            card = ModernCard(container, bg_card=card_bg, border_color=border)
             card.pack(fill=tk.X, pady=(0, 6))
 
             row = tk.Frame(card, bg=card_bg, padx=10, pady=8)
@@ -2894,7 +2894,7 @@ class BuiltInMacroApp:
             # Stage number badge
             num_lbl = tk.Label(
                 row, text=f"Stage #{idx + 1}", font=("Segoe UI", 8, "bold"),
-                bg=DISCORD_BLURPLE if not is_active else DISCORD_GREEN, fg="#ffffff", padx=6, pady=2
+                bg=COLOR_ACCENT if not is_active else COLOR_SUCCESS, fg="#ffffff", padx=6, pady=2
             )
             num_lbl.pack(side=tk.LEFT, padx=(0, 10))
 
@@ -2922,7 +2922,7 @@ class BuiltInMacroApp:
             btn_del = tk.Label(row, text=" ✕ ", font=("Segoe UI", 9, "bold"), bg=card_bg, fg=TEXT_MUTED, cursor="hand2")
             btn_del.pack(side=tk.RIGHT, padx=(4, 0))
             btn_del.bind("<Button-1>", lambda e, i=idx: self.remove_chain_stage(i))
-            btn_del.bind("<Enter>", lambda e, w=btn_del: w.config(fg="white", bg=DISCORD_RED))
+            btn_del.bind("<Enter>", lambda e, w=btn_del: w.config(fg="white", bg=COLOR_DANGER))
             btn_del.bind("<Leave>", lambda e, w=btn_del, bg=card_bg: w.config(fg=TEXT_MUTED, bg=bg))
 
             # Move Down Button
@@ -2939,7 +2939,7 @@ class BuiltInMacroApp:
 
     def save_chain_to_file(self):
         if not self.chain_steps:
-            self.update_status("Chain Empty", DISCORD_RED)
+            self.update_status("Chain Empty", COLOR_DANGER)
             return
 
         self.root.attributes('-topmost', False)
@@ -2955,9 +2955,9 @@ class BuiltInMacroApp:
             try:
                 with open(file_path, "w", encoding="utf-8") as f:
                     json.dump(self.chain_steps, f, indent=2)
-                self.update_status("Exported Chain", DISCORD_GREEN)
+                self.update_status("Exported Chain", COLOR_SUCCESS)
             except Exception as e:
-                self.update_status(f"Export Error: {e}", DISCORD_RED)
+                self.update_status(f"Export Error: {e}", COLOR_DANGER)
 
     def load_chain_from_file(self):
         if self.chain_running: return
@@ -2985,11 +2985,11 @@ class BuiltInMacroApp:
                             })
                     self.chain_steps = validated
                     self.refresh_chain_ui()
-                    self.update_status("Imported Chain", DISCORD_GREEN)
+                    self.update_status("Imported Chain", COLOR_SUCCESS)
                 else:
-                    self.update_status("Invalid Chain Format", DISCORD_RED)
+                    self.update_status("Invalid Chain Format", COLOR_DANGER)
             except Exception as e:
-                self.update_status(f"Load Error: {e}", DISCORD_RED)
+                self.update_status(f"Load Error: {e}", COLOR_DANGER)
 
     def toggle_chain_run(self):
         if not self.chain_running:
@@ -2999,7 +2999,7 @@ class BuiltInMacroApp:
 
     def start_chain(self):
         if not self.chain_steps:
-            self.update_status("Chain has no stages", DISCORD_RED)
+            self.update_status("Chain has no stages", COLOR_DANGER)
             return
 
         self.chain_running = True
@@ -3007,7 +3007,7 @@ class BuiltInMacroApp:
         self.is_paused = False
         self.current_chain_stage = 0
 
-        self.btn_run_chain.set_state("normal", text="⏹ Stop Chain (F10)", bg=DISCORD_RED, hover=DISCORD_RED_HOV)
+        self.btn_run_chain.set_state("normal", text="⏹ Stop Chain (F10)", bg=COLOR_DANGER, hover=COLOR_DANGER_HOV)
         self.pause_btn.set_state("normal", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
         self.refresh_chain_ui()
 
@@ -3019,7 +3019,7 @@ class BuiltInMacroApp:
         self.is_paused = False
         self.current_chain_stage = -1
         self.update_status("Chain Stopped", SYNTAX_ORANGE)
-        self.btn_run_chain.set_state("normal", text="▶ Run Macro Chain (F9)", bg=DISCORD_GREEN, hover="#1d8a4b")
+        self.btn_run_chain.set_state("normal", text="▶ Run Macro Chain (F9)", bg=COLOR_SUCCESS, hover="#1d8a4b")
         self.pause_btn.set_state("disabled", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
         self.refresh_chain_ui()
 
@@ -3036,12 +3036,12 @@ class BuiltInMacroApp:
             post_delay = stage["delay_after"]
 
             self.root.after(0, self.refresh_chain_ui)
-            self.root.after(0, lambda n=preset_name, idx=s_idx: self.update_status(f"Stage #{idx + 1}: '{n}'", DISCORD_BLURPLE))
+            self.root.after(0, lambda n=preset_name, idx=s_idx: self.update_status(f"Stage #{idx + 1}: '{n}'", COLOR_ACCENT))
 
             # Load preset actions
             preset_path = os.path.join(self.presets_dir, f"{preset_name}.json")
             if not os.path.exists(preset_path):
-                self.root.after(0, lambda n=preset_name: self.update_status(f"Missing preset: '{n}'", DISCORD_RED))
+                self.root.after(0, lambda n=preset_name: self.update_status(f"Missing preset: '{n}'", COLOR_DANGER))
                 time.sleep(1.0)
                 continue
 
@@ -3092,8 +3092,8 @@ class BuiltInMacroApp:
         self.playing = False
         self.is_paused = False
         self.current_chain_stage = -1
-        self.update_status("Chain Complete", DISCORD_GREEN)
-        self.btn_run_chain.set_state("normal", text="▶ Run Macro Chain (F9)", bg=DISCORD_GREEN, hover="#1d8a4b")
+        self.update_status("Chain Complete", COLOR_SUCCESS)
+        self.btn_run_chain.set_state("normal", text="▶ Run Macro Chain (F9)", bg=COLOR_SUCCESS, hover="#1d8a4b")
         self.pause_btn.set_state("disabled", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
         self.refresh_chain_ui()
 
@@ -3103,7 +3103,7 @@ class BuiltInMacroApp:
             if self.recording_paused:
                 self.update_status("Recording Paused", SYNTAX_ORANGE)
                 if self.audio_cues: play_cue("pause")
-                self.pause_btn.set_state("normal", text="Resume Rec (F9)", bg=DISCORD_GREEN, hover="#1d8a4b")
+                self.pause_btn.set_state("normal", text="Resume Rec (F9)", bg=COLOR_SUCCESS, hover="#1d8a4b")
                 self.queue_viewer.set_interactive(True)
                 self.display_actions_in_queue(self.recorded_actions, "Recorded Sequence")
                 if self.recorded_actions:
@@ -3113,7 +3113,7 @@ class BuiltInMacroApp:
                 self.queue_viewer.close_sub_menu()
                 self.queue_viewer.set_interactive(False)
                 self.last_event_time = time.perf_counter()
-                self.update_status("Recording...", DISCORD_RED)
+                self.update_status("Recording...", COLOR_DANGER)
                 if self.audio_cues: play_cue("resume")
                 self.pause_btn.set_state("normal", text="Pause Rec (F9)", bg=BG_BORDER, hover=BG_HOVER)
                 if hasattr(self, 'ghost_reticle'):
@@ -3131,7 +3131,7 @@ class BuiltInMacroApp:
         if self.is_paused:
             self.update_status("Paused", SYNTAX_ORANGE)
             if self.audio_cues: play_cue("pause")
-            self.pause_btn.set_state("normal", text="Resume (F9)", bg=DISCORD_GREEN, hover="#1d8a4b")
+            self.pause_btn.set_state("normal", text="Resume (F9)", bg=COLOR_SUCCESS, hover="#1d8a4b")
             self.queue_viewer.set_interactive(True)
             if hasattr(self, 'ghost_reticle'):
                 self.ghost_reticle.hide()
@@ -3141,7 +3141,7 @@ class BuiltInMacroApp:
             self.queue_viewer.set_interactive(False)
             if hasattr(self, 'ghost_reticle'):
                 self.ghost_reticle.hide()
-            self.update_status(f"Resuming #{self.current_action_idx + 1}...", DISCORD_BLURPLE)
+            self.update_status(f"Resuming #{self.current_action_idx + 1}...", COLOR_ACCENT)
             if self.audio_cues: play_cue("resume")
             self.pause_btn.set_state("normal", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
 
@@ -3330,15 +3330,15 @@ class BuiltInMacroApp:
         action = self.recorded_actions[self.current_action_idx]
         try:
             self.execute_single_action(action)
-            self.update_status(f"Ran step #{self.current_action_idx + 1}", DISCORD_GREEN)
+            self.update_status(f"Ran step #{self.current_action_idx + 1}", COLOR_SUCCESS)
         except Exception as e:
-            self.update_status(f"Step Error: {e}", DISCORD_RED)
+            self.update_status(f"Step Error: {e}", COLOR_DANGER)
 
         if self.current_action_idx < len(self.recorded_actions) - 1:
             self.current_action_idx += 1
             self.update_scrubber_ui()
         else:
-            self.update_status("End of sequence", DISCORD_GREEN)
+            self.update_status("End of sequence", COLOR_SUCCESS)
         
     def execute_single_action(self, action):
         act_type = action.get("type")
@@ -3369,7 +3369,7 @@ class BuiltInMacroApp:
             if entered_val is not None:
                 self.variables[var_name] = str(entered_val)
                 if self.audio_cues: play_cue("match")
-                self.update_status(f"Var '{var_name}' = '{entered_val}'", DISCORD_GREEN)
+                self.update_status(f"Var '{var_name}' = '{entered_val}'", COLOR_SUCCESS)
         elif act_type == "read_clipboard":
             clip_content = get_clipboard_text().lower()
             keywords = [k.lower() for k in action.get("keywords", [])]
@@ -3379,7 +3379,7 @@ class BuiltInMacroApp:
                 val = action.get("value", "")
                 self.variables[var_name] = val
                 if self.audio_cues: play_cue("match")
-                self.update_status(f"Var '{var_name}' = '{val}'", DISCORD_GREEN)
+                self.update_status(f"Var '{var_name}' = '{val}'", COLOR_SUCCESS)
             else:
                 self.update_status(f"Var '{var_name}': No match in clipboard", SYNTAX_ORANGE)
         elif act_type == "type_variable":
@@ -3387,7 +3387,7 @@ class BuiltInMacroApp:
             val = str(self.variables.get(var_name, ""))
             if val:
                 type_string(val, self.playback_speed)
-                self.update_status(f"Typed '{val}'", DISCORD_GREEN)
+                self.update_status(f"Typed '{val}'", COLOR_SUCCESS)
             else:
                 self.update_status(f"Var '{var_name}' is empty", SYNTAX_ORANGE)
         elif act_type == "key":
@@ -3411,14 +3411,14 @@ class BuiltInMacroApp:
             expected = action.get("color", "#FFFFFF").upper()
             match = (cur == expected)
             if match and self.audio_cues: play_cue("match")
-            self.update_status(f"Pixel: {cur} (Match: {match})", DISCORD_GREEN if match else DISCORD_RED)
+            self.update_status(f"Pixel: {cur} (Match: {match})", COLOR_SUCCESS if match else COLOR_DANGER)
 
 
     def update_action_count_badge(self):
         count = len(self.recorded_actions)
         if count == 0: self.action_badge.config(text="0 Actions", fg=TEXT_MUTED)
-        elif count == 1: self.action_badge.config(text="1 Action", fg=DISCORD_GREEN)
-        else: self.action_badge.config(text=f"{count} Actions", fg=DISCORD_GREEN)
+        elif count == 1: self.action_badge.config(text="1 Action", fg=COLOR_SUCCESS)
+        else: self.action_badge.config(text=f"{count} Actions", fg=COLOR_SUCCESS)
 
     def toggle_breakpoint(self, index):
         if index in self.breakpoints:
@@ -3426,7 +3426,7 @@ class BuiltInMacroApp:
             self.update_status(f"Removed Breakpoint (Line {index + 2})", TEXT_MUTED)
         else:
             self.breakpoints.add(index)
-            self.update_status(f"Breakpoint set at Line {index + 2}", DISCORD_RED)
+            self.update_status(f"Breakpoint set at Line {index + 2}", COLOR_DANGER)
         if hasattr(self, 'queue_viewer'):
             self.queue_viewer.redraw_breakpoints()
 
@@ -3436,7 +3436,7 @@ class BuiltInMacroApp:
         self.recorded_actions.insert(index, delay_action)
         self.current_action_idx = index
         self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-        self.update_status(f"Added {seconds:.2f}s Delay", DISCORD_GREEN)
+        self.update_status(f"Added {seconds:.2f}s Delay", COLOR_SUCCESS)
 
     def insert_search_area_action(self, index, text, area, preset, match_any=False):
         if (self.recording and not self.recording_paused) or self.playing: return
@@ -3451,7 +3451,7 @@ class BuiltInMacroApp:
         self.current_action_idx = index
         self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
         desc = "Any Text" if match_any else f"'{text}'"
-        self.update_status(f"Added Area Search: {desc}", DISCORD_GREEN)
+        self.update_status(f"Added Area Search: {desc}", COLOR_SUCCESS)
 
     def delete_action(self, index):
         if (self.recording and not self.recording_paused) or self.playing: return
@@ -3461,7 +3461,7 @@ class BuiltInMacroApp:
                 self.current_action_idx = max(0, len(self.recorded_actions) - 1)
             self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
             act_type = act.get("type", "action")
-            self.update_status(f"Deleted {act_type} (Action #{index + 1})", DISCORD_RED)
+            self.update_status(f"Deleted {act_type} (Action #{index + 1})", COLOR_DANGER)
 
     def delete_action_range(self, start_idx, end_idx):
         if (self.recording and not self.recording_paused) or self.playing: return
@@ -3473,7 +3473,7 @@ class BuiltInMacroApp:
             if self.current_action_idx >= len(self.recorded_actions):
                 self.current_action_idx = max(0, len(self.recorded_actions) - 1)
             self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-            self.update_status(f"Deleted {count} action(s)", DISCORD_RED)
+            self.update_status(f"Deleted {count} action(s)", COLOR_DANGER)
 
     def remove_all_mouse_moves(self):
         if (self.recording and not self.recording_paused) or self.playing: return
@@ -3482,7 +3482,7 @@ class BuiltInMacroApp:
         removed = initial_len - len(self.recorded_actions)
         self.current_action_idx = 0
         self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-        self.update_status(f"Removed {removed} mouse move(s)", DISCORD_GREEN)
+        self.update_status(f"Removed {removed} mouse move(s)", COLOR_SUCCESS)
 
     def start_pixel_inspection(self, callback):
         """Creates a crosshair canvas, hiding it before sampling so true desktop colors are captured."""
@@ -3576,12 +3576,12 @@ class BuiltInMacroApp:
 
         cancel_badge = tk.Label(
             snipper, text="  ✕ Cancel (Esc / Right-Click)  ",
-            bg=DISCORD_RED, fg="#ffffff", font=("Segoe UI", 9, "bold"), cursor="hand2"
+            bg=COLOR_DANGER, fg="#ffffff", font=("Segoe UI", 9, "bold"), cursor="hand2"
         )
         cancel_badge.place(x=banner_x - 120, y=65)
         cancel_badge.bind("<Button-1>", cancel_snipping)
-        cancel_badge.bind("<Enter>", lambda e: cancel_badge.config(bg=DISCORD_RED_HOV))
-        cancel_badge.bind("<Leave>", lambda e: cancel_badge.config(bg=DISCORD_RED))
+        cancel_badge.bind("<Enter>", lambda e: cancel_badge.config(bg=COLOR_DANGER_HOV))
+        cancel_badge.bind("<Leave>", lambda e: cancel_badge.config(bg=COLOR_DANGER))
 
         def on_mouse_down(event):
             state["start_root_x"] = event.x_root
@@ -3591,7 +3591,7 @@ class BuiltInMacroApp:
             if state["rect"]: canvas.delete(state["rect"])
             state["rect"] = canvas.create_rectangle(
                 c_x, c_y, c_x, c_y,
-                outline=DISCORD_BLURPLE, width=2, fill="#5865f2", stipple="gray25"
+                outline=COLOR_ACCENT, width=2, fill="#5865f2", stipple="gray25"
             )
 
         def on_mouse_drag(event):
@@ -3808,35 +3808,35 @@ try {{
         self.switching_preset = False
         preset_file = os.path.join(self.presets_dir, f"{preset_name}.json")
         if not os.path.exists(preset_file):
-            self.update_status(f"Preset '{preset_name}' Missing", DISCORD_RED)
+            self.update_status(f"Preset '{preset_name}' Missing", COLOR_DANGER)
             self.finish_macro()
             return
 
         self.on_preset_file_selected(preset_name, preset_file)
-        self.update_status(f"Switching to '{preset_name}'...", DISCORD_BLURPLE)
+        self.update_status(f"Switching to '{preset_name}'...", COLOR_ACCENT)
         self.root.after(150, self.start_macro)
 
     def switch_to_file_and_start(self, file_path):
         self.switching_preset = False
         if not os.path.exists(file_path):
-            self.update_status(f"File Missing: {os.path.basename(file_path)}", DISCORD_RED)
+            self.update_status(f"File Missing: {os.path.basename(file_path)}", COLOR_DANGER)
             self.finish_macro()
             return
 
         stem = os.path.splitext(os.path.basename(file_path))[0]
         self.on_preset_file_selected(stem, file_path)
-        self.update_status(f"Switching to '{stem}'...", DISCORD_BLURPLE)
+        self.update_status(f"Switching to '{stem}'...", COLOR_ACCENT)
         self.root.after(150, self.start_macro)
 
     def build_settings_view(self):
-        self.settings_scroll = DiscordScrollableFrame(self.frame_settings, bg=BG_APP)
+        self.settings_scroll = ModernScrollableFrame(self.frame_settings, bg=BG_APP)
         self.settings_scroll.pack(fill=tk.BOTH, expand=True)
 
         scroll_container = self.settings_scroll.scrollable_frame
 
         tk.Label(scroll_container, text="Preferences", font=("Segoe UI", 16, "bold"), bg=BG_APP, fg=TEXT_PRIMARY).pack(anchor="w", padx=20, pady=(20, 10))
 
-        pref_card = DiscordCard(scroll_container, bg_card=BG_PANEL)
+        pref_card = ModernCard(scroll_container, bg_card=BG_PANEL)
         pref_card.pack(fill=tk.X, padx=20, pady=(0, 10))
 
         pref_frame = tk.Frame(pref_card, bg=BG_PANEL, padx=20, pady=15)
@@ -3848,7 +3848,7 @@ try {{
         tk.Label(speed_row, text="Playback Speed", font=("Segoe UI", 10, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=22, anchor="w").pack(side=tk.LEFT)
         speed_controls = tk.Frame(speed_row, bg=BG_PANEL)
         speed_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.speed_slider = DiscordSlider(speed_controls, min_val=1.0, max_val=10.0, step=0.5, initial_val=self.playback_speed, command=self.on_speed_slider_change, width=180, height=24)
+        self.speed_slider = ModernSlider(speed_controls, min_val=1.0, max_val=10.0, step=0.5, initial_val=self.playback_speed, command=self.on_speed_slider_change, width=180, height=24)
         self.speed_slider.pack(side=tk.LEFT, padx=(0, 10))
         self.speed_lbl = tk.Label(speed_controls, text=f"{self.playback_speed:.1f}x", font=("Consolas", 10, "bold"), bg=BG_INPUT, fg=SYNTAX_BLUE, width=6)
         self.speed_lbl.pack(side=tk.LEFT)
@@ -3859,7 +3859,7 @@ try {{
         tk.Label(delay_row, text="Action Delay", font=("Segoe UI", 10, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=22, anchor="w").pack(side=tk.LEFT)
         delay_controls = tk.Frame(delay_row, bg=BG_PANEL)
         delay_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.delay_slider = DiscordSlider(delay_controls, min_val=0.05, max_val=1.5, step=0.05, initial_val=self.action_delay, command=self.on_delay_slider_change, width=180, height=24)
+        self.delay_slider = ModernSlider(delay_controls, min_val=0.05, max_val=1.5, step=0.05, initial_val=self.action_delay, command=self.on_delay_slider_change, width=180, height=24)
         self.delay_slider.pack(side=tk.LEFT, padx=(0, 10))
         self.delay_lbl = tk.Label(delay_controls, text=f"{self.action_delay:.2f}s", font=("Consolas", 10, "bold"), bg=BG_INPUT, fg=SYNTAX_BLUE, width=6)
         self.delay_lbl.pack(side=tk.LEFT)
@@ -3869,7 +3869,7 @@ try {{
             r = tk.Frame(pref_frame, bg=BG_PANEL)
             r.pack(fill=tk.X, pady=(0, 10))
             tk.Label(r, text=text, font=("Segoe UI", 10, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=22, anchor="w").pack(side=tk.LEFT)
-            t = DiscordPillToggle(r, initial_state=initial, command=callback)
+            t = ModernPillToggle(r, initial_state=initial, command=callback)
             t.pack(side=tk.LEFT)
             return t
 
@@ -3889,13 +3889,13 @@ try {{
         folder_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.folder_display = tk.Label(folder_controls, text=self.shorten_path(self.presets_dir), font=("Consolas", 9), bg=BG_INPUT, fg=TEXT_MUTED, anchor="w", padx=8, pady=4, highlightbackground=BG_BORDER, highlightthickness=1)
         self.folder_display.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        btn_browse = tk.Label(folder_controls, text="Browse", font=("Segoe UI", 8, "bold"), bg=DISCORD_BLURPLE, fg=TEXT_PRIMARY, cursor="hand2", padx=10, pady=4)
+        btn_browse = tk.Label(folder_controls, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_PRIMARY, cursor="hand2", padx=10, pady=4)
         btn_browse.pack(side=tk.RIGHT)
         btn_browse.bind("<Button-1>", lambda e: self.choose_presets_folder())
 
         # Hotkeys Section
         tk.Label(scroll_container, text="Hotkeys", font=("Segoe UI", 16, "bold"), bg=BG_APP, fg=TEXT_PRIMARY).pack(anchor="w", padx=20, pady=(15, 10))
-        keys_card = DiscordCard(scroll_container, bg_card=BG_PANEL)
+        keys_card = ModernCard(scroll_container, bg_card=BG_PANEL)
         keys_card.pack(fill=tk.X, padx=20, pady=(0, 20))
         keys_frame = tk.Frame(keys_card, bg=BG_PANEL, padx=20, pady=20)
         keys_frame.pack(fill=tk.X)
@@ -3916,7 +3916,7 @@ try {{
             self.presets_dir = os.path.abspath(chosen)
             if hasattr(self, 'folder_display'): self.folder_display.config(text=self.shorten_path(self.presets_dir))
             self.refresh_preset_menu()
-            self.update_status("Preset Folder Updated", DISCORD_GREEN)
+            self.update_status("Preset Folder Updated", COLOR_SUCCESS)
 
     def on_speed_slider_change(self, val):
         self.playback_speed = float(val)
@@ -3993,14 +3993,14 @@ try {{
                     self.preset_var.set(stem)
                     self.current_source_label = f"Preset: {stem}"
                     self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-                    self.update_status(f"Loaded '{stem}'", DISCORD_GREEN)
-                else: self.update_status("Empty Preset File", DISCORD_RED)
-            else: self.update_status("Invalid Format", DISCORD_RED)
-        except Exception: self.update_status("Preset Load Error", DISCORD_RED)
+                    self.update_status(f"Loaded '{stem}'", COLOR_SUCCESS)
+                else: self.update_status("Empty Preset File", COLOR_DANGER)
+            else: self.update_status("Invalid Format", COLOR_DANGER)
+        except Exception: self.update_status("Preset Load Error", COLOR_DANGER)
   
     def save_macro_to_file(self):
         if not self.recorded_actions:
-            self.update_status("Queue Empty", DISCORD_RED)
+            self.update_status("Queue Empty", COLOR_DANGER)
             return
 
         self.root.attributes('-topmost', False)
@@ -4015,11 +4015,11 @@ try {{
         if file_path:
             try:
                 with open(file_path, "w", encoding="utf-8") as f: json.dump(self.recorded_actions, f, indent=2)
-                self.update_status("Exported File", DISCORD_GREEN)
+                self.update_status("Exported File", COLOR_SUCCESS)
                 if os.path.dirname(os.path.abspath(file_path)) == self.presets_dir:
                     stem = os.path.splitext(os.path.basename(file_path))[0]
                     self.refresh_preset_menu(selected=stem)
-            except Exception: self.update_status("Export Error", DISCORD_RED)
+            except Exception: self.update_status("Export Error", COLOR_DANGER)
 
     def load_macro_from_file(self):
         if self.recording or self.playing: return
@@ -4061,13 +4061,13 @@ try {{
                         file_name = file_path.replace("\\", "/").split("/")[-1]
                         self.current_source_label = f"File: {file_name}"
                         self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-                        self.update_status("Loaded File", DISCORD_GREEN)
+                        self.update_status("Loaded File", COLOR_SUCCESS)
                     else: 
-                        self.update_status("Empty/Invalid File", DISCORD_RED)
+                        self.update_status("Empty/Invalid File", COLOR_DANGER)
                 else: 
-                    self.update_status("Invalid File", DISCORD_RED)
+                    self.update_status("Invalid File", COLOR_DANGER)
             except Exception: 
-                self.update_status("Import Error", DISCORD_RED)
+                self.update_status("Import Error", COLOR_DANGER)
 
     def display_actions_in_queue(self, actions, source_label=None):
         if source_label is None: source_label = self.current_source_label
@@ -4200,7 +4200,7 @@ try {{
         self.last_event_time = time.perf_counter()
         self.preset_var.set("-- Select Preset --")
         self.show_tab("playback")
-        self.update_status("Recording...", DISCORD_RED)
+        self.update_status("Recording...", COLOR_DANGER)
         if self.audio_cues: play_cue("start")
 
         self.queue_viewer.set_interactive(False)
@@ -4229,7 +4229,7 @@ try {{
         self.update_status(f"Actions: {len(self.recorded_actions)}", TEXT_MUTED)
         if self.audio_cues: play_cue("stop")
 
-        self.record_btn.set_state("normal", text=self.get_btn_text("start_rec"), bg=DISCORD_RED, hover=DISCORD_RED_HOV)
+        self.record_btn.set_state("normal", text=self.get_btn_text("start_rec"), bg=COLOR_DANGER, hover=COLOR_DANGER_HOV)
         self.play_btn.set_state("normal")
         self.pause_btn.set_state("disabled", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
 
@@ -4575,11 +4575,11 @@ try {{
     
     def start_macro(self):
         if not self.recorded_actions:
-            self.update_status("Queue Empty", DISCORD_RED)
+            self.update_status("Queue Empty", COLOR_DANGER)
             return
         self.playing = True
         self.show_tab("playback") 
-        self.update_status("Running Script...", DISCORD_BLURPLE)
+        self.update_status("Running Script...", COLOR_ACCENT)
         self.is_paused = False
         self.pause_btn.set_state("normal", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
         
@@ -4603,8 +4603,8 @@ try {{
 
         self.current_action_idx = 0
         self.pause_btn.set_state("disabled", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
-        self.play_btn.set_state("normal", text=self.get_btn_text("start_play"), bg=DISCORD_BLURPLE, hover=DISCORD_BLURPLE_HOV)
-        self.record_btn.set_state("normal", text=self.get_btn_text("start_rec"), bg=DISCORD_RED, hover=DISCORD_RED_HOV)
+        self.play_btn.set_state("normal", text=self.get_btn_text("start_play"), bg=COLOR_ACCENT, hover=COLOR_ACCENT_HOV)
+        self.record_btn.set_state("normal", text=self.get_btn_text("start_rec"), bg=COLOR_DANGER, hover=COLOR_DANGER_HOV)
         self.queue_viewer.set_interactive(True)
         self.update_scrubber_ui(show_reticle=False)
 
@@ -4721,7 +4721,7 @@ try {{
             entry.bind("<Return>", submit)
             dlg.bind("<Escape>", cancel)
 
-            ok_btn = ModernButton(btn_row, text="Submit", bg_color=DISCORD_BLURPLE, hover_color=DISCORD_BLURPLE_HOV, command=submit)
+            ok_btn = ModernButton(btn_row, text="Submit", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit)
             ok_btn.pack(side=tk.RIGHT)
 
         self.root.after(0, _show)
@@ -4747,7 +4747,7 @@ try {{
         self._playback_ui_pending = False
         run_id = self.playback_run_id
 
-        self.root.after(0, lambda: self.update_status(f"Running (from #{start_idx + 1})...", DISCORD_BLURPLE))
+        self.root.after(0, lambda: self.update_status(f"Running (from #{start_idx + 1})...", COLOR_ACCENT))
         if self.audio_cues: play_cue("start")
         time.sleep(0.3) 
 
@@ -4776,8 +4776,8 @@ try {{
                         self.playback_run_id = time.time()
                         self._playback_ui_pending = False
                         bp_line = step_ptr + 2
-                        self.root.after(0, lambda l=bp_line: self.update_status(f"Breakpoint hit at Line {l}", DISCORD_RED))
-                        self.root.after(0, lambda: self.pause_btn.set_state("normal", text="Resume (F9)", bg=DISCORD_GREEN, hover="#1d8a4b"))
+                        self.root.after(0, lambda l=bp_line: self.update_status(f"Breakpoint hit at Line {l}", COLOR_DANGER))
+                        self.root.after(0, lambda: self.pause_btn.set_state("normal", text="Resume (F9)", bg=COLOR_SUCCESS, hover="#1d8a4b"))
                         while self.is_paused and self.playing:
                             time.sleep(0.04)
                         if not self.playing: break
@@ -4856,7 +4856,7 @@ try {{
                         if entered_val is not None:
                             self.variables[var_name] = str(entered_val)
                             if self.audio_cues: play_cue("match")
-                            self.root.after(0, lambda n=var_name, v=entered_val: self.update_status(f"Var '{n}' = '{v}'", DISCORD_GREEN))
+                            self.root.after(0, lambda n=var_name, v=entered_val: self.update_status(f"Var '{n}' = '{v}'", COLOR_SUCCESS))
                         step_ptr += 1
                         continue
 
@@ -4872,7 +4872,7 @@ try {{
                             val = action.get("value", "")
                             self.variables[var_name] = val
                             if self.audio_cues: play_cue("match")
-                            self.root.after(0, lambda n=var_name, v=val: self.update_status(f"Var '{n}' = '{v}'", DISCORD_GREEN))
+                            self.root.after(0, lambda n=var_name, v=val: self.update_status(f"Var '{n}' = '{v}'", COLOR_SUCCESS))
                         else:
                             self.root.after(0, lambda n=var_name: self.update_status(f"Var '{n}': No match in clipboard", SYNTAX_ORANGE))
 
@@ -4885,7 +4885,7 @@ try {{
                         val = str(self.variables.get(var_name, ""))
                         if val:
                             type_string(val, self.playback_speed)
-                            self.root.after(0, lambda v=val: self.update_status(f"Typed '{v}'", DISCORD_GREEN))
+                            self.root.after(0, lambda v=val: self.update_status(f"Typed '{v}'", COLOR_SUCCESS))
                         else:
                             self.root.after(0, lambda n=var_name: self.update_status(f"Var '{n}' empty", SYNTAX_ORANGE))
 
@@ -4932,7 +4932,7 @@ try {{
                         if matched and self.audio_cues: play_cue("match")
                         if not matched and self.playing:
                             if self.audio_cues: play_cue("error")
-                            self.root.after(0, lambda: self.update_status(f"Pixel timeout ({expected_color})", DISCORD_RED))
+                            self.root.after(0, lambda: self.update_status(f"Pixel timeout ({expected_color})", COLOR_DANGER))
 
                         step_ptr += 1
                         continue
@@ -5100,7 +5100,7 @@ try {{
 
         except Exception as e:
             if self.audio_cues: play_cue("error")
-            self.root.after(0, self.update_status, f"Error: {e}", DISCORD_RED)
+            self.root.after(0, self.update_status, f"Error: {e}", COLOR_DANGER)
         finally:
             for m in list(held_modifiers):
                 m_scan = ctypes.windll.user32.MapVirtualKeyW(m, 0)
@@ -5114,7 +5114,7 @@ try {{
         self._playback_ui_pending = False
         self.playing = False
         self.is_paused = False
-        self.update_status("Finished", DISCORD_GREEN)
+        self.update_status("Finished", COLOR_SUCCESS)
         if self.audio_cues: play_cue("stop")
         self.lbl_active_action.config(text="// Execution complete", fg=SYNTAX_GREEN)
 
@@ -5123,8 +5123,8 @@ try {{
 
         self.current_action_idx = 0
         self.queue_viewer.set_interactive(True)
-        self.record_btn.set_state("normal", text=self.get_btn_text("start_rec"), bg=DISCORD_RED, hover=DISCORD_RED_HOV)
-        self.play_btn.set_state("normal", text=self.get_btn_text("start_play"), bg=DISCORD_BLURPLE, hover=DISCORD_BLURPLE_HOV)
+        self.record_btn.set_state("normal", text=self.get_btn_text("start_rec"), bg=COLOR_DANGER, hover=COLOR_DANGER_HOV)
+        self.play_btn.set_state("normal", text=self.get_btn_text("start_play"), bg=COLOR_ACCENT, hover=COLOR_ACCENT_HOV)
         self.pause_btn.set_state("disabled", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
         self.update_scrubber_ui(show_reticle=False)
 
