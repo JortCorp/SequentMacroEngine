@@ -612,14 +612,12 @@ class VSCodeQueueViewer(tk.Frame):
         self.sep = tk.Frame(self, bg=BG_BORDER, width=1)
         self.sep.pack(side=tk.LEFT, fill=tk.Y)
 
-        self.scroll_sep = tk.Frame(self, bg=BG_BORDER, width=1)
-        self.scroll_sep.pack(side=tk.RIGHT, fill=tk.Y)
-
+        # Dynamic scrollbar and separator (packed dynamically only when content overflows)
         self.scrollbar = DiscordScrollBar(
             self, command=self._on_scrollbar_scroll,
             width=18, bg_trough=BG_SCROLL_TRACK
         )
-        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.scroll_sep = tk.Frame(self, bg=BG_BORDER, width=1)
 
         self.code_text = tk.Text(
             self, bg=bg, fg=TEXT_PRIMARY,
@@ -647,13 +645,11 @@ class VSCodeQueueViewer(tk.Frame):
             w.bind("<MouseWheel>", self._on_mousewheel)
             w.bind("<Button-3>", self._on_right_click)
 
-        # Margin click toggles breakpoint; gutter text click opens options
         self.gutter_margin.bind("<Button-1>", self._on_gutter_margin_click)
         self.gutter.bind("<Button-1>", self._on_gutter_click)
         self.code_text.bind("<Button-1>", self._on_code_click)
         self.bind("<MouseWheel>", self._on_mousewheel)
 
-        # Multi-reticle after-image trajectory bindings
         self.code_text.bind("<<Selection>>", self._on_text_selection_changed)
         self.code_text.bind("<ButtonRelease-1>", self._on_text_selection_changed)
 
@@ -661,7 +657,8 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.tag_lower("active_line")
         self.gutter.tag_configure("active_line", background=DISCORD_BLURPLE, foreground="#ffffff")
         self.gutter.tag_raise("active_line")
-    
+
+
     def highlight_action(self, index):
         self.code_text.tag_remove("active_line", "1.0", "end")
         self.gutter.tag_remove("active_line", "1.0", "end")
@@ -887,16 +884,26 @@ class VSCodeQueueViewer(tk.Frame):
 
     def _on_code_scroll(self, first, last):
         self.plus_btn.place_forget()
+        f, l = float(first), float(last)
+        if f <= 0.001 and l >= 0.999:
+            if self.scrollbar.winfo_ismapped():
+                self.scrollbar.pack_forget()
+                self.scroll_sep.pack_forget()
+        else:
+            if not self.scrollbar.winfo_ismapped():
+                self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y, before=self.code_text)
+                self.scroll_sep.pack(side=tk.RIGHT, fill=tk.Y, before=self.code_text)
         self.scrollbar.set(first, last)
         self.gutter.yview_moveto(first)
         self.redraw_breakpoints()
 
     def _on_mousewheel(self, event):
         self.plus_btn.place_forget()
-        delta = int(-1 * (event.delta / 120))
-        self.code_text.yview_scroll(delta, "units")
-        self.gutter.yview_scroll(delta, "units")
-        self.redraw_breakpoints()
+        if self.scrollbar.winfo_ismapped():
+            delta = int(-1 * (event.delta / 120))
+            self.code_text.yview_scroll(delta, "units")
+            self.gutter.yview_scroll(delta, "units")
+            self.redraw_breakpoints()
         return "break"
     
     def _on_viewer_motion(self, event):
@@ -1693,16 +1700,24 @@ class DiscordScrollableFrame(tk.Frame):
 
         self.canvas_frame = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         self.canvas.bind('<Configure>', self._on_canvas_configure)
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.configure(yscrollcommand=self._on_canvas_scroll)
 
         self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
+        # Scrollbar is auto-managed and hidden until content exceeds view bounds
 
-        self.scrollable_frame.bind('<Enter>', self._bind_mousewheel)
-        self.scrollable_frame.bind('<Leave>', self._unbind_mousewheel)
 
     def _on_canvas_configure(self, event):
         self.canvas.itemconfig(self.canvas_frame, width=event.width)
+
+    def _on_canvas_scroll(self, first, last):
+        f, l = float(first), float(last)
+        if f <= 0.001 and l >= 0.999:
+            if self.scrollbar.winfo_ismapped():
+                self.scrollbar.pack_forget()
+        else:
+            if not self.scrollbar.winfo_ismapped():
+                self.scrollbar.pack(side="right", fill="y", before=self.canvas)
+        self.scrollbar.set(first, last)
 
     def _bind_mousewheel(self, event):
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
@@ -1711,7 +1726,8 @@ class DiscordScrollableFrame(tk.Frame):
         self.canvas.unbind_all("<MouseWheel>")
 
     def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        if self.scrollbar.winfo_ismapped():
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
 # --- Custom Discord UI Components ---
 class ModernButton(tk.Frame):
@@ -2378,7 +2394,7 @@ class BuiltInMacroApp:
 
         self.root.geometry(f"{int(w)}x{int(h)}+{int(x)}+{int(y)}")
 
-        
+
     def get_btn_text(self, action_type):
         hk = self.hotkeys[action_type]["name"]
         suffix = f" ({hk})" if hk and hk != "None" else ""
