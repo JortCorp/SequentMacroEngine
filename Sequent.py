@@ -1034,6 +1034,7 @@ class VSCodeQueueViewer(tk.Frame):
 
         action_options = [
             "Delay", 
+            "Disclaimer / Warning",
             "If Variable Condition",
             "Read Clipboard", 
             "Request Input",
@@ -1058,9 +1059,11 @@ class VSCodeQueueViewer(tk.Frame):
         if not self.sub_menu or not self.sub_menu.winfo_exists(): return
         menu_w = 340
         menu_h = 400 if action_type in ("Search selected area", "If Variable Condition") else (
-            350 if action_type == "Read Clipboard" else (
-                300 if action_type == "Request Input" else (
-                    280 if action_type in ("Wait Pixel", "Type Variable") else 250
+            370 if action_type == "Disclaimer / Warning" else (
+                350 if action_type == "Read Clipboard" else (
+                    300 if action_type == "Request Input" else (
+                        280 if action_type in ("Wait Pixel", "Type Variable") else 250
+                    )
                 )
             )
         )
@@ -1070,6 +1073,7 @@ class VSCodeQueueViewer(tk.Frame):
         for child in self.action_content_frame.winfo_children(): child.destroy()
 
         if action_type == "Delay": self._render_delay_view(line_num)
+        elif action_type == "Disclaimer / Warning": self._render_disclaimer_view(line_num)
         elif action_type == "If Variable Condition": self._render_if_var_view(line_num)
         elif action_type == "Read Clipboard": self._render_read_clipboard_view(line_num)
         elif action_type == "Request Input": self._render_request_input_view(line_num)
@@ -1078,6 +1082,7 @@ class VSCodeQueueViewer(tk.Frame):
         elif action_type == "Wait Pixel": self._render_wait_pixel_view(line_num)
         elif action_type == "Label Marker": self._render_label_view(line_num)
         elif action_type == "Jump to Label": self._render_goto_view(line_num)
+
 
     def _render_label_view(self, line_num):
         body = self.action_content_frame
@@ -1547,6 +1552,47 @@ class VSCodeQueueViewer(tk.Frame):
         prompt_entry.bind("<Return>", lambda e: submit())
         var_entry.bind("<Return>", lambda e: submit())
         ModernButton(body, text="Add Request Input", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+
+    def _render_disclaimer_view(self, line_num):
+        body = self.action_content_frame
+
+        tk.Label(body, text="Warning Title:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
+        title_entry = tk.Entry(body, bg=BG_INPUT, fg=SYNTAX_ORANGE, font=("Segoe UI", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        title_entry.pack(fill=tk.X, ipady=2, pady=(0, 6))
+        title_entry.insert(0, "Disclaimer Note")
+        title_entry.focus_set()
+
+        tk.Label(body, text="Disclaimer / Warning Message:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
+        msg_text = tk.Text(body, height=4, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1, wrap="word")
+        msg_text.pack(fill=tk.X, pady=(0, 6))
+        msg_text.insert("1.0", "Please make sure your target window is open, focused, and scaled to 100% before proceeding.")
+
+        pos_var = tk.StringVar(value=f"Before Line {line_num}")
+        pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+        pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+        pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        pos_menu.pack(fill=tk.X, pady=(2, 8))
+
+        def submit():
+            t_title = title_entry.get().strip() or "Disclaimer Note"
+            t_msg = msg_text.get("1.0", "end").strip() or "Proceed with execution?"
+
+            is_after = "After" in pos_var.get()
+            insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+            insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
+
+            self.app.recorded_actions.insert(insert_idx, {
+                "type": "disclaimer",
+                "title": t_title,
+                "message": t_msg
+            })
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.update_status(f"Added Disclaimer Warning", COLOR_SUCCESS)
+            self.close_sub_menu()
+
+        ModernButton(body, text="Add Disclaimer Note", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+
+
     
     def _render_delay_view(self, line_num):
         body = self.action_content_frame
@@ -3170,6 +3216,10 @@ class BuiltInMacroApp:
             return f"🏷️ flow.label('{action.get('name', '')}')"
         elif act_type == "goto": 
             return f"↪️ flow.goto('{action.get('target', '')}')"
+        elif act_type == "disclaimer":
+            msg = action.get("message", "")
+            preview = (msg[:24] + "..") if len(msg) > 26 else msg
+            return f"⚠️ ui.disclaimer('{preview}')"
         elif act_type == "if_var":
             op = action.get("op", "==")
             v_name = action.get("var_name", "status")
@@ -3226,17 +3276,18 @@ class BuiltInMacroApp:
         elif act_type == "paste": 
             return "📌 command.paste()"
         return f"{act_type}"
-    
+        
 
     def get_action_color(self, action):
         act_type = action.get("type", "") if action else ""
         if act_type in ("label", "goto", "if_var", "read_clipboard", "type_variable", "prompt_input"): return SYNTAX_PURPLE
-        if act_type == "wait_pixel": return SYNTAX_GREEN
+        if act_type == "disclaimer": return SYNTAX_ORANGE
+        if act_type == "wait_pixel": return COLOR_SUCCESS
         if act_type in ("move", "click", "drag", "scroll"): return SYNTAX_BLUE
         if act_type in ("key", "press", "enter", "backspace"): return SYNTAX_ORANGE
         if act_type in ("combo", "select_all", "copy", "paste", "delay", "search_area"): return SYNTAX_PURPLE
         return TEXT_PRIMARY
-
+    
 
     def update_scrubber_ui(self, show_reticle=True):
         total = len(self.recorded_actions)
@@ -3361,6 +3412,14 @@ class BuiltInMacroApp:
             ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         elif act_type == "delay":
             time.sleep(max(0.05, float(action.get("seconds", 1.0))))
+        elif act_type == "disclaimer":
+            d_title = action.get("title", "Disclaimer Note")
+            d_msg = action.get("message", "Proceed with execution?")
+            proceed = self.show_disclaimer_modal(d_title, d_msg)
+            if not proceed:
+                self.update_status("Disclaimer cancelled", COLOR_DANGER)
+            else:
+                self.update_status("Disclaimer accepted", COLOR_SUCCESS)
         elif act_type == "prompt_input":
             prompt_txt = action.get("prompt", "Enter input:")
             default_val = action.get("default", "")
@@ -4732,6 +4791,127 @@ try {{
 
         return result[0]
         
+    def show_disclaimer_modal(self, title_text, message_text):
+        """Displays a centered, draggable warning/disclaimer modal with Proceed and Abort options."""
+        import threading
+        evt = threading.Event()
+        proceed = [False]
+
+        def _show():
+            dlg = tk.Toplevel(self.root)
+            dlg.overrideredirect(True)
+            dlg.attributes('-topmost', True)
+            dlg.configure(bg=BG_BORDER)
+
+            w, h = 380, 210
+
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_uint32),
+                    ("rcMonitor", RECT),
+                    ("rcWork", RECT),
+                    ("dwFlags", ctypes.c_uint32)
+                ]
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            MONITOR_DEFAULTTONEAREST = 2
+
+            if hwnd:
+                hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            else:
+                pt = POINT()
+                user32.GetCursorPos(ctypes.byref(pt))
+                hmon = user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                mon_x = mi.rcWork.left
+                mon_y = mi.rcWork.top
+                mon_w = mi.rcWork.right - mi.rcWork.left
+                mon_h = mi.rcWork.bottom - mi.rcWork.top
+            else:
+                mon_x, mon_y = 0, 0
+                mon_w, mon_h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+
+            rx = mon_x + (mon_w - w) // 2
+            ry = mon_y + (mon_h - h) // 2
+            dlg.geometry(f"{w}x{h}+{rx}+{ry}")
+
+            card = tk.Frame(dlg, bg=BG_PANEL)
+            card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+            head = tk.Frame(card, bg=BG_HEADER, height=28, cursor="fleur")
+            head.pack(fill=tk.X)
+
+            drag_icon = tk.Label(head, text=" ⠇ ", font=("Segoe UI", 9), bg=BG_HEADER, fg=TEXT_MUTED, cursor="fleur")
+            drag_icon.pack(side=tk.LEFT, padx=(4, 0))
+
+            lbl_title = tk.Label(head, text=f"⚠️  {title_text.upper()}", font=("Segoe UI", 8, "bold"), bg=BG_HEADER, fg=SYNTAX_ORANGE, cursor="fleur")
+            lbl_title.pack(side=tk.LEFT, padx=4, pady=5)
+
+            drag_data = {"x": 0, "y": 0, "win_x": 0, "win_y": 0}
+
+            def _start_drag(e):
+                drag_data["x"] = e.x_root
+                drag_data["y"] = e.y_root
+                drag_data["win_x"] = dlg.winfo_x()
+                drag_data["win_y"] = dlg.winfo_y()
+
+            def _do_drag(e):
+                dx = e.x_root - drag_data["x"]
+                dy = e.y_root - drag_data["y"]
+                dlg.geometry(f"+{drag_data['win_x'] + dx}+{drag_data['win_y'] + dy}")
+
+            for widget in (head, drag_icon, lbl_title):
+                widget.bind("<Button-1>", _start_drag)
+                widget.bind("<B1-Motion>", _do_drag)
+
+            body = tk.Frame(card, bg=BG_PANEL, padx=16, pady=12)
+            body.pack(fill=tk.BOTH, expand=True)
+
+            msg_box = tk.Message(
+                body, text=message_text, font=("Segoe UI", 9), bg=BG_PANEL,
+                fg=TEXT_PRIMARY, width=340, anchor="w", justify="left"
+            )
+            msg_box.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+            btn_row = tk.Frame(body, bg=BG_PANEL)
+            btn_row.pack(fill=tk.X)
+
+            def on_confirm(event=None):
+                proceed[0] = True
+                try: dlg.destroy()
+                except Exception: pass
+                evt.set()
+
+            def on_cancel(event=None):
+                proceed[0] = False
+                try: dlg.destroy()
+                except Exception: pass
+                evt.set()
+
+            dlg.bind("<Return>", on_confirm)
+            dlg.bind("<Escape>", on_cancel)
+
+            btn_abort = ModernButton(btn_row, text="Abort Macro", bg_color=BG_BORDER, hover_color=COLOR_DANGER, command=on_cancel)
+            btn_abort.pack(side=tk.LEFT)
+
+            btn_proceed = ModernButton(btn_row, text="Proceed ▶", bg_color=COLOR_SUCCESS, hover_color="#1d8a4b", command=on_confirm)
+            btn_proceed.pack(side=tk.RIGHT)
+
+        self.root.after(0, _show)
+        while not evt.is_set():
+            if not self.playing and not self.recording:
+                break
+            evt.wait(0.05)
+
+        return proceed[0]
+
     def run_sequence(self):
         total_actions = len(self.recorded_actions)
         if total_actions == 0:
@@ -4785,7 +4965,7 @@ try {{
                     action = self.recorded_actions[step_ptr]
                     act_type = action.get("type")
 
-                    # Synchronized UI step notification (prevents flooding Tkinter event loop)
+                    # Synchronized UI step notification
                     i = step_ptr
                     if not self._playback_ui_pending or act_type != "move":
                         self._playback_ui_pending = True
@@ -4806,6 +4986,17 @@ try {{
                         else:
                             step_ptr += 1
                             continue
+
+                    # --- Disclaimer / Warning Note ---
+                    if act_type == "disclaimer":
+                        d_title = action.get("title", "Disclaimer Note")
+                        d_msg = action.get("message", "Proceed with execution?")
+                        proceed = self.show_disclaimer_modal(d_title, d_msg)
+                        if not proceed:
+                            self.root.after(0, self.stop_macro)
+                            return
+                        step_ptr += 1
+                        continue
 
                     # --- Conditional Branch (Jump, Switch Preset, or Run File) ---
                     if act_type == "if_var":
