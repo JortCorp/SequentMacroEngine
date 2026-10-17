@@ -85,5 +85,5 @@ Actions in Sequent's queue viewer display clean syntax representations:
 
 1. Clone the repository:
    ```bash
-   git clone [https://github.com/your-username/sequent.git](https://github.com/your-username/sequent.git)
+   git clone [https://github.com/jortcorp/sequent.git](https://github.com/jortcorp/sequent.git)
    cd sequent
