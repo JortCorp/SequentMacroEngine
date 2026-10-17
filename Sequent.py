@@ -728,6 +728,7 @@ class VSCodeQueueViewer(tk.Frame):
         )),
         ("Screen & Recognition", (
             ("Search selected area", "Read an area and branch to a preset.", "OCR"),
+            ("Find Color & Click", "Find a color in an area and click it.", "FC"),
         )),
         ("Variables & Inputs", (
             ("Read Clipboard", "Capture and inspect clipboard contents.", "CB"),
@@ -787,13 +788,14 @@ class VSCodeQueueViewer(tk.Frame):
 
         self.code_text = tk.Text(
             self, bg=bg, fg=TEXT_PRIMARY,
-            # A Text defaults to 80 characters wide and inflates its parent's
-            # requested size. This panel must expand into available dock space.
             width=1,
             font=("Consolas", 10), bd=0, padx=10, pady=8,
             highlightthickness=0, wrap="none", cursor="xterm",
-            yscrollcommand=self._on_code_scroll
+            yscrollcommand=self._on_code_scroll,
+            exportselection=False  # Stops external focus changes from forcing selection jumps
         )
+
+
         self.code_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.plus_btn = tk.Label(
@@ -894,28 +896,65 @@ class VSCodeQueueViewer(tk.Frame):
             coord_items = []
             for idx in range(start_idx, end_idx + 1):
                 act = self.app.recorded_actions[idx]
-                if act.get("type") in ("move", "click", "wait_pixel", "scroll"):
+                if act.get("type") in ("move", "click", "wait_pixel", "scroll", "find_color", "search_area", "wait_text"):
                     coord_items.append(act)
 
             if not coord_items:
                 self.app.ghost_reticle.hide()
                 return
 
+            # Restrict trailing path to maximum 50 items
+            coord_items = coord_items[-50:]
+
             n = len(coord_items)
             reticle_data = []
+            area_rect = None
+            color_rect = None
+
             for i, act in enumerate(coord_items):
                 # Gradient alpha: lowest line count (oldest) = 0.22, highest line count (newest) = 0.92
                 alpha = 0.85 if n == 1 else (0.22 + (0.70 * (i / (n - 1))))
-                is_click = (act.get("type") in ("click", "scroll"))
-                reticle_data.append((act.get("x", 0), act.get("y", 0), is_click, alpha))
+                is_click = (act.get("type") in ("click", "scroll", "find_color"))
+                
+                if act.get("type") == "find_color":
+                    area = act.get("area", [0, 0, 0, 0])
+                    ox, oy = int(act.get("ox", 0)), int(act.get("oy", 0))
+                    
+                    found_box = self.app.search_color_in_area(area[0], area[1], area[2], area[3], act.get("color", "#FFFFFF"))
+                    
+                    if found_box:
+                        x1, y1, x2, y2 = found_box
+                        anchor_x = x2 if ox > 0 else (x1 if ox < 0 else x1 + (x2 - x1) // 2)
+                        anchor_y = y2 if oy > 0 else (y1 if oy < 0 else y1 + (y2 - y1) // 2)
+                        rx, ry = anchor_x + ox, anchor_y + oy
+                        if i == n - 1:
+                            area_rect = (area[0], area[1], area[2], area[3], alpha)
+                            color_rect = (x1, y1, x2 - x1, y2 - y1, alpha)
+                    else:
+                        rx = area[0] + (area[2] // 2) + ox
+                        ry = area[1] + (area[3] // 2) + oy
+                        if i == n - 1:
+                            area_rect = (area[0], area[1], area[2], area[3], alpha)
+                elif act.get("type") in ("search_area", "wait_text"):
+                    area = act.get("area", [0, 0, 0, 0])
+                    if i == n - 1:
+                        area_rect = (area[0], area[1], area[2], area[3], alpha)
+                    continue 
+                else:
+                    rx = int(act.get("x", 0))
+                    ry = int(act.get("y", 0))
+                    
+                reticle_data.append((rx, ry, is_click, alpha))
 
-            self.app.ghost_reticle.show_multi(reticle_data)
+            self.app.ghost_reticle.show_multi(reticle_data, area_rect=area_rect, color_rect=color_rect)
         except Exception:
             pass
+
 
     def clear(self):
         self.close_sub_menu()
         self.plus_btn.place_forget()
+        self.code_text.tag_remove("sel", "1.0", "end")  # Forcibly clear selections
         self.code_text.tag_remove("active_line", "1.0", "end")
         self.gutter.tag_remove("active_line", "1.0", "end")
         self.line_count = 0
@@ -923,7 +962,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.delete("1.0", "end")
         self.gutter.configure(width=5)
 
-    def append_line(self, text, color=TEXT_PRIMARY):
+    def append_line(self, text, color=TEXT_PRIMARY, auto_scroll=True):
         self.line_count += 1
         needed_width = max(5, len(str(self.line_count)) + 2)
         if int(self.gutter.cget("width")) < needed_width:
@@ -936,8 +975,9 @@ class VSCodeQueueViewer(tk.Frame):
             self.code_text.tag_configure(tag_name, foreground=color)
 
         self.code_text.insert("end", f"{text}\n", tag_name)
-        self.code_text.see("end")
-        self.gutter.see("end")
+        if auto_scroll:
+            self.code_text.see("end")
+            self.gutter.see("end")
 
     def set_interactive(self, enabled):
         self.interactive_enabled = enabled
@@ -1179,6 +1219,7 @@ class VSCodeQueueViewer(tk.Frame):
             "search_area": "Search selected area",
             "wait_pixel": "Wait Pixel",
             "wait_text": "Wait for Text",
+            "find_color": "Find Color & Click",
             "label": "Label Marker",
             "goto": "Jump to Label",
         }
@@ -1192,8 +1233,6 @@ class VSCodeQueueViewer(tk.Frame):
         initial_action = type_to_label.get(
             edit_action.get("type"), "Delay") if edit_action else "Delay"
 
-        # Use the active monitor's work area (not the full desktop), so the
-        # dialog remains accessible even on smaller or multi-monitor setups.
         class RECT(ctypes.Structure):
             _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                         ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
@@ -1386,6 +1425,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.sub_menu.bind("<MouseWheel>", self._on_action_picker_mousewheel)
         self._switch_action_view(initial_action, line_num, edit_idx=edit_idx)
 
+
     def _focus_action_search(self):
         if self.sub_menu and self.sub_menu.winfo_exists():
             self._action_search_entry.focus_set()
@@ -1504,6 +1544,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Request Input": self._render_request_input_view,
             "Type Variable": self._render_type_variable_view,
             "Search selected area": self._render_search_area_view,
+            "Find Color & Click": self._render_find_color_view,
             "Wait for Text": self._render_wait_text_view,
             "Wait Pixel": self._render_wait_pixel_view,
             "Label Marker": self._render_label_view,
@@ -2425,6 +2466,93 @@ class VSCodeQueueViewer(tk.Frame):
         btn_txt = "Save Changes" if edit_idx is not None else "Add Search Action"
         ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit_search_area).pack(fill=tk.X)
 
+    def _render_find_color_view(self, line_num, edit_idx=None):
+        body = self.action_content_frame
+        curr = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else {}
+
+        # Area Snip
+        chosen = {"area": curr.get("area")}
+        area_row = tk.Frame(body, bg=BG_PANEL)
+        area_row.pack(fill=tk.X, pady=(0, 9))
+        area_text = f"[{chosen['area'][0]},{chosen['area'][1]} {chosen['area'][2]}x{chosen['area'][3]}]" if chosen["area"] else "Area: Not selected"
+        area_lbl = tk.Label(area_row, text=area_text, font=("Consolas", 8), bg=BG_INPUT, fg=SYNTAX_BLUE if chosen["area"] else TEXT_MUTED, padx=6, pady=3, highlightbackground=BG_BORDER, highlightthickness=1, anchor="w")
+        area_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        def snip_done(a):
+            chosen["area"] = a
+            area_lbl.config(text=f"[{a[0]},{a[1]} {a[2]}x{a[3]}]", fg=SYNTAX_BLUE, highlightbackground=BG_BORDER)
+            if self.sub_menu: self.sub_menu.deiconify()
+
+        snip_btn = tk.Label(area_row, text="⛶ Snip", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3)
+        snip_btn.pack(side=tk.RIGHT)
+        snip_btn.bind("<Button-1>", lambda e: (self.sub_menu.withdraw(), self.app.start_screen_selection(snip_done)))
+
+        # Color & Inspector
+        col_row = tk.Frame(body, bg=BG_PANEL)
+        col_row.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(col_row, text="Target Color:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT)
+        col_entry = tk.Entry(col_row, width=9, bg=BG_INPUT, fg=SYNTAX_GREEN, font=("Consolas", 9, "bold"), bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        col_entry.insert(0, str(curr.get("color", "#FFFFFF")).upper())
+        col_entry.pack(side=tk.LEFT, padx=(6, 10))
+
+        def on_color_picked(x, y, hex_color):
+            col_entry.delete(0, "end")
+            col_entry.insert(0, hex_color)
+            if self.sub_menu: self.sub_menu.deiconify()
+
+        insp_btn = tk.Label(col_row, text="⌖ Inspect", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
+        insp_btn.pack(side=tk.LEFT)
+        insp_btn.bind("<Button-1>", lambda e: (self.sub_menu.withdraw(), self.app.start_pixel_inspection(on_color_picked)))
+
+        # Offsets
+        off_row = tk.Frame(body, bg=BG_PANEL)
+        off_row.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(off_row, text="Offset X:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT)
+        ox_entry = tk.Entry(off_row, width=6, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        ox_entry.insert(0, str(curr.get("ox", 0)))
+        ox_entry.pack(side=tk.LEFT, padx=(4, 10))
+        tk.Label(off_row, text="Offset Y:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT)
+        oy_entry = tk.Entry(off_row, width=6, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        oy_entry.insert(0, str(curr.get("oy", 0)))
+        oy_entry.pack(side=tk.LEFT, padx=(4, 0))
+
+        # Action Type Dropdown
+        act_row = tk.Frame(body, bg=BG_PANEL)
+        act_row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(act_row, text="Action:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT)
+        act_var = tk.StringVar(value=curr.get("action", "Single Click"))
+        act_menu = tk.OptionMenu(act_row, act_var, "Move Only", "Single Click", "Double Click")
+        act_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
+        act_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        act_menu.pack(side=tk.LEFT, padx=(6, 0))
+
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(0, 10))
+
+        def save():
+            try:
+                ox, oy = int(ox_entry.get().strip()), int(oy_entry.get().strip())
+                color = col_entry.get().strip().upper()
+                if not re.match(r"^#[0-9A-F]{6}$", color) or not chosen["area"]: raise ValueError
+            except ValueError:
+                return
+
+            action = {"type": "find_color", "area": [int(n) for n in chosen["area"]], "color": color, "ox": ox, "oy": oy, "action": act_var.get()}
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = action
+            else:
+                idx = line_num - 1 if "After" in pos_var.get() else line_num - 2
+                self.app.recorded_actions.insert(max(0, min(idx, len(self.app.recorded_actions))), action)
+
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.close_sub_menu()
+
+        ModernButton(body, text="Save Action", bg_color=COLOR_SUCCESS, hover_color="#1d8a4b", command=save).pack(fill=tk.X)
+
 
     def close_sub_menu(self):
         if self.sub_menu:
@@ -2978,6 +3106,10 @@ class GhostReticle:
         self.root = root
         self.pool = []
         self.hide_timer = None
+        self.area_win = None
+        self.area_canvas = None
+        self.color_win = None
+        self.color_canvas = None
 
     def _create_reticle_window(self):
         win = tk.Toplevel(self.root)
@@ -2999,15 +3131,55 @@ class GhostReticle:
         canvas.pack()
         return win, canvas
 
-    def show_multi(self, items):
+    def _create_area_window(self):
+        if self.area_win and self.area_win.winfo_exists():
+            return
+        self.area_win = tk.Toplevel(self.root)
+        self.area_win.overrideredirect(True)
+        self.area_win.attributes("-topmost", True, "-transparentcolor", "black")
+        self.area_win.config(bg="black")
+        self.area_canvas = tk.Canvas(self.area_win, bg="black", highlightthickness=0)
+        self.area_canvas.pack(fill=tk.BOTH, expand=True)
+        
+        try:
+            hwnd = self.area_win.winfo_id()
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TRANSPARENT = 0x00000020
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)
+        except Exception:
+            pass
+
+    def _create_color_window(self):
+        if self.color_win and self.color_win.winfo_exists():
+            return
+        self.color_win = tk.Toplevel(self.root)
+        self.color_win.overrideredirect(True)
+        self.color_win.attributes("-topmost", True, "-transparentcolor", "black")
+        self.color_win.config(bg="black")
+        self.color_canvas = tk.Canvas(self.color_win, bg="black", highlightthickness=0)
+        self.color_canvas.pack(fill=tk.BOTH, expand=True)
+        
+        try:
+            hwnd = self.color_win.winfo_id()
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TRANSPARENT = 0x00000020
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)
+        except Exception:
+            pass
+
+    def show_multi(self, items, area_rect=None, color_rect=None):
         if self.hide_timer:
             try: self.root.after_cancel(self.hide_timer)
             except Exception: pass
             self.hide_timer = None
 
-        if not items:
+        if not items and not area_rect and not color_rect:
             self.hide()
             return
+
+        items = items[-50:]
 
         while len(self.pool) < len(items):
             self.pool.append(self._create_reticle_window())
@@ -3025,27 +3197,109 @@ class GhostReticle:
             canvas.create_oval(12, 12, 16, 16, fill="#ffffff", outline=color)
 
             win.attributes("-alpha", max(0.15, min(1.0, alpha)))
-            win.geometry(f"{size}x{size}+{int(x - size // 2)}+{int(y - size // 2)}")
+            wx, wy = int(x - size // 2), int(y - size // 2)
+            win.geometry(f"{size}x{size}")
+            
+            win.update_idletasks()
+            try:
+                ctypes.windll.user32.MoveWindow(win.winfo_id(), wx, wy, size, size, True)
+            except Exception:
+                win.geometry(f"{size}x{size}{wx:+d}{wy:+d}")
+                
             win.deiconify()
 
         for i in range(len(items), len(self.pool)):
             self.pool[i][0].withdraw()
 
+        if area_rect:
+            self._create_area_window()
+            ax, ay, aw, ah, a_alpha = area_rect
+            pad = 2
+            ww, wh = aw + pad*2, ah + pad*2
+            wx, wy = ax - pad, ay - pad
+            self.area_win.geometry(f"{ww}x{wh}")
+            self.area_win.update_idletasks()
+            try:
+                ctypes.windll.user32.MoveWindow(self.area_win.winfo_id(), wx, wy, ww, wh, True)
+            except Exception:
+                self.area_win.geometry(f"{ww}x{wh}{wx:+d}{wy:+d}")
+                
+            self.area_canvas.delete("all")
+            self.area_canvas.create_rectangle(pad, pad, aw + pad, ah + pad, outline=SYNTAX_PURPLE, width=2, dash=(4, 4))
+            self.area_win.attributes("-alpha", max(0.15, min(1.0, a_alpha)))
+            self.area_win.deiconify()
+        else:
+            if self.area_win and self.area_win.winfo_exists():
+                self.area_win.withdraw()
+
+        if color_rect:
+            self._create_color_window()
+            cx, cy, cw, ch, c_alpha = color_rect
+            pad = 2
+            ww, wh = cw + pad*2, ch + pad*2
+            wx, wy = cx - pad, cy - pad
+            self.color_win.geometry(f"{ww}x{wh}")
+            self.color_win.update_idletasks()
+            try:
+                ctypes.windll.user32.MoveWindow(self.color_win.winfo_id(), wx, wy, ww, wh, True)
+            except Exception:
+                self.color_win.geometry(f"{ww}x{wh}{wx:+d}{wy:+d}")
+                
+            self.color_canvas.delete("all")
+            self.color_canvas.create_rectangle(pad, pad, cw + pad, ch + pad, outline="#35a879", width=2)
+            self.color_win.attributes("-alpha", max(0.15, min(1.0, c_alpha)))
+            self.color_win.deiconify()
+        else:
+            if self.color_win and self.color_win.winfo_exists():
+                self.color_win.withdraw()
+
         self.hide_timer = self.root.after(3500, self.hide)
 
-    def update(self, actions, index):
+    def update(self, actions, index, app=None):
         if not actions or index < 0 or index >= len(actions):
             self.hide()
             return
         
         act = actions[index]
-        if act.get("type") in ("move", "click", "wait_pixel", "scroll"):
-            self.show(act.get("x", 0), act.get("y", 0), is_click=(act.get("type") in ("click", "scroll")), alpha=0.85)
+        area_rect = None
+        color_rect = None
+        
+        if act.get("type") in ("move", "click", "wait_pixel", "scroll", "find_color", "search_area", "wait_text"):
+            if act.get("type") == "find_color":
+                area = act.get("area", [0, 0, 0, 0])
+                ox, oy = int(act.get("ox", 0)), int(act.get("oy", 0))
+                area_rect = (area[0], area[1], area[2], area[3], 0.85)
+                
+                # Perform live search if app context is provided
+                if app:
+                    found_box = app.search_color_in_area(area[0], area[1], area[2], area[3], act.get("color", "#FFFFFF"))
+                    if found_box:
+                        x1, y1, x2, y2 = found_box
+                        anchor_x = x2 if ox > 0 else (x1 if ox < 0 else x1 + (x2 - x1) // 2)
+                        anchor_y = y2 if oy > 0 else (y1 if oy < 0 else y1 + (y2 - y1) // 2)
+                        rx, ry = anchor_x + ox, anchor_y + oy
+                        color_rect = (x1, y1, x2 - x1, y2 - y1, 0.85)
+                    else:
+                        rx = area[0] + (area[2] // 2) + ox
+                        ry = area[1] + (area[3] // 2) + oy
+                else:
+                    rx = area[0] + (area[2] // 2) + ox
+                    ry = area[1] + (area[3] // 2) + oy
+                    
+                is_click = True
+            elif act.get("type") in ("search_area", "wait_text"):
+                area = act.get("area", [0, 0, 0, 0])
+                area_rect = (area[0], area[1], area[2], area[3], 0.85)
+                self.show_multi([], area_rect=area_rect)
+                return
+            else:
+                rx = int(act.get("x", 0))
+                ry = int(act.get("y", 0))
+                is_click = (act.get("type") in ("click", "scroll"))
+                
+            self.show_multi([(rx, ry, is_click, 0.85)], area_rect=area_rect, color_rect=color_rect)
         else:
             self.hide()
-
-    def show(self, x, y, is_click=False, alpha=0.85):
-        self.show_multi([(x, y, is_click, alpha)])
 
     def hide(self):
         if self.hide_timer:
@@ -3055,6 +3309,11 @@ class GhostReticle:
         for win, _ in self.pool:
             if win.winfo_exists():
                 win.withdraw()
+        if self.area_win and self.area_win.winfo_exists():
+            self.area_win.withdraw()
+        if self.color_win and self.color_win.winfo_exists():
+            self.color_win.withdraw()
+
 
 # --- Interactive, non-destructive guided tour ---
 class SequentWalkthrough:
@@ -3882,18 +4141,22 @@ class BuiltInMacroApp:
         return "break"
 
     def nudge_active_coordinate(self, dx, dy):
-        if (self.recording and not self.recording_paused) or self.playing or not self.recorded_actions:
+        if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused) or not self.recorded_actions:
             return "break"
 
         if not (0 <= self.current_action_idx < len(self.recorded_actions)):
             return "break"
 
         act = self.recorded_actions[self.current_action_idx]
-        if act.get("type") not in ("move", "click", "wait_pixel", "scroll"):
+        if act.get("type") not in ("move", "click", "wait_pixel", "scroll", "find_color"):
             return "break"
-
-        act["x"] = max(0, int(act.get("x", 0)) + dx)
-        act["y"] = max(0, int(act.get("y", 0)) + dy)
+            
+        if act.get("type") == "find_color":
+            act["ox"] = int(act.get("ox", 0)) + dx
+            act["oy"] = int(act.get("oy", 0)) + dy
+        else:
+            act["x"] = max(0, int(act.get("x", 0)) + dx)
+            act["y"] = max(0, int(act.get("y", 0)) + dy)
 
         line_num = self.current_action_idx + 2
         new_text = self.get_action_summary(act)
@@ -3903,13 +4166,14 @@ class BuiltInMacroApp:
         self.queue_viewer.code_text.delete(f"{line_num}.0", f"{line_num}.end")
         self.queue_viewer.code_text.insert(f"{line_num}.0", new_text, tag_name)
         self.queue_viewer.highlight_action(self.current_action_idx)
-
+        
         self.lbl_active_action.config(
             text=f"Action #{self.current_action_idx + 1}: {new_text}",
             fg=SYNTAX_GREEN
         )
 
-        self.ghost_reticle.update(self.recorded_actions, self.current_action_idx)
+        # Pass app=self so GhostReticle can perform live bounding box searches while nudging
+        self.ghost_reticle.update(self.recorded_actions, self.current_action_idx, app=self)
         return "break"
         
     def build_sidebar(self):
@@ -4751,6 +5015,10 @@ class BuiltInMacroApp:
             if action.get("match_any") or action.get("text") in ("*", "<ANY TEXT DETECTED>"):
                 return "🔍 ocr.search_area(match_any=True)"
             return f"🔍 ocr.search_area('{action.get('text', '')}')"
+        elif act_type == "find_color":
+            sub_action = action.get('action', 'Single Click')
+            verb = "move" if sub_action == "Move Only" else ("double_click" if sub_action == "Double Click" else "click")
+            return f"🎯 ocr.find_color('{action.get('color', '')}', offset=({action.get('ox', 0)},{action.get('oy', 0)}), do='{verb}')"
         elif act_type == "enter": 
             return "↵ keyboard.press('Enter')"
         elif act_type == "backspace": 
@@ -4768,7 +5036,7 @@ class BuiltInMacroApp:
         act_type = action.get("type", "") if action else ""
         if act_type in ("label", "goto", "if_var", "read_clipboard", "type_variable", "prompt_input"): return SYNTAX_PURPLE
         if act_type == "disclaimer": return SYNTAX_ORANGE
-        if act_type in ("wait_pixel", "wait_text"): return COLOR_SUCCESS
+        if act_type in ("wait_pixel", "wait_text", "find_color"): return COLOR_SUCCESS
         if act_type in ("move", "click", "drag", "scroll"): return SYNTAX_BLUE
         if act_type in ("key", "press", "enter", "backspace"): return SYNTAX_ORANGE
         if act_type in ("combo", "select_all", "copy", "paste", "delay", "search_area"): return SYNTAX_PURPLE
@@ -4797,17 +5065,14 @@ class BuiltInMacroApp:
         self.queue_viewer.highlight_action(self.current_action_idx)
 
         if hasattr(self, 'ghost_reticle'):
-            # Only display reticle during explicit manual inspection/scrubbing, never during playback
+            # Display reticle when idle or explicitly paused
             is_active_running = (self.playing and not self.is_paused) or (self.recording and not self.recording_paused)
-            if not is_active_running and not self.playing and show_reticle:
+            if not is_active_running and show_reticle:
                 self.ghost_reticle.update(self.recorded_actions, self.current_action_idx)
             else:
                 self.ghost_reticle.hide()
 
     def set_active_action_index(self, index):
-        # Ignore delayed queue dispatches if macro playback has already been stopped
-        if not self.playing and not self.recording and not self.chain_running:
-            return
         self.current_action_idx = index
         self.update_scrubber_ui()
 
@@ -4981,6 +5246,29 @@ class BuiltInMacroApp:
             match = (cur == expected)
             if match and self.audio_cues: play_cue("match")
             self.update_status(f"Pixel: {cur} (Match: {match})", COLOR_SUCCESS if match else COLOR_DANGER)
+        elif act_type == "find_color":
+            area = action.get("area", [0, 0, 100, 100])
+            hex_color = action.get("color", "#FFFFFF").upper()
+            ox, oy = action.get("ox", 0), action.get("oy", 0)
+            sub_action = action.get("action", "Single Click")
+            
+            found_pt = self.search_color_in_area(area[0], area[1], area[2], area[3], hex_color)
+            
+            if found_pt:
+                tx, ty = found_pt[0] + ox, found_pt[1] + oy
+                move_mouse(tx, ty)
+                time.sleep(max(0.001, 0.04 / self.playback_speed))
+                
+                if sub_action == "Single Click":
+                    click("left")
+                elif sub_action == "Double Click":
+                    click("left")
+                    time.sleep(0.05)
+                    click("left")
+                    
+                if self.audio_cues: play_cue("match")
+            else:
+                raise MacroExecutionError(f"Color {hex_color} not found in search area")
 
 
     def update_action_count_badge(self):
@@ -5000,7 +5288,7 @@ class BuiltInMacroApp:
             self.queue_viewer.redraw_breakpoints()
 
     def insert_delay_action(self, index, seconds):
-        if (self.recording and not self.recording_paused) or self.playing: return
+        if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused): return
         delay_action = {"type": "delay", "seconds": float(seconds)}
         self.recorded_actions.insert(index, delay_action)
         self.current_action_idx = index
@@ -5008,7 +5296,7 @@ class BuiltInMacroApp:
         self.update_status(f"Added {seconds:.2f}s Delay", COLOR_SUCCESS)
 
     def insert_search_area_action(self, index, text, area, preset, match_any=False):
-        if (self.recording and not self.recording_paused) or self.playing: return
+        if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused): return
         search_action = {
             "type": "search_area",
             "text": str(text),
@@ -5023,7 +5311,7 @@ class BuiltInMacroApp:
         self.update_status(f"Added Area Search: {desc}", COLOR_SUCCESS)
 
     def delete_action(self, index):
-        if (self.recording and not self.recording_paused) or self.playing: return
+        if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused): return
         if 0 <= index < len(self.recorded_actions):
             act = self.recorded_actions.pop(index)
             if self.current_action_idx >= len(self.recorded_actions):
@@ -5033,7 +5321,7 @@ class BuiltInMacroApp:
             self.update_status(f"Deleted {act_type} (Action #{index + 1})", COLOR_DANGER)
 
     def delete_action_range(self, start_idx, end_idx):
-        if (self.recording and not self.recording_paused) or self.playing: return
+        if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused): return
         start_idx = max(0, start_idx)
         end_idx = min(len(self.recorded_actions) - 1, end_idx)
         if start_idx <= end_idx:
@@ -5045,7 +5333,7 @@ class BuiltInMacroApp:
             self.update_status(f"Deleted {count} action(s)", COLOR_DANGER)
 
     def remove_all_mouse_moves(self):
-        if (self.recording and not self.recording_paused) or self.playing: return
+        if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused): return
         initial_len = len(self.recorded_actions)
         self.recorded_actions = [a for a in self.recorded_actions if a.get("type") != "move"]
         removed = initial_len - len(self.recorded_actions)
@@ -5068,7 +5356,14 @@ class BuiltInMacroApp:
         snipper.attributes("-topmost", True, "-alpha", 0.20)
         snipper.configure(bg="#000000")
         snipper.overrideredirect(True)
-        snipper.geometry(f"{vw}x{vh}+{vx}+{vy}")
+        snipper.geometry(f"{vw}x{vh}")
+        
+        snipper.update_idletasks()
+        try:
+            ctypes.windll.user32.MoveWindow(snipper.winfo_id(), vx, vy, vw, vh, True)
+        except Exception:
+            snipper.geometry(f"{vw}x{vh}{vx:+d}{vy:+d}")
+            
         snipper.config(cursor="crosshair")
 
         def cancel(event=None):
@@ -5118,11 +5413,23 @@ class BuiltInMacroApp:
         snipper.attributes('-alpha', 0.28)
         snipper.configure(bg="#000000")
         snipper.overrideredirect(True)
-        snipper.geometry(f"{vw}x{vh}+{vx}+{vy}")
-        snipper.config(cursor="cross")
-
+        
+        # 1. Establish the size explicitly for Tkinter's layout engine
+        snipper.geometry(f"{vw}x{vh}")
+        
+        # 2. Pack the canvas immediately so it expands to the full size
         canvas = tk.Canvas(snipper, bg="#000000", highlightthickness=0)
         canvas.pack(fill=tk.BOTH, expand=True)
+
+        snipper.update_idletasks()
+        
+        # 3. Natively move the window, bypassing the Tkinter negative-coordinate bug
+        try:
+            ctypes.windll.user32.MoveWindow(snipper.winfo_id(), vx, vy, vw, vh, True)
+        except Exception:
+            snipper.geometry(f"{vw}x{vh}{vx:+d}{vy:+d}")
+
+        snipper.config(cursor="cross")
 
         banner_x = vw // 2
         canvas.create_text(
@@ -5272,6 +5579,96 @@ class BuiltInMacroApp:
             gdi32.DeleteObject(h_bitmap)
             gdi32.DeleteDC(h_mem_dc)
             user32.ReleaseDC(0, h_screen_dc)
+
+    def search_color_in_area(self, x, y, w, h, hex_color):
+        """Captures a region to memory and searches for a hex color rapidly. Returns bounding box."""
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        
+        hex_color = hex_color.lstrip('#')
+        target_r, target_g, target_b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+        h_screen = user32.GetDC(0)
+        h_dc = gdi32.CreateCompatibleDC(h_screen)
+        h_bmp = gdi32.CreateCompatibleBitmap(h_screen, w, h)
+        gdi32.SelectObject(h_dc, h_bmp)
+        gdi32.BitBlt(h_dc, 0, 0, w, h, h_screen, x, y, 0x00CC0020)
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+                        ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+                        ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                        ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_int32),
+                        ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32),
+                        ("biClrImportant", ctypes.c_uint32)]
+
+        stride = ((w * 24 + 31) // 32) * 4
+        buf = (ctypes.c_char * (stride * h))()
+        bmi = BITMAPINFOHEADER(biSize=ctypes.sizeof(BITMAPINFOHEADER), biWidth=w, biHeight=-h, 
+                               biPlanes=1, biBitCount=24, biCompression=0, biSizeImage=stride * h)
+
+        gdi32.GetDIBits(h_dc, h_bmp, 0, h, buf, ctypes.byref(bmi), 0)
+        user32.ReleaseDC(0, h_screen)
+        gdi32.DeleteDC(h_dc)
+        gdi32.DeleteObject(h_bmp)
+
+        raw = bytes(buf)
+        
+        min_px, min_py = w, h
+        max_px, max_py = -1, -1
+        found = False
+
+        for py in range(h):
+            row_start = py * stride
+            for px in range(w):
+                idx = row_start + (px * 3)
+                if raw[idx] == target_b and raw[idx+1] == target_g and raw[idx+2] == target_r:
+                    if px < min_px: min_px = px
+                    if px > max_px: max_px = px
+                    if py < min_py: min_py = py
+                    if py > max_py: max_py = py
+                    found = True
+
+        if found:
+            # +1 ensures the bounding box encapsulates the full pixel width and height
+            return (x + min_px, y + min_py, x + max_px + 1, y + max_py + 1)
+        return None
+
+    def draw_highlight_box(self, x1, y1, x2, y2, outline_color="#35a879", duration_ms=800):
+        """Draws a transparent bounding box overlay on the screen where the color was found."""
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True, "-transparentcolor", "black")
+        win.config(bg="black")
+        
+        w = max(4, x2 - x1)
+        h = max(4, y2 - y1)
+        
+        pad = 2
+        ww, wh = w + pad*2, h + pad*2
+        wx, wy = x1 - pad, y1 - pad
+        win.geometry(f"{ww}x{wh}")
+        
+        canvas = tk.Canvas(win, width=ww, height=wh, bg="black", highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+        canvas.create_rectangle(pad, pad, w + pad, h + pad, outline=outline_color, width=2)
+        
+        win.update_idletasks()
+        try:
+            ctypes.windll.user32.MoveWindow(win.winfo_id(), wx, wy, ww, wh, True)
+        except Exception:
+            win.geometry(f"{ww}x{wh}{wx:+d}{wy:+d}")
+
+        try:
+            hwnd = win.winfo_id()
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TRANSPARENT = 0x00000020
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)
+        except Exception:
+            pass
+
+        self.root.after(duration_ms, lambda: win.destroy() if win.winfo_exists() else None)
 
 
     def ocr_screen_area(self, x, y, w, h):
@@ -6044,6 +6441,11 @@ try {{
                         if act.get("type") == "wait_pixel":
                             cleaned_act["timeout"] = float(cleaned_act.get("timeout", 15.0))
                             cleaned_act["color"] = str(cleaned_act.get("color", "#FFFFFF")).upper()
+                        if act.get("type") == "find_color":
+                            cleaned_act["ox"] = int(cleaned_act.get("ox", 0))
+                            cleaned_act["oy"] = int(cleaned_act.get("oy", 0))
+                            cleaned_act["color"] = str(cleaned_act.get("color", "#FFFFFF")).upper()
+                            cleaned_act["action"] = str(cleaned_act.get("action", "Single Click"))
                         if "match_any" in act:
                             cleaned_act["match_any"] = bool(act["match_any"])
                         validated_actions.append(cleaned_act)
@@ -6111,6 +6513,11 @@ try {{
                             if act.get("type") == "wait_pixel":
                                 cleaned_act["timeout"] = float(cleaned_act.get("timeout", 15.0))
                                 cleaned_act["color"] = str(cleaned_act.get("color", "#FFFFFF")).upper()
+                            if act.get("type") == "find_color":
+                                cleaned_act["ox"] = int(cleaned_act.get("ox", 0))
+                                cleaned_act["oy"] = int(cleaned_act.get("oy", 0))
+                                cleaned_act["color"] = str(cleaned_act.get("color", "#FFFFFF")).upper()
+                                cleaned_act["action"] = str(cleaned_act.get("action", "Single Click"))
                             if "match_any" in act:
                                 cleaned_act["match_any"] = bool(act["match_any"])
                             validated_actions.append(cleaned_act)
@@ -6131,20 +6538,31 @@ try {{
                 self.update_status("Import Error", COLOR_DANGER)
 
     def display_actions_in_queue(self, actions, source_label=None):
-        if source_label is None: source_label = self.current_source_label
+        is_new_source = (source_label is not None and source_label != self.current_source_label)
+        if source_label is None: 
+            source_label = self.current_source_label
+
+        # Save current scroll position unless loading a completely new macro file
+        old_scroll = self.queue_viewer.code_text.yview() if not is_new_source else None
+
         self.current_source_label = source_label
 
         self.queue_viewer.clear()
-        self.queue_viewer.append_line(f"// {source_label}", SYNTAX_GREEN)
+        self.queue_viewer.append_line(f"// {source_label}", SYNTAX_GREEN, auto_scroll=is_new_source)
 
         for act in actions:
             desc = self.get_action_summary(act)
             color = self.get_action_color(act)
-            self.queue_viewer.append_line(desc, color)
+            self.queue_viewer.append_line(desc, color, auto_scroll=False)
 
         self.update_action_count_badge()
         self.update_scrubber_ui()
         self.queue_viewer.redraw_breakpoints()
+
+        # Restore exact scroll offset
+        if not is_new_source and old_scroll:
+            self.queue_viewer.code_text.yview_moveto(old_scroll[0])
+            self.queue_viewer.gutter.yview_moveto(old_scroll[0])
     
     def _place_settings_page(self):
         """Place the Settings form at rest; never move it per animation frame.
@@ -7267,13 +7685,16 @@ try {{
         Thread(target=self.run_sequence, daemon=True).start()
 
     def stop_macro(self):
-        # Immediately invalidate all pending playback callbacks
+        # Capture view position before playhead reset
+        old_scroll = self.queue_viewer.code_text.yview()
+
         self.playback_run_id = time.time()
         self._playback_ui_pending = False
         self.playing = False
         self.is_paused = False
         self.update_status("Stopped by user", SYNTAX_ORANGE)
-        if self.audio_cues: play_cue("stop")
+        if self.audio_cues: 
+            play_cue("stop_rec")
 
         if hasattr(self, 'ghost_reticle'):
             self.ghost_reticle.hide()
@@ -7284,6 +7705,10 @@ try {{
         self.record_btn.set_state("normal", text=self.get_btn_text("start_rec"), bg=COLOR_DANGER, hover=COLOR_DANGER_HOV)
         self.queue_viewer.set_interactive(True)
         self.update_scrubber_ui(show_reticle=False)
+
+        # Restore view position
+        self.queue_viewer.code_text.yview_moveto(old_scroll[0])
+        self.queue_viewer.gutter.yview_moveto(old_scroll[0])
 
 
     def prompt_user_input(self, prompt_text, default_val=""):
@@ -7787,6 +8212,43 @@ try {{
                         else:
                             step_ptr += 1
                             continue
+                            
+                    # --- Find Color & Click (DYNAMIC BOUNDING BOX ANCHOR) ---
+                    if act_type == "find_color":
+                        area = action.get("area", [0, 0, 100, 100])
+                        hex_color = action.get("color", "#FFFFFF").upper()
+                        ox, oy = action.get("ox", 0), action.get("oy", 0)
+                        sub_action = action.get("action", "Single Click")
+                        
+                        found_box = self.search_color_in_area(area[0], area[1], area[2], area[3], hex_color)
+                        
+                        if found_box:
+                            x1, y1, x2, y2 = found_box
+                            
+                            # Draw visual bounding box overlay
+                            self.root.after(0, lambda bx1=x1, by1=y1, bx2=x2, by2=y2: self.draw_highlight_box(bx1, by1, bx2, by2, COLOR_SUCCESS, 800))
+                            
+                            # Calculate dynamic click target based on bounding box edges
+                            anchor_x = x2 if ox > 0 else (x1 if ox < 0 else x1 + (x2 - x1) // 2)
+                            anchor_y = y2 if oy > 0 else (y1 if oy < 0 else y1 + (y2 - y1) // 2)
+                            
+                            tx, ty = anchor_x + ox, anchor_y + oy
+                            move_mouse(tx, ty)
+                            time.sleep(max(0.001, 0.04 / self.playback_speed))
+                            
+                            if sub_action == "Single Click":
+                                click("left")
+                            elif sub_action == "Double Click":
+                                click("left")
+                                time.sleep(0.05)
+                                click("left")
+                                
+                            if self.audio_cues: play_cue("match")
+                        else:
+                            raise MacroExecutionError(f"Color {hex_color} not found in search area")
+                            
+                        step_ptr += 1
+                        continue
 
                     # --- Mouse Movement ---
                     if act_type == "move":
