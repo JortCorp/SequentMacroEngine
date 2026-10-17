@@ -18,8 +18,9 @@ import winsound
 ACTIVE_SOUND_THEME = "Classic"
 CUSTOM_SOUND_PATHS = {
     "start_rec": "",
+    "stop_rec": "",
     "pause": "",
-    "start": ""  # Used for Run Macro
+    "start": ""  
 }
 
 class MacroExecutionError(Exception):
@@ -30,12 +31,24 @@ class MacroExecutionError(Exception):
 def play_cue(cue_type):
     global ACTIVE_SOUND_THEME, CUSTOM_SOUND_PATHS
     def _beep():
-        # 1. Play custom WAV if set
+        # 1. Play custom WAV or MP3 if set
         custom_path = CUSTOM_SOUND_PATHS.get(cue_type, "")
-        if custom_path and os.path.exists(custom_path) and custom_path.lower().endswith(".wav"):
+        if custom_path and os.path.exists(custom_path):
+            ext = custom_path.lower()
             try:
-                winsound.PlaySound(custom_path, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
-                return
+                if ext.endswith(".wav"):
+                    winsound.PlaySound(custom_path, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+                    return
+                elif ext.endswith(".mp3"):
+                    # Use native Windows MCI (Media Control Interface) for MP3s
+                    mci = ctypes.windll.winmm.mciSendStringW
+                    alias = f"seq_audio_{cue_type}"
+                    mci(f'close {alias}', None, 0, None)  # Ensure track isn't locked
+                    
+                    if mci(f'open "{custom_path}" alias {alias}', None, 0, None) == 0:
+                        mci(f'play {alias} wait', None, 0, None)
+                        mci(f'close {alias}', None, 0, None)
+                        return
             except Exception:
                 pass
 
@@ -70,8 +83,10 @@ def play_cue(cue_type):
             b = ctypes.windll.kernel32.Beep
             theme = themes.get(ACTIVE_SOUND_THEME, themes["Classic"])
             
-            # Fallback for start_rec to use 'start' theme notes if no custom file exists
-            theme_cue = "start" if cue_type == "start_rec" else cue_type
+            # Map specific cue_types to their corresponding theme arrays
+            if cue_type == "start_rec": theme_cue = "start"
+            elif cue_type == "stop_rec": theme_cue = "stop"
+            else: theme_cue = cue_type
             
             for freq, dur in theme.get(theme_cue, []):
                 b(freq, dur)
@@ -5651,13 +5666,19 @@ try {{
             def _browse():
                 self.root.attributes('-topmost', False)
                 try:
-                    path = filedialog.askopenfilename(parent=self.root, title=f"Select Sound for {label_text}", filetypes=[("WAV Audio", "*.wav")])
+                    # Updated to allow both MP3 and WAV
+                    path = filedialog.askopenfilename(
+                        parent=self.root, 
+                        title=f"Select Sound for {label_text}", 
+                        filetypes=[("Audio Files", "*.wav *.mp3"), ("WAV Audio", "*.wav"), ("MP3 Audio", "*.mp3")]
+                    )
                 finally:
                     self.root.attributes('-topmost', True)
                 if path:
                     CUSTOM_SOUND_PATHS[cue_key] = path
                     lbl_path.config(text=self.shorten_path(path), fg=SYNTAX_GREEN)
-            
+
+
             def _clear():
                 CUSTOM_SOUND_PATHS[cue_key] = ""
                 lbl_path.config(text="Default Theme Sound", fg=TEXT_MUTED)
@@ -5673,6 +5694,7 @@ try {{
             btn_browse.bind("<Button-1>", lambda e: _browse())
 
         add_custom_sound_row(f_sys, "Start Recording Sound", "start_rec")
+        add_custom_sound_row(f_sys, "Stop Recording Sound", "stop_rec")
         add_custom_sound_row(f_sys, "Pause Sequence Sound", "pause")
         add_custom_sound_row(f_sys, "Run Macro Sound", "start")
 
@@ -6882,7 +6904,7 @@ try {{
         self.current_action_idx = 0
         self.update_action_count_badge()
         self.update_status(f"Actions: {len(self.recorded_actions)}", TEXT_MUTED)
-        if self.audio_cues: play_cue("stop")
+        if self.audio_cues: play_cue("stop_rec") 
 
         self.record_btn.set_state("normal", text=self.get_btn_text("start_rec"), bg=COLOR_DANGER, hover=COLOR_DANGER_HOV)
         self.play_btn.set_state("normal")
@@ -7525,7 +7547,6 @@ try {{
 
         self.root.after(0, lambda: self.update_status(f"Running (from #{start_idx + 1})...", COLOR_ACCENT))
         if self.audio_cues: play_cue("start")
-        time.sleep(0.3) 
 
         held_modifiers = set()
         failure_reason = ""
