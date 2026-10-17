@@ -22,6 +22,10 @@ CUSTOM_SOUND_PATHS = {
     "start": ""  # Used for Run Macro
 }
 
+class MacroExecutionError(Exception):
+    """Expected macro failure, such as an unmet verification condition."""
+
+
 # --- Native Audio Feedback (Non-Blocking Kernel32 Beeps & WAVs) ---
 def play_cue(cue_type):
     global ACTIVE_SOUND_THEME, CUSTOM_SOUND_PATHS
@@ -139,7 +143,7 @@ def calculate_bezier_trajectory(start_pt, end_pt, steps=25):
         points.append((int(bx), int(by)))
     return points
 
-# --- Activate Windows Per-Monitor DPI Awareness ---
+# --- Windows DPI Awareness ---
 
 def get_dpi_scale():
     """Calculates the active display DPI scaling ratio (e.g., 1.0 for 100%, 1.25 for 125%, 1.5 for 150%)."""
@@ -162,12 +166,20 @@ def get_dpi_scale():
     return 1.0
 
 
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2) # PROCESS_PER_MONITOR_DPI_AWARE
-except Exception:
+# System-DPI awareness is the default for consistent Tk rendering.
+# SEQUENT_DPI_MODE can optionally override it for environments with different
+# display configurations (system, permonitor, unaware). Set before launch.
+SEQUENT_DPI_MODE = os.environ.get("SEQUENT_DPI_MODE", "system").strip().lower()
+if SEQUENT_DPI_MODE not in ("system", "permonitor", "unaware"):
+    SEQUENT_DPI_MODE = "system"
+
+if os.name == "nt":
     try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
+        awareness = {"unaware": 0, "system": 1, "permonitor": 2}[SEQUENT_DPI_MODE]
+        rc = ctypes.windll.shcore.SetProcessDpiAwareness(awareness)
+        # Windows may return E_ACCESSDENIED if Python or a manifest has
+        # already selected awareness. In that case Tk keeps the existing mode.
+    except (AttributeError, OSError):
         pass
 
 # --- Native Windows API Constants & Structures ---
@@ -412,40 +424,78 @@ def press_key_combo(mods, vk, hold_time=0.06):
         m_scan = ctypes.windll.user32.MapVirtualKeyW(m, 0)
         ctypes.windll.user32.keybd_event(m, m_scan, m_flags | KEYEVENTF_KEYUP, 0)
 
-# --- Modern Theme Palette ---
-BG_APP = "#313338"
-BG_SIDEBAR = "#2b2d31"
-BG_HEADER = "#1e1f22"
-BG_PANEL = "#2b2d31"
-BG_INPUT = "#1e1f22"
-BG_GUTTER = "#16171a"
-BG_SCROLL_TRACK = "#141517"
-BG_BORDER = "#383a40"
-BG_HOVER = "#35373c"
-TRACK_INACTIVE = "#3f4147"
-TRACK_HOVER = "#585b64"
-TRACK_ACTIVE = "#5865f2"
+# --- Sequent workspace theme tokens (all main views + action library) ---
+BG_APP = "#17191e"          # Workspace canvas
+BG_SIDEBAR = "#1c1f26"      # Navigation / action library
+BG_HEADER = "#111318"       # Window chrome / dock headers
+BG_PANEL = "#23262e"        # Dock interiors and cards
+BG_INPUT = "#181b21"        # Edit fields and recessed controls
+BG_GUTTER = "#15171c"
+BG_SCROLL_TRACK = "#15171c"
+BG_BORDER = "#353a43"
+BG_HOVER = "#303642"
+BG_SELECTED = "#293b54"
+TRACK_INACTIVE = "#4a5260"
+TRACK_HOVER = "#657185"
+TRACK_ACTIVE = "#4089eb"
 
-TEXT_PRIMARY = "#f2f3f5"
-TEXT_MUTED = "#949ba4"
+TEXT_PRIMARY = "#edf1f6"
+TEXT_MUTED = "#a0aab8"
 TEXT_HEADER = "#ffffff"
 
-COLOR_ACCENT = "#5865f2"
-COLOR_ACCENT_HOV = "#4752c4"
-COLOR_DANGER = "#da373c"
-COLOR_DANGER_HOV = "#a12828"
-COLOR_SUCCESS = "#23a55a"
-DISABLED = "#383a40"
+COLOR_ACCENT = "#347bd8"
+COLOR_ACCENT_HOV = "#2667be"
+COLOR_DANGER = "#d54d54"
+COLOR_DANGER_HOV = "#a73942"
+COLOR_SUCCESS = "#35a879"
+DISABLED = "#363b45"
 
-SYNTAX_BLUE = "#00a8fc"
-SYNTAX_ORANGE = "#f0b232"
-SYNTAX_PURPLE = "#c586c0"
-SYNTAX_GREEN = "#23a55a"
+SYNTAX_BLUE = "#79b8ff"
+SYNTAX_ORANGE = "#f3ba65"
+SYNTAX_PURPLE = "#c4a3ed"
+SYNTAX_GREEN = "#65d4aa"
+
+
+def sequent_dock_header(parent, title, subtitle="", right_text=""):
+    """Small consistent dock title bar. No changes to automation behavior."""
+    shell = tk.Frame(parent, bg=BG_HEADER, height=39)
+    shell.pack(fill=tk.X)
+    shell.pack_propagate(False)
+    tk.Frame(shell, bg=COLOR_ACCENT, width=3).pack(side=tk.LEFT, fill=tk.Y)
+    tk.Label(shell, text=title.upper(), bg=BG_HEADER, fg=TEXT_PRIMARY,
+             font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(12, 8))
+    if subtitle:
+        tk.Label(shell, text=subtitle, bg=BG_HEADER, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8)).pack(side=tk.LEFT)
+    if right_text:
+        tk.Label(shell, text=right_text, bg=BG_INPUT, fg=SYNTAX_BLUE,
+                 font=("Consolas", 8), padx=7, pady=3).pack(side=tk.RIGHT, padx=10)
+    tk.Frame(parent, bg=BG_BORDER, height=1).pack(fill=tk.X)
+    return shell
+
+
+def sequent_toolbar_button(parent, text, command, accent=False):
+    """Compact Sequent toolbar button with clear hover affordance."""
+    base = COLOR_ACCENT if accent else BG_INPUT
+    hover = COLOR_ACCENT_HOV if accent else BG_HOVER
+    label = tk.Label(parent, text=text, bg=base,
+                     fg="#ffffff" if accent else TEXT_PRIMARY,
+                     font=("Segoe UI", 9, "bold"), padx=11, pady=6,
+                     cursor="hand2", highlightbackground=BG_BORDER,
+                     highlightthickness=0 if accent else 1)
+    label.bind("<Button-1>", lambda e: command())
+    label.bind("<Enter>", lambda e: label.config(bg=hover))
+    label.bind("<Leave>", lambda e: label.config(bg=base))
+    return label
 
 class ModernTooltip:
     """Renders a sleek Modern-themed floating micro-tooltip with hotkey badges."""
     def __init__(self, widget, text, hotkey=None, delay_ms=350):
         self.widget = widget
+        # Makes pending tooltip timers discoverable during theme teardown.
+        if not hasattr(widget, "_sequent_tooltips"):
+            widget._sequent_tooltips = []
+        widget._sequent_tooltips.append(self)
         self.text = text
         self.hotkey = hotkey
         self.delay_ms = delay_ms
@@ -653,6 +703,32 @@ class ModernScrollBar(tk.Canvas):
             
 # --- VS Code-Style Playback Queue Viewer ---
 class VSCodeQueueViewer(tk.Frame):
+    # Categorized action catalog. Existing action type names are unchanged,
+    # so recorded macros and all existing action editors remain compatible.
+    ACTION_PICKER_GROUPS = (
+        ("Timing & Waiting", (
+            ("Delay", "Pause playback for a set duration.", "DL"),
+            ("Wait Pixel", "Wait for a screen pixel to match a color.", "PX"),
+            ("Wait for Text", "Wait for OCR text to appear or disappear.", "TX"),
+        )),
+        ("Screen & Recognition", (
+            ("Search selected area", "Read an area and branch to a preset.", "OCR"),
+        )),
+        ("Variables & Inputs", (
+            ("Read Clipboard", "Capture and inspect clipboard contents.", "CB"),
+            ("Request Input", "Ask the user for a value at runtime.", "IN"),
+            ("Type Variable", "Type the value of a saved variable.", "VAR"),
+        )),
+        ("Logic & Flow", (
+            ("If Variable Condition", "Branch based on a variable comparison.", "IF"),
+            ("Label Marker", "Create a named location in the queue.", "LB"),
+            ("Jump to Label", "Continue execution at a named label.", "GO"),
+        )),
+        ("User Interaction", (
+            ("Disclaimer / Warning", "Display a message before continuing.", "!"),
+        )),
+    )
+
     def __init__(self, parent, app_instance, bg=None, **kwargs):
         bg = bg or BG_INPUT
         super().__init__(parent, bg=bg, highlightbackground=BG_BORDER, highlightthickness=1, **kwargs)
@@ -696,6 +772,9 @@ class VSCodeQueueViewer(tk.Frame):
 
         self.code_text = tk.Text(
             self, bg=bg, fg=TEXT_PRIMARY,
+            # A Text defaults to 80 characters wide and inflates its parent's
+            # requested size. This panel must expand into available dock space.
+            width=1,
             font=("Consolas", 10), bd=0, padx=10, pady=8,
             highlightthickness=0, wrap="none", cursor="xterm",
             yscrollcommand=self._on_code_scroll
@@ -1070,10 +1149,12 @@ class VSCodeQueueViewer(tk.Frame):
             self.open_action_submenu(self.hovered_line, event)
 
     def open_action_submenu(self, line_num, event, edit_idx=None):
+        """Open a searchable Sequent action browser and properties editor."""
         self.close_sub_menu()
-        if not self.interactive_enabled: return
+        if not self.interactive_enabled:
+            return
 
-        TYPE_TO_LABEL = {
+        type_to_label = {
             "delay": "Delay",
             "disclaimer": "Disclaimer / Warning",
             "if_var": "If Variable Condition",
@@ -1082,173 +1163,339 @@ class VSCodeQueueViewer(tk.Frame):
             "type_variable": "Type Variable",
             "search_area": "Search selected area",
             "wait_pixel": "Wait Pixel",
+            "wait_text": "Wait for Text",
             "label": "Label Marker",
-            "goto": "Jump to Label"
+            "goto": "Jump to Label",
         }
-
-        editing_act = None
-        if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions):
-            editing_act = self.app.recorded_actions[edit_idx]
-            if editing_act.get("type") not in TYPE_TO_LABEL:
+        edit_action = None
+        if edit_idx is not None:
+            if not 0 <= edit_idx < len(self.app.recorded_actions):
                 return
+            edit_action = self.app.recorded_actions[edit_idx]
+            if edit_action.get("type") not in type_to_label:
+                return
+        initial_action = type_to_label.get(
+            edit_action.get("type"), "Delay") if edit_action else "Delay"
 
-        initial_action = TYPE_TO_LABEL.get(editing_act.get("type"), "Delay") if editing_act else "Delay"
-
-        menu_w = 340
-        base_h = 400 if initial_action in ("Search selected area", "If Variable Condition") else (
-            370 if initial_action == "Disclaimer / Warning" else (
-                350 if initial_action == "Read Clipboard" else (
-                    300 if initial_action == "Request Input" else (
-                        280 if initial_action in ("Wait Pixel", "Type Variable") else 250
-                    )
-                )
-            )
-        )
-        menu_h = base_h - 30 if edit_idx is not None else base_h
-
+        # Use the active monitor's work area (not the full desktop), so the
+        # dialog remains accessible even on smaller or multi-monitor setups.
         class RECT(ctypes.Structure):
-            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
         class MONITORINFO(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", ctypes.c_uint32),
-                ("rcMonitor", RECT),
-                ("rcWork", RECT),
-                ("dwFlags", ctypes.c_uint32)
-            ]
+            _fields_ = [("cbSize", ctypes.c_uint32), ("rcMonitor", RECT),
+                        ("rcWork", RECT), ("dwFlags", ctypes.c_uint32)]
 
         user32 = ctypes.windll.user32
         hwnd = user32.GetForegroundWindow()
-        MONITOR_DEFAULTTONEAREST = 2
-
         if hwnd:
-            hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            monitor = user32.MonitorFromWindow(hwnd, 2)
         else:
-            pt = POINT()
-            user32.GetCursorPos(ctypes.byref(pt))
-            hmon = user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+            cursor = POINT()
+            user32.GetCursorPos(ctypes.byref(cursor))
+            monitor = user32.MonitorFromPoint(cursor, 2)
 
         mi = MONITORINFO()
         mi.cbSize = ctypes.sizeof(MONITORINFO)
-        if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
-            mon_x = mi.rcWork.left
-            mon_y = mi.rcWork.top
+        if user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
+            mon_x, mon_y = mi.rcWork.left, mi.rcWork.top
             mon_w = mi.rcWork.right - mi.rcWork.left
             mon_h = mi.rcWork.bottom - mi.rcWork.top
         else:
             mon_x, mon_y = 0, 0
             mon_w, mon_h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
+        menu_w = min(920, max(440, mon_w - 32))
+        menu_h = min(640, max(360, mon_h - 32))
         init_x = mon_x + max(0, (mon_w - menu_w) // 2)
         init_y = mon_y + max(0, (mon_h - menu_h) // 2)
 
-        root = self.app.root
-        self.sub_menu = tk.Toplevel(root)
+        self.sub_menu = tk.Toplevel(self.app.root)
         self.sub_menu.overrideredirect(True)
-        self.sub_menu.attributes('-topmost', True)
+        self.sub_menu.attributes("-topmost", True)
         self.sub_menu.geometry(f"{menu_w}x{menu_h}+{init_x}+{init_y}")
         self.sub_menu.configure(bg=BG_BORDER)
-        self.sub_menu.update_idletasks()
+        self.sub_menu.bind("<Escape>", lambda e: self.close_sub_menu())
+        self.sub_menu.bind("<Control-f>", lambda e: self._focus_action_search())
 
-        if getattr(self.app, 'entertain_me', True):
-            self.sub_menu.attributes('-alpha', 0.0)
-            def _fade_in_modal(alpha=0.0):
-                if not self.sub_menu or not self.sub_menu.winfo_exists(): return
+        if getattr(self.app, "entertain_me", True):
+            self.sub_menu.attributes("-alpha", 0.0)
+            def fade_in(alpha=0.0):
+                if not self.sub_menu or not self.sub_menu.winfo_exists():
+                    return
                 alpha = min(1.0, alpha + 0.18)
-                self.sub_menu.attributes('-alpha', alpha)
+                self.sub_menu.attributes("-alpha", alpha)
                 if alpha < 1.0:
-                    self.sub_menu.after(12, lambda: _fade_in_modal(alpha))
-            self.sub_menu.after(10, _fade_in_modal)
-        else:
-            self.sub_menu.attributes('-alpha', 1.0)
+                    self.sub_menu.after(12, lambda: fade_in(alpha))
+            self.sub_menu.after(10, fade_in)
 
         card = tk.Frame(self.sub_menu, bg=BG_PANEL)
         card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
-        def _start_drag(e):
-            self._sub_drag_start_x = e.x_root; self._sub_drag_start_y = e.y_root
-            self._sub_drag_win_x = self.sub_menu.winfo_x(); self._sub_drag_win_y = self.sub_menu.winfo_y()
+        def start_drag(e):
+            self._sub_drag_start_x, self._sub_drag_start_y = e.x_root, e.y_root
+            self._sub_drag_win_x = self.sub_menu.winfo_x()
+            self._sub_drag_win_y = self.sub_menu.winfo_y()
 
-        def _do_drag(e):
-            dx = e.x_root - self._sub_drag_start_x; dy = e.y_root - self._sub_drag_start_y
-            self.sub_menu.geometry(f"+{self._sub_drag_win_x + dx}+{self._sub_drag_win_y + dy}")
+        def do_drag(e):
+            dx = e.x_root - self._sub_drag_start_x
+            dy = e.y_root - self._sub_drag_start_y
+            self.sub_menu.geometry(
+                f"+{self._sub_drag_win_x + dx}+{self._sub_drag_win_y + dy}")
 
-        head = tk.Frame(card, bg=BG_HEADER, height=28, cursor="fleur")
+        head = tk.Frame(card, bg=BG_HEADER, height=40, cursor="fleur")
         head.pack(fill=tk.X)
-        drag_icon = tk.Label(head, text=" ⠇ ", font=("Segoe UI", 9), bg=BG_HEADER, fg=TEXT_MUTED, cursor="fleur")
-        drag_icon.pack(side=tk.LEFT, padx=(4, 0))
+        head.pack_propagate(False)
+        title_lbl = tk.Label(
+            head, text="  ≡  " + ("EDIT ACTION" if edit_idx is not None else "ADD ACTION"),
+            font=("Segoe UI", 10, "bold"), bg=BG_HEADER, fg=TEXT_PRIMARY,
+            cursor="fleur")
+        title_lbl.pack(side=tk.LEFT, padx=(9, 10))
+        line_lbl = tk.Label(head, text=f"LINE {line_num}",
+                            font=("Consolas", 9, "bold"), bg=BG_INPUT,
+                            fg=SYNTAX_BLUE, padx=8, pady=3, cursor="fleur")
+        line_lbl.pack(side=tk.LEFT)
+        tk.Label(head, text="SEQUENT  /  ACTION LIBRARY",
+                 font=("Segoe UI", 8), bg=BG_HEADER,
+                 fg=TEXT_MUTED).pack(side=tk.LEFT, padx=20)
+        close_btn = tk.Label(head, text="  ✕  ", font=("Segoe UI", 11),
+                             bg=BG_HEADER, fg=TEXT_MUTED, cursor="hand2")
+        close_btn.pack(side=tk.RIGHT, padx=8)
+        close_btn.bind("<Button-1>", lambda e: self.close_sub_menu())
+        close_btn.bind("<Enter>", lambda e: close_btn.config(fg=TEXT_PRIMARY, bg=COLOR_DANGER))
+        close_btn.bind("<Leave>", lambda e: close_btn.config(fg=TEXT_MUTED, bg=BG_HEADER))
+        for w in (head, title_lbl, line_lbl):
+            w.bind("<Button-1>", start_drag)
+            w.bind("<B1-Motion>", do_drag)
 
-        title_lbl = "EDIT ACTION" if edit_idx is not None else ("LINE OPTIONS" if line_num >= 2 else "ADD ACTION")
-        lbl_title = tk.Label(head, text=title_lbl, font=("Segoe UI", 8, "bold"), bg=BG_HEADER, fg=COLOR_SUCCESS if edit_idx is not None else TEXT_MUTED, cursor="fleur")
-        lbl_title.pack(side=tk.LEFT, padx=4, pady=5)
-        lbl_line = tk.Label(head, text=f"Line {line_num}", font=("Consolas", 8, "bold"), bg=BG_INPUT, fg=SYNTAX_BLUE, padx=4, pady=1, cursor="fleur")
-        lbl_line.pack(side=tk.LEFT, padx=2)
+        body = tk.Frame(card, bg=BG_PANEL)
+        body.pack(fill=tk.BOTH, expand=True)
+        nav_width = min(285, max(175, menu_w // 3))
+        nav = tk.Frame(body, bg=BG_SIDEBAR, width=nav_width)
+        nav.pack(side=tk.LEFT, fill=tk.Y)
+        nav.pack_propagate(False)
+        tk.Frame(body, bg=BG_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y)
 
-        for w in (head, drag_icon, lbl_title, lbl_line):
-            w.bind("<Button-1>", _start_drag); w.bind("<B1-Motion>", _do_drag)
+        tk.Label(nav, text="ACTION LIBRARY", font=("Segoe UI", 9, "bold"),
+                 bg=BG_SIDEBAR, fg=TEXT_PRIMARY, anchor="w").pack(
+                     fill=tk.X, padx=14, pady=(16, 3))
+        tk.Label(nav, text="Choose a type, then configure it →",
+                 font=("Segoe UI", 8), bg=BG_SIDEBAR,
+                 fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, padx=14)
 
-        btn_close = tk.Label(head, text=" ✕ ", font=("Segoe UI", 9), bg=BG_HEADER, fg=TEXT_MUTED, cursor="hand2")
-        btn_close.pack(side=tk.RIGHT, padx=4)
-        btn_close.bind("<Button-1>", lambda e: self.close_sub_menu())
+        search_shell = tk.Frame(nav, bg=BG_INPUT, highlightbackground=BG_BORDER,
+                                highlightthickness=1)
+        search_shell.pack(fill=tk.X, padx=12, pady=(12, 12))
+        tk.Label(search_shell, text="⌕", bg=BG_INPUT, fg=TEXT_MUTED,
+                 font=("Segoe UI", 13)).pack(side=tk.LEFT, padx=(8, 4))
+        self._action_search_var = tk.StringVar()
+        self._action_search_entry = tk.Entry(
+            search_shell, textvariable=self._action_search_var,
+            bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+            font=("Segoe UI", 9), bd=0, relief="flat")
+        self._action_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), pady=7)
+        self._action_search_entry.bind("<Return>", self._select_first_search_result)
 
-        tk.Frame(card, bg=BG_BORDER, height=1).pack(fill=tk.X)
+        picker_area = tk.Frame(nav, bg=BG_SIDEBAR)
+        picker_area.pack(fill=tk.BOTH, expand=True, padx=(4, 2), pady=(0, 8))
+        self._action_picker_canvas = tk.Canvas(
+            picker_area, bg=BG_SIDEBAR, bd=0, highlightthickness=0)
+        self._action_picker_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        picker_scroll = ModernScrollBar(
+            picker_area, command=self._action_picker_canvas.yview,
+            width=12, bg_trough=BG_SIDEBAR)
+        picker_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._action_picker_canvas.configure(yscrollcommand=picker_scroll.set)
+        self._action_picker_inner = tk.Frame(self._action_picker_canvas, bg=BG_SIDEBAR)
+        picker_window = self._action_picker_canvas.create_window(
+            (0, 0), window=self._action_picker_inner, anchor="nw")
+        self._action_picker_inner.bind(
+            "<Configure>", lambda e: self._action_picker_canvas.configure(
+                scrollregion=self._action_picker_canvas.bbox("all")))
+        self._action_picker_canvas.bind(
+            "<Configure>", lambda e: self._action_picker_canvas.itemconfigure(
+                picker_window, width=e.width))
 
-        top_row = tk.Frame(card, bg=BG_PANEL, padx=12, pady=8)
-        top_row.pack(fill=tk.X)
-        tk.Label(top_row, text="Action:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, width=7, anchor="w").pack(side=tk.LEFT)
+        detail = tk.Frame(body, bg=BG_PANEL)
+        detail.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        detail_head = tk.Frame(detail, bg=BG_PANEL)
+        detail_head.pack(fill=tk.X, padx=23, pady=(18, 12))
+        self._selected_action_title = tk.Label(
+            detail_head, text="", bg=BG_PANEL, fg=TEXT_PRIMARY,
+            font=("Segoe UI", 15, "bold"), anchor="w")
+        self._selected_action_title.pack(fill=tk.X)
+        self._selected_action_desc = tk.Label(
+            detail_head, text="", bg=BG_PANEL, fg=TEXT_MUTED,
+            font=("Segoe UI", 9), anchor="w", justify="left",
+            wraplength=max(200, menu_w - nav_width - 95))
+        self._selected_action_desc.pack(fill=tk.X, pady=(5, 0))
+        tk.Frame(detail, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=23)
 
-        action_options = [
-            "Delay", 
-            "Disclaimer / Warning",
-            "If Variable Condition",
-            "Read Clipboard", 
-            "Request Input",
-            "Type Variable", 
-            "Search selected area", 
-            "Wait Pixel", 
-            "Label Marker", 
-            "Jump to Label"
-        ]
-        action_var = tk.StringVar(value=initial_action)
-        action_menu = tk.OptionMenu(top_row, action_var, *action_options, command=lambda val: self._switch_action_view(val, line_num, edit_idx=edit_idx))
-        action_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER, font=("Segoe UI", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        action_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
-        action_menu.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        editor_shell = tk.Frame(detail, bg=BG_PANEL)
+        editor_shell.pack(fill=tk.BOTH, expand=True, padx=(13, 9), pady=(15, 6))
+        self._action_editor_canvas = tk.Canvas(
+            editor_shell, bg=BG_PANEL, bd=0, highlightthickness=0)
+        self._action_editor_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        editor_scroll = ModernScrollBar(
+            editor_shell, command=self._action_editor_canvas.yview,
+            width=14, bg_trough=BG_PANEL)
+        editor_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._action_editor_canvas.configure(yscrollcommand=editor_scroll.set)
+        self.action_content_frame = tk.Frame(self._action_editor_canvas, bg=BG_PANEL,
+                                             padx=10, pady=5)
+        editor_win = self._action_editor_canvas.create_window(
+            (0, 0), window=self.action_content_frame, anchor="nw")
+        self.action_content_frame.bind(
+            "<Configure>", lambda e: self._action_editor_canvas.configure(
+                scrollregion=self._action_editor_canvas.bbox("all")))
+        self._action_editor_canvas.bind(
+            "<Configure>", lambda e: self._action_editor_canvas.itemconfigure(
+                editor_win, width=e.width))
 
-        self.action_content_frame = tk.Frame(card, bg=BG_PANEL, padx=12, pady=4)
-        self.action_content_frame.pack(fill=tk.BOTH, expand=True)
+        tk.Frame(detail, bg=BG_BORDER, height=1).pack(fill=tk.X)
+        footer = tk.Frame(detail, bg=BG_PANEL)
+        footer.pack(fill=tk.X, padx=20, pady=10)
+        tk.Label(footer, text="Changes apply only when you save the action.",
+                 font=("Segoe UI", 8), bg=BG_PANEL,
+                 fg=TEXT_MUTED).pack(side=tk.LEFT)
+        cancel_btn = tk.Label(footer, text="  Cancel  ", font=("Segoe UI", 9, "bold"),
+                              bg=BG_INPUT, fg=TEXT_PRIMARY, padx=5, pady=5,
+                              highlightbackground=BG_BORDER, highlightthickness=1,
+                              cursor="hand2")
+        cancel_btn.pack(side=tk.RIGHT)
+        cancel_btn.bind("<Button-1>", lambda e: self.close_sub_menu())
+
+        self._selected_action_name = None
+        self._action_search_var.trace_add("write", lambda *args: self._rebuild_action_picker())
+        self.sub_menu.bind("<MouseWheel>", self._on_action_picker_mousewheel)
         self._switch_action_view(initial_action, line_num, edit_idx=edit_idx)
 
+    def _focus_action_search(self):
+        if self.sub_menu and self.sub_menu.winfo_exists():
+            self._action_search_entry.focus_set()
+            self._action_search_entry.select_range(0, "end")
+        return "break"
+
+    def _select_first_search_result(self, event=None):
+        matches = getattr(self, "_visible_action_names", [])
+        if matches:
+            self._switch_action_view(
+                matches[0], self._action_menu_line_num, self._action_menu_edit_idx)
+        return "break"
+
+    def _on_action_picker_mousewheel(self, event):
+        if not self.sub_menu or not self.sub_menu.winfo_exists():
+            return
+        # Tk sends descendant events through their toplevel bindtag. Only
+        # scroll the column currently under the mouse pointer.
+        if isinstance(event.widget, (tk.Text, tk.Listbox)):
+            return
+        if event.x_root < self._action_editor_canvas.winfo_rootx():
+            canvas = self._action_picker_canvas
+        else:
+            canvas = self._action_editor_canvas
+        if canvas.winfo_exists():
+            amount = -int(event.delta / 120) if event.delta else 0
+            if amount:
+                canvas.yview_scroll(amount, "units")
+                return "break"
+
+    def _rebuild_action_picker(self):
+        if not self.sub_menu or not self.sub_menu.winfo_exists():
+            return
+        search = self._action_search_var.get().strip().casefold()
+        old_scroll = self._action_picker_canvas.yview()[0]
+        for child in self._action_picker_inner.winfo_children():
+            child.destroy()
+
+        matches = []
+        for category, actions in self.ACTION_PICKER_GROUPS:
+            visible = [item for item in actions if not search or
+                       search in category.casefold() or
+                       search in item[0].casefold() or
+                       search in item[1].casefold()]
+            if not visible:
+                continue
+            tk.Label(self._action_picker_inner, text=category.upper(),
+                     font=("Segoe UI", 8, "bold"), fg=TEXT_MUTED,
+                     bg=BG_SIDEBAR, anchor="w").pack(
+                         fill=tk.X, padx=14, pady=(14, 5))
+            for name, description, sigil in visible:
+                matches.append(name)
+                selected = (name == self._selected_action_name)
+                row_color = BG_SELECTED if selected else BG_SIDEBAR
+                tile = tk.Frame(self._action_picker_inner, bg=row_color,
+                                cursor="hand2", padx=9, pady=8)
+                tile.pack(fill=tk.X, padx=(4, 8), pady=2)
+                accent = tk.Frame(tile, width=3,
+                                  bg=COLOR_ACCENT if selected else row_color)
+                accent.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 9))
+                accent.pack_propagate(False)
+                tag = tk.Label(tile, text=sigil, width=3,
+                               font=("Consolas", 8, "bold"),
+                               bg=BG_INPUT, fg=SYNTAX_BLUE, pady=4)
+                tag.pack(side=tk.LEFT, padx=(0, 8))
+                names = tk.Frame(tile, bg=row_color)
+                names.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                name_lbl = tk.Label(
+                    names, text=name, font=("Segoe UI", 9, "bold"),
+                    bg=row_color, fg=TEXT_PRIMARY, anchor="w")
+                name_lbl.pack(fill=tk.X)
+                summary = tk.Label(
+                    names, text=description, font=("Segoe UI", 8),
+                    bg=row_color, fg=TEXT_MUTED, anchor="w", justify="left",
+                    wraplength=170)
+                summary.pack(fill=tk.X, pady=(2, 0))
+                for widget in (tile, accent, tag, names, name_lbl, summary):
+                    widget.bind("<Button-1>",
+                                lambda e, n=name: self._switch_action_view(
+                                    n, self._action_menu_line_num,
+                                    self._action_menu_edit_idx))
+        self._visible_action_names = matches
+        if not matches:
+            tk.Label(self._action_picker_inner,
+                     text="No matching actions.\nTry another search.",
+                     font=("Segoe UI", 9), bg=BG_SIDEBAR,
+                     fg=TEXT_MUTED, justify="center").pack(padx=8, pady=32)
+        self._action_picker_inner.update_idletasks()
+        self._action_picker_canvas.configure(
+            scrollregion=self._action_picker_canvas.bbox("all"))
+        self._action_picker_canvas.yview_moveto(old_scroll)
+
     def _switch_action_view(self, action_type, line_num, edit_idx=None):
-        if not self.sub_menu or not self.sub_menu.winfo_exists(): return
-        menu_w = 340
-        menu_h = 400 if action_type in ("Search selected area", "If Variable Condition") else (
-            370 if action_type == "Disclaimer / Warning" else (
-                350 if action_type == "Read Clipboard" else (
-                    300 if action_type == "Request Input" else (
-                        280 if action_type in ("Wait Pixel", "Type Variable") else 250
-                    )
-                )
-            )
-        )
-        if edit_idx is not None:
-            menu_h -= 30
+        if not self.sub_menu or not self.sub_menu.winfo_exists():
+            return
+        self._action_menu_line_num = line_num
+        self._action_menu_edit_idx = edit_idx
+        self._selected_action_name = action_type
+        descriptions = {
+            name: description
+            for _, actions in self.ACTION_PICKER_GROUPS
+            for name, description, _ in actions
+        }
+        self._selected_action_title.config(text=action_type)
+        self._selected_action_desc.config(text=descriptions.get(action_type, ""))
+        self._rebuild_action_picker()
 
-        curr_x, curr_y = self.sub_menu.winfo_x(), self.sub_menu.winfo_y()
-        self.sub_menu.geometry(f"{menu_w}x{menu_h}+{curr_x}+{curr_y}")
+        for child in self.action_content_frame.winfo_children():
+            child.destroy()
 
-        for child in self.action_content_frame.winfo_children(): child.destroy()
-
-        if action_type == "Delay": self._render_delay_view(line_num, edit_idx=edit_idx)
-        elif action_type == "Disclaimer / Warning": self._render_disclaimer_view(line_num, edit_idx=edit_idx)
-        elif action_type == "If Variable Condition": self._render_if_var_view(line_num, edit_idx=edit_idx)
-        elif action_type == "Read Clipboard": self._render_read_clipboard_view(line_num, edit_idx=edit_idx)
-        elif action_type == "Request Input": self._render_request_input_view(line_num, edit_idx=edit_idx)
-        elif action_type == "Type Variable": self._render_type_variable_view(line_num, edit_idx=edit_idx)
-        elif action_type == "Search selected area": self._render_search_area_view(line_num, edit_idx=edit_idx)
-        elif action_type == "Wait Pixel": self._render_wait_pixel_view(line_num, edit_idx=edit_idx)
-        elif action_type == "Label Marker": self._render_label_view(line_num, edit_idx=edit_idx)
-        elif action_type == "Jump to Label": self._render_goto_view(line_num, edit_idx=edit_idx)
+        renderers = {
+            "Delay": self._render_delay_view,
+            "Disclaimer / Warning": self._render_disclaimer_view,
+            "If Variable Condition": self._render_if_var_view,
+            "Read Clipboard": self._render_read_clipboard_view,
+            "Request Input": self._render_request_input_view,
+            "Type Variable": self._render_type_variable_view,
+            "Search selected area": self._render_search_area_view,
+            "Wait for Text": self._render_wait_text_view,
+            "Wait Pixel": self._render_wait_pixel_view,
+            "Label Marker": self._render_label_view,
+            "Jump to Label": self._render_goto_view,
+        }
+        renderers[action_type](line_num, edit_idx=edit_idx)
+        self._action_editor_canvas.yview_moveto(0)
 
 
     def _render_label_view(self, line_num, edit_idx=None):
@@ -1939,6 +2186,118 @@ class VSCodeQueueViewer(tk.Frame):
         ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit_delay).pack(fill=tk.X)
 
 
+    def _render_wait_text_view(self, line_num, edit_idx=None):
+        """Editor for a screen-OCR checkpoint that waits until text changes."""
+        body = self.action_content_frame
+        curr = (self.app.recorded_actions[edit_idx]
+                if edit_idx is not None else {})
+
+        tk.Label(body, text="Text to detect:", font=("Segoe UI", 8, "bold"),
+                 bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
+        text_entry = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                              font=("Segoe UI", 9), insertbackground=TEXT_PRIMARY,
+                              highlightbackground=BG_BORDER, highlightthickness=1, bd=0)
+        text_entry.insert(0, curr.get("text", ""))
+        text_entry.pack(fill=tk.X, ipady=3, pady=(0, 9))
+        text_entry.focus_set()
+
+        tk.Label(body, text="Wait until text:", font=("Segoe UI", 8, "bold"),
+                 bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
+        mode_var = tk.StringVar(value=curr.get("mode", "appears"))
+        mode_menu = tk.OptionMenu(body, mode_var, "appears", "disappears")
+        mode_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8),
+                         highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
+        mode_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                 activebackground=COLOR_ACCENT)
+        mode_menu.pack(fill=tk.X, pady=(0, 9))
+
+        tk.Label(body, text="Timeout (seconds):", font=("Segoe UI", 8, "bold"),
+                 bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
+        timeout_entry = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                 font=("Consolas", 9), insertbackground=TEXT_PRIMARY,
+                                 highlightbackground=BG_BORDER, highlightthickness=1, bd=0)
+        timeout_entry.insert(0, str(curr.get("timeout", 15.0)))
+        timeout_entry.pack(fill=tk.X, ipady=3, pady=(0, 9))
+
+        chosen = {"area": curr.get("area")}
+        area_row = tk.Frame(body, bg=BG_PANEL)
+        area_row.pack(fill=tk.X, pady=(0, 9))
+        area = chosen["area"]
+        area_text = (f"[{area[0]},{area[1]} {area[2]}x{area[3]}]"
+                     if isinstance(area, (list, tuple)) and len(area) == 4 else "Area: Not selected")
+        area_label = tk.Label(area_row, text=area_text, font=("Consolas", 8),
+                              bg=BG_INPUT, fg=SYNTAX_BLUE if area else TEXT_MUTED,
+                              padx=6, pady=3, highlightbackground=BG_BORDER,
+                              highlightthickness=1, anchor="w")
+        area_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        def snip_done(area):
+            chosen["area"] = area
+            x, y, w, h = area
+            area_label.config(text=f"[{x},{y} {w}x{h}]", fg=SYNTAX_BLUE,
+                              highlightbackground=BG_BORDER)
+            if self.sub_menu and self.sub_menu.winfo_exists():
+                self.sub_menu.deiconify()
+
+        def choose_area():
+            if self.sub_menu and self.sub_menu.winfo_exists():
+                self.sub_menu.withdraw()
+            # The existing selector restores the application and submenu on completion/cancel.
+            self.app.start_screen_selection(snip_done)
+
+        snip = tk.Label(area_row, text="⛶ Snip", font=("Segoe UI", 8, "bold"),
+                        bg=COLOR_ACCENT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3)
+        snip.pack(side=tk.RIGHT)
+        snip.bind("<Button-1>", lambda event: choose_area())
+
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8),
+                            highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                    activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(0, 9))
+
+        def save():
+            text = text_entry.get().strip()
+            area = chosen["area"]
+            try:
+                timeout = float(timeout_entry.get().strip())
+                if not math.isfinite(timeout) or timeout < 0:
+                    raise ValueError
+            except ValueError:
+                timeout_entry.config(highlightbackground=COLOR_DANGER)
+                return
+            if not text:
+                text_entry.config(highlightbackground=COLOR_DANGER)
+                return
+            if not isinstance(area, (list, tuple)) or len(area) != 4 or int(area[2]) <= 0 or int(area[3]) <= 0:
+                area_label.config(text="Select a screen area!", highlightbackground=COLOR_DANGER)
+                return
+
+            action = {"type": "wait_text", "text": text, "mode": mode_var.get(),
+                      "timeout": timeout, "area": [int(n) for n in area]}
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = action
+                new_index = edit_idx
+            else:
+                after = "After" in pos_var.get()
+                new_index = 0 if line_num <= 1 else (line_num - 1 if after else line_num - 2)
+                new_index = max(0, min(new_index, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(new_index, action)
+
+            self.app.current_action_idx = new_index
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.update_status("Wait for Text saved", COLOR_SUCCESS)
+            self.close_sub_menu()
+
+        text_entry.bind("<Return>", lambda event: save())
+        label = "Save Changes" if edit_idx is not None else "Add Wait for Text"
+        ModernButton(body, text=label, bg_color=COLOR_SUCCESS,
+                     hover_color="#1d8a4b", command=save).pack(fill=tk.X)
+
+
     def _render_search_area_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
         curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
@@ -2076,8 +2435,9 @@ class ModernScrollableFrame(tk.Frame):
 
         self.canvas.pack(side="left", fill="both", expand=True)
 
-        # Bind globally, filter dynamically by cursor location
-        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        # One active Settings scroll handler at a time. Using add="+" here
+        # leaked callbacks from destroyed Settings pages on every theme change.
+        self.bind_all("<MouseWheel>", self._on_mousewheel)
 
 
     def _on_canvas_configure(self, event):
@@ -2481,7 +2841,7 @@ class ModernScrubberTrack(tk.Canvas):
     def _on_release(self, event):
         self.is_dragging = False
 
-class OBSHotkeyField(tk.Frame):
+class SequentHotkeyField(tk.Frame):
     def __init__(self, parent, action_key, initial_name, app_instance):
         super().__init__(parent, bg=BG_INPUT, highlightbackground=BG_BORDER, highlightthickness=1, cursor="xterm")
         self.action_key = action_key
@@ -2591,9 +2951,9 @@ class SidebarButton(tk.Frame):
 
     def set_active(self, is_active):
         self.active = is_active
-        color = BG_HOVER if is_active else BG_SIDEBAR
+        color = BG_SELECTED if is_active else BG_SIDEBAR
         fg_color = TEXT_PRIMARY if is_active else TEXT_MUTED
-        ind_color = TEXT_PRIMARY if is_active else color
+        ind_color = COLOR_ACCENT if is_active else color
         self.configure(bg=color)
         self.label.configure(bg=color, fg=fg_color)
         self.indicator.configure(bg=ind_color)
@@ -2681,6 +3041,250 @@ class GhostReticle:
             if win.winfo_exists():
                 win.withdraw()
 
+# --- Interactive, non-destructive guided tour ---
+class SequentWalkthrough:
+    """Highlight existing controls without touching macro state or relaying input.
+
+    Four thin borderless windows draw a spotlight around the real widget.
+    Only the floating explanation card receives tour navigation input. Unlike
+    a full-window overlay this doesn't resize or re-parent the application UI.
+    """
+    STEPS = (
+        ("playback", "Welcome to Sequent",
+         "This tour points out the main tools without recording, running, or editing anything. "
+         "Use Next and Back to explore. Press Esc to leave whenever you want.", "hamburger"),
+        ("playback", "Your Action Queue",
+         "Recorded mouse and keyboard actions appear here in order. "
+         "Click a line to inspect it, or double-click an action to edit its options.", "queue_viewport"),
+        ("playback", "Insert and configure actions",
+         "Right-click in the Action Queue or use its line gutter to add actions. "
+         "The Action Library lets you choose waits, text recognition, conditions and other steps.", "queue_viewer"),
+        ("playback", "Import an existing macro",
+         "Choose Import above the Action Queue to open a saved JSON macro file. "
+         "Its actions will appear in the queue for you to review or edit. "
+         "Importing does not run the macro, but it replaces the current queue, so export any unsaved work first.",
+         "import_macro_button"),
+        ("playback", "Load a saved preset",
+         "The Preset selector in the top toolbar lists JSON macros saved in Sequent's presets folder. "
+         "Pick one to load it into the queue, or use Refresh to update the list. "
+         "Selecting a preset does not execute it.", "preset_card"),
+        ("playback", "Mini HUD",
+         "Mini HUD hides the main workspace and opens a compact floating bar. "
+         "The bar shows execution status and has Pause, Stop and Expand controls; "
+         "drag its grip to move it, and choose Expand to return to the full workspace. "
+         "The tour will not activate it.", "mini_hud_button"),
+        ("playback", "Record what you do",
+         "Start Recording captures input events. Stop it with the configured hotkey, "
+         "then review the recorded steps before replaying them. This tour won't start recording.", "record_btn"),
+        ("playback", "Run your macro",
+         "Run Macro replays the queued actions. Confirm the target application and "
+         "test with harmless actions first, especially before automating business transactions.", "play_btn"),
+        ("playback", "Inspect and debug",
+         "Use the playhead, Back/Next, Step, and breakpoints in the queue "
+         "to inspect or execute individual actions while troubleshooting.", "scrub_card"),
+        ("sequencer", "Build a macro chain",
+         "The Sequencer combines saved macro presets into a sequence of stages. "
+         "Import, export, and review the stage order in the Macro Chain panel.", "seq_timeline_viewport"),
+        ("sequencer", "Configure a stage",
+         "Choose a saved preset, set its loop count and delay, then select Add Stage. "
+         "The Stage Builder also controls running the entire chain.", "stage_builder_dock"),
+        ("settings", "Personalize Sequent",
+         "Preferences contains appearance, timing, recording, audio, and hotkeys. "
+         "Entertain Me controls the interface animations. You can relaunch this tour from Help anytime.", "frame_settings"),
+    )
+
+    def __init__(self, app):
+        self.app = app
+        self.root = app.root
+        self.index = 0
+        self._closed = False
+        self._position_job = None
+        self._navigate = False
+        self.original_tab = app.current_tab_name or "playback"
+        self.original_sidebar_open = app.sidebar_open
+        self.edges = []
+        for _ in range(4):
+            edge = tk.Toplevel(self.root)
+            edge.overrideredirect(True)
+            edge.configure(bg=COLOR_ACCENT)
+            edge.attributes("-topmost", True)
+            edge.withdraw()
+            self.edges.append(edge)
+
+        self.card = tk.Toplevel(self.root)
+        self.card.overrideredirect(True)
+        self.card.attributes("-topmost", True)
+        self.card.configure(bg=COLOR_ACCENT)
+        self.card.withdraw()
+        shell = tk.Frame(self.card, bg=BG_HEADER, padx=17, pady=14)
+        shell.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self.kicker = tk.Label(shell, text="SEQUENT  /  WALKTHROUGH", bg=BG_HEADER,
+                               fg=SYNTAX_BLUE, font=("Segoe UI", 8, "bold"), anchor="w")
+        self.kicker.pack(fill=tk.X)
+        self.title = tk.Label(shell, bg=BG_HEADER, fg=TEXT_PRIMARY,
+                              font=("Segoe UI", 15, "bold"), anchor="w")
+        self.title.pack(fill=tk.X, pady=(8, 5))
+        self.description = tk.Label(shell, bg=BG_HEADER, fg=TEXT_MUTED,
+                                    font=("Segoe UI", 10), wraplength=320,
+                                    justify="left", anchor="nw")
+        self.description.pack(fill=tk.X, pady=(0, 14))
+        self.progress = tk.Label(shell, bg=BG_HEADER, fg=TEXT_MUTED,
+                                 font=("Consolas", 9), anchor="w")
+        self.progress.pack(fill=tk.X, pady=(0, 7))
+        btn_row = tk.Frame(shell, bg=BG_HEADER)
+        btn_row.pack(fill=tk.X)
+        self.btn_exit = tk.Button(btn_row, text="Exit tour", command=self.close,
+                                   bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
+                                   activeforeground=TEXT_PRIMARY, relief="flat", bd=0,
+                                   padx=10, pady=7, cursor="hand2")
+        self.btn_exit.pack(side=tk.LEFT)
+        self.btn_next = tk.Button(btn_row, text="Next  →", command=self.next,
+                                   bg=COLOR_ACCENT, fg="#ffffff", activebackground=COLOR_ACCENT_HOV,
+                                   activeforeground="#ffffff", relief="flat", bd=0,
+                                   padx=12, pady=7, cursor="hand2")
+        self.btn_next.pack(side=tk.RIGHT)
+        self.btn_back = tk.Button(btn_row, text="←  Back", command=self.back,
+                                   bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
+                                   activeforeground=TEXT_PRIMARY, relief="flat", bd=0,
+                                   padx=10, pady=7, cursor="hand2")
+        self.btn_back.pack(side=tk.RIGHT, padx=(0, 7))
+        self.card.bind("<Escape>", lambda e: self.close())
+        self.card.bind("<Right>", lambda e: self.next())
+        self.card.bind("<Left>", lambda e: self.back())
+        self._root_escape_id = self.root.bind("<Escape>", lambda e: self.close(), add="+")
+        self._root_configure_id = self.root.bind("<Configure>", self._queue_position, add="+")
+        self._workspace_configure_id = self.app.workspace.bind(
+            "<Configure>", self._queue_position, add="+"
+        )
+        self.show_step(0)
+
+    def _queue_position(self, event=None):
+        if self._closed or self._position_job is not None:
+            return
+        self._position_job = self.root.after(70, self._refresh_position)
+
+    def _refresh_position(self):
+        self._position_job = None
+        if not self._closed:
+            self._position()
+
+    def show_step(self, number):
+        if self._closed:
+            return
+        self.index = max(0, min(len(self.STEPS) - 1, number))
+        tab, heading, info, _target = self.STEPS[self.index]
+        for edge in self.edges:
+            edge.withdraw()
+        self.card.withdraw()
+        self._navigate = True
+        try:
+            if self.app.current_tab_name != tab:
+                # Finish any pending transition. The tour NEVER animates or
+                # re-parents the real control hierarchy while highlighting it.
+                self.app.show_tab(tab, animate=False)
+            else:
+                self.app._settle_tab_transition()
+        finally:
+            self._navigate = False
+        self.title.configure(text=heading)
+        self.description.configure(text=info)
+        self.progress.configure(text=f"STEP {self.index + 1} OF {len(self.STEPS)}")
+        self.btn_back.configure(state="normal" if self.index else "disabled")
+        self.btn_next.configure(text="Finish  ✓" if self.index == len(self.STEPS) - 1 else "Next  →")
+        self._queue_position()
+
+    def _position(self):
+        if self._closed:
+            return
+        tab, _, _, attr = self.STEPS[self.index]
+        target = getattr(self.app, attr, None)
+        if target is None or not target.winfo_exists() or not target.winfo_ismapped():
+            # A newly selected dock needs an idle layout pass before geometry
+            # becomes available. Don't spin indefinitely if a widget is absent.
+            return
+        self.root.update_idletasks()
+        x, y = target.winfo_rootx(), target.winfo_rooty()
+        w, h = target.winfo_width(), target.winfo_height()
+        if w < 8 or h < 8:
+            return
+        pad, thick = 4, 3
+        x0, y0 = x - pad, y - pad
+        x1, y1 = x + w + pad, y + h + pad
+        regions = (
+            (x0, y0, x1-x0, thick),
+            (x0, y1-thick, x1-x0, thick),
+            (x0, y0, thick, y1-y0),
+            (x1-thick, y0, thick, y1-y0),
+        )
+        for edge, (rx, ry, rw, rh) in zip(self.edges, regions):
+            edge.geometry(f"{max(1,rw)}x{max(1,rh)}+{rx}+{ry}")
+            edge.deiconify()
+
+        # Place the explanation near the highlight, but within the desktop.
+        self.card.update_idletasks()
+        cw, ch = self.card.winfo_reqwidth(), self.card.winfo_reqheight()
+        desktop_left = self.root.winfo_rootx()
+        desktop_top = self.root.winfo_rooty()
+        desktop_right = desktop_left + self.root.winfo_width()
+        desktop_bottom = desktop_top + self.root.winfo_height()
+        gap = 14
+        if x1 + gap + cw <= desktop_right:
+            cx, cy = x1 + gap, y
+        elif x0 - gap - cw >= desktop_left:
+            cx, cy = x0 - gap - cw, y
+        elif y1 + gap + ch <= desktop_bottom:
+            cx, cy = x, y1 + gap
+        elif y0 - gap - ch >= desktop_top:
+            cx, cy = x, y0 - gap - ch
+        else:
+            cx, cy = desktop_right - cw - 12, desktop_top + 72
+        cx = max(desktop_left + 8, min(cx, desktop_right - cw - 8))
+        cy = max(desktop_top + 8, min(cy, desktop_bottom - ch - 8))
+        self.card.geometry(f"{cw}x{ch}+{int(cx)}+{int(cy)}")
+        self.card.deiconify()
+        self.card.lift()
+
+    def next(self):
+        if self.index == len(self.STEPS) - 1:
+            self.close()
+        else:
+            self.show_step(self.index + 1)
+
+    def back(self):
+        if self.index > 0:
+            self.show_step(self.index - 1)
+
+    def close(self, restore=True):
+        if self._closed:
+            return
+        self._closed = True
+        if self._position_job is not None:
+            try:
+                self.root.after_cancel(self._position_job)
+            except tk.TclError:
+                pass
+        for seq, bind_id in (("<Escape>", self._root_escape_id),
+                             ("<Configure>", self._root_configure_id)):
+            if bind_id:
+                try:
+                    self.root.unbind(seq, bind_id)
+                except tk.TclError:
+                    pass
+        if self._workspace_configure_id:
+            try:
+                self.app.workspace.unbind("<Configure>", self._workspace_configure_id)
+            except tk.TclError:
+                pass
+        for window in [self.card, *self.edges]:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+        if getattr(self.app, "_walkthrough", None) is self:
+            self.app._walkthrough = None
+        if restore and self.root.winfo_exists() and self.original_tab != self.app.current_tab_name:
+            self.app.show_tab(self.original_tab, animate=False)
+
 # --- Main Application ---
 class BuiltInMacroApp:
     def __init__(self, root):
@@ -2689,19 +3293,31 @@ class BuiltInMacroApp:
 
         # Dynamic DPI Scaling & Centering
         self.dpi_scale = get_dpi_scale()
-        win_w = int(780 * self.dpi_scale)
-        win_h = int(640 * self.dpi_scale)
+        win_w = int(1150 * self.dpi_scale)
+        win_h = int(750 * self.dpi_scale)
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         pos_x = max(0, (sw - win_w) // 2)
         pos_y = max(0, (sh - win_h) // 2)
 
         self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+        # Also protect programmatic size changes (not only edge-drag handles).
+        self.root.minsize(int(940 * self.dpi_scale), int(700 * self.dpi_scale))
         self.root.configure(bg=BG_APP)
         self.root.attributes('-topmost', True)
 
-        self.root.overrideredirect(True)
-        self.set_app_window()
+        # Sequent's borderless window and custom resize grips are the default.
+        # Native window decorations remain an optional troubleshooting mode:
+        # set SEQUENT_WINDOW_MODE=native before launching.
+        self.native_window_resize = (
+            os.environ.get('SEQUENT_WINDOW_MODE', 'custom').strip().lower()
+            == 'native'
+        )
+        if self.native_window_resize:
+            self.root.resizable(True, True)
+        else:
+            self.root.overrideredirect(True)
+            self.set_app_window()
 
         self.drag_x = 0
         self.drag_y = 0
@@ -2721,6 +3337,7 @@ class BuiltInMacroApp:
         self.fluid_mouse = True
         self.current_source_label = "Recorded Sequence"
         self.switching_preset = False
+        self._walkthrough = None
         
         # Playback Thread Synchronization IDs
         self.playback_run_id = 0
@@ -2769,9 +3386,15 @@ class BuiltInMacroApp:
             try: os.makedirs(self.chains_dir, exist_ok=True)
             except Exception: pass
 
-        self.sidebar_open = False
-        self.sidebar_width = int(220 * self.dpi_scale)
-        self.current_sidebar_x = -self.sidebar_width
+        # Sidebar transitions preserve the queue's right edge beside Controls.
+        # Only the Action Queue dock follows the changing available width;
+        # the workspace and Controls never reflow with sidebar animation.
+        self.sidebar_open = True
+        self.sidebar_width = int(184 * self.dpi_scale)
+        self._sidebar_visible_width = self.sidebar_width
+        self._sidebar_anim_id = None
+        self._theme_rebuilding = False
+        self._ui_generation = 0
 
         self.hotkeys = {
             "start_rec": {"vk": 0x76, "mod_vks": [], "name": "F7"},
@@ -2790,38 +3413,61 @@ class BuiltInMacroApp:
 
     
     def set_app_window(self):
+        # This helper is also invoked after the Mini HUD and screen selection.
+        # Never switch a natively managed window back to borderless mode.
+        if getattr(self, 'native_window_resize', False):
+            return
         hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
         style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
         ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
 
-        try:
-            margins = MARGINS(1, 1, 1, 1)
-            ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(margins))
-        except Exception: pass
+        # Tk paints the full client area itself. Extending a DWM glass frame
+        # into that area can leave stale paint/compositing artifacts on Windows,
+        # especially while a borderless window is repeatedly resized.
+        # Leave glass-frame extension disabled by default.
+        if os.environ.get("SEQUENT_DWM_FRAME") == "1":
+            try:
+                margins = MARGINS(1, 1, 1, 1)
+                ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
+                    hwnd, ctypes.byref(margins))
+            except (AttributeError, OSError):
+                pass
 
         self.root.wm_withdraw()
         self.root.after(10, lambda: self.root.wm_deiconify())
 
     def start_drag(self, event):
+        if self.native_window_resize:
+            return
         self.drag_x = event.x
         self.drag_y = event.y
 
     def drag_window(self, event):
+        if self.native_window_resize:
+            return
         x = self.root.winfo_x() + (event.x - self.drag_x)
         y = self.root.winfo_y() + (event.y - self.drag_y)
         self.root.geometry(f"+{x}+{y}")
 
     def minimize_window(self):
+        if self.native_window_resize:
+            self.root.iconify()
+            return
         self.root.overrideredirect(False)
         self.root.iconify()
         self.root.bind("<FocusIn>", self.on_restore)
 
     def on_restore(self, event=None):
         self.root.unbind("<FocusIn>")
-        self.root.overrideredirect(True)
+        if not self.native_window_resize:
+            self.root.overrideredirect(True)
 
     def setup_resizing_handles(self):
+        # Native Windows sizing handles resizing and snapping; do not install
+        # Tk edge grips and geometry() drag handlers in this mode.
+        if self.native_window_resize:
+            return
         # Use minimal 2px invisible frames to allow edge resizing without covering UI elements
         self.grip_e = tk.Frame(self.root, bg=BG_APP, cursor="size_we")
         self.grip_e.place(relx=1.0, rely=0, x=-2, y=35, relheight=1.0, width=2)
@@ -2846,6 +3492,7 @@ class BuiltInMacroApp:
         for widget, edge in handles:
             widget.bind("<Button-1>", lambda e, edge=edge: self._start_resize(e, edge))
             widget.bind("<B1-Motion>", self._do_resize)
+            widget.bind("<ButtonRelease-1>", self._finish_resize)
 
     def toggle_mini_hud(self):
         """Collapses the main 740x600 window into a 260x44 floating HUD bar or restores it."""
@@ -2898,6 +3545,8 @@ class BuiltInMacroApp:
         def _apply():
             if hasattr(self, 'status_text') and self.status_text.winfo_exists():
                 self.status_text.config(text=f"● {text}", fg=fg_color)
+            if hasattr(self, "footer_status") and self.footer_status.winfo_exists():
+                self.footer_status.config(text=str(text), fg=fg_color)
             if self.mini_hud and self.mini_hud.winfo_exists() and hasattr(self, 'hud_status_lbl'):
                 trunc = (text[:14] + "..") if len(text) > 16 else text
                 self.hud_status_lbl.config(text=f"● {trunc}", fg=fg_color)
@@ -2905,6 +3554,7 @@ class BuiltInMacroApp:
 
 
     def _start_resize(self, event, edge):
+        """Start a resize gesture without forcing synchronous redraws."""
         self._resize_edge = edge
         self._resize_start_x = event.x_root
         self._resize_start_y = event.y_root
@@ -2912,26 +3562,84 @@ class BuiltInMacroApp:
         self._resize_start_h = self.root.winfo_height()
         self._resize_start_win_x = self.root.winfo_x()
         self._resize_start_win_y = self.root.winfo_y()
+        self._resize_pending_geometry = None
+        self._resize_active = True
+        self._resize_last_geometry = None
+        if getattr(self, '_resize_job', None) is not None:
+            self.root.after_cancel(self._resize_job)
+            self._resize_job = None
 
     def _do_resize(self, event):
+        """Coalesce rapid mouse events into at most one resize every ~16 ms."""
+        if not getattr(self, '_resize_active', False):
+            return
+
         dx = event.x_root - self._resize_start_x
         dy = event.y_root - self._resize_start_y
         w, h = self._resize_start_w, self._resize_start_h
         x, y = self._resize_start_win_x, self._resize_start_win_y
 
         scale = getattr(self, 'dpi_scale', 1.0)
-        min_w = int(600 * scale)
-        min_h = int(480 * scale)
+        min_w = int(940 * scale)
+        min_h = int(700 * scale)
 
-        if "e" in self._resize_edge: w = max(min_w, self._resize_start_w + dx)
-        if "s" in self._resize_edge: h = max(min_h, self._resize_start_h + dy)
+        if "e" in self._resize_edge:
+            w = max(min_w, self._resize_start_w + dx)
+        if "s" in self._resize_edge:
+            h = max(min_h, self._resize_start_h + dy)
         if "w" in self._resize_edge:
-            possible_w = self._resize_start_w - dx
-            if possible_w >= min_w:
-                w = possible_w
-                x = self._resize_start_win_x + dx
+            possible_w = max(min_w, self._resize_start_w - dx)
+            w = possible_w
+            x = self._resize_start_win_x + self._resize_start_w - w
 
-        self.root.geometry(f"{int(w)}x{int(h)}+{int(x)}+{int(y)}")
+        self._resize_pending_geometry = f"{int(w)}x{int(h)}+{int(x)}+{int(y)}"
+        if getattr(self, '_resize_job', None) is None:
+            self._resize_job = self.root.after(16, self._flush_resize)
+
+    def _flush_resize(self):
+        """Apply the newest requested geometry; discard intermediate sizes."""
+        self._resize_job = None
+        geom = getattr(self, '_resize_pending_geometry', None)
+        self._resize_pending_geometry = None
+        if geom is not None and self.root.winfo_exists():
+            if geom != getattr(self, '_resize_last_geometry', None):
+                self.root.geometry(geom)
+                self._resize_last_geometry = geom
+
+    def _finish_resize(self, event=None):
+        """Apply the final size and repaint after the user releases the mouse."""
+        self._resize_active = False
+        if getattr(self, '_resize_job', None) is not None:
+            self.root.after_cancel(self._resize_job)
+            self._resize_job = None
+        self._flush_resize()
+
+        # Only repaint after the drag. Forcing redraw on every mouse event
+        # causes much more flickering and makes stale child areas more likely.
+        if getattr(self, '_resize_repaint_job', None) is not None:
+            self.root.after_cancel(self._resize_repaint_job)
+        self._resize_repaint_job = self.root.after(60, self._repaint_after_resize)
+
+    def _repaint_after_resize(self):
+        self._resize_repaint_job = None
+        if not self.root.winfo_exists():
+            return
+        self.root.update_idletasks()
+        # Windows: invalidate the root and all child controls. On other
+        # platforms update_idletasks is sufficient, so do nothing further.
+        if os.name == 'nt':
+            try:
+                user32 = ctypes.windll.user32
+                hwnd = self.root.winfo_id()
+                RDW_INVALIDATE = 0x0001
+                RDW_ERASE = 0x0004
+                RDW_ALLCHILDREN = 0x0080
+                user32.RedrawWindow(
+                    hwnd, None, None,
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN
+                )
+            except (AttributeError, OSError):
+                pass
 
 
     def get_btn_text(self, action_type):
@@ -2953,6 +3661,7 @@ class BuiltInMacroApp:
         except Exception: return []
 
     def setup_ui(self, initial_tab="playback", animate=True):
+        """Sequent workspace shell: workspace rail, top toolbar, docked views, and footer."""
         self.main_container = tk.Frame(self.root, bg=BG_APP)
         self.main_container.pack(fill=tk.BOTH, expand=True)
 
@@ -2961,110 +3670,185 @@ class BuiltInMacroApp:
         self.root.bind("<Home>", lambda e: self._on_scrub_nav("home"))
         self.root.bind("<End>", lambda e: self._on_scrub_nav("end"))
         self.root.bind("<space>", lambda e: self._on_scrub_nav("run_step"))
-
-        nudge_keys = [
+        for seq, dx, dy in [
             ("<Alt-Left>", -1, 0), ("<Alt-Right>", 1, 0),
             ("<Alt-Up>", 0, -1), ("<Alt-Down>", 0, 1),
             ("<Alt-Shift-Left>", -5, 0), ("<Alt-Shift-Right>", 5, 0),
             ("<Alt-Shift-Up>", 0, -5), ("<Alt-Shift-Down>", 0, 5),
-        ]
-        for seq, dx, dy in nudge_keys:
+        ]:
             self.root.bind(seq, lambda e, x=dx, y=dy: self.nudge_active_coordinate(x, y))
 
-        top_bar = tk.Frame(self.main_container, bg=BG_HEADER)
+        top_bar = tk.Frame(self.main_container, bg=BG_HEADER, height=49)
         top_bar.pack(fill=tk.X)
+        top_bar.pack_propagate(False)
         top_bar.bind("<Button-1>", self.start_drag)
         top_bar.bind("<B1-Motion>", self.drag_window)
 
-        self.hamburger = tk.Label(top_bar, text=" ☰ ", font=("Segoe UI", 12), bg=BG_HEADER, fg=TEXT_MUTED, cursor="hand2")
-        self.hamburger.pack(side=tk.LEFT, padx=6, pady=4)
+        self.hamburger = tk.Label(top_bar, text="☰", bg=BG_HEADER,
+                                  fg=TEXT_MUTED, font=("Segoe UI", 14),
+                                  padx=12, cursor="hand2")
+        self.hamburger.pack(side=tk.LEFT, fill=tk.Y)
         self.hamburger.bind("<Button-1>", lambda e: self.toggle_sidebar())
-        self.hamburger.bind("<Enter>", lambda e: self.hamburger.config(bg=BG_HOVER, fg=TEXT_PRIMARY))
-        self.hamburger.bind("<Leave>", lambda e: self.hamburger.config(bg=BG_HEADER, fg=TEXT_MUTED))
-        ModernTooltip(self.hamburger, "Open Navigation & Settings", "Menu")
+        self.hamburger.bind("<Enter>", lambda e: self.hamburger.config(bg=BG_HOVER))
+        self.hamburger.bind("<Leave>", lambda e: self.hamburger.config(bg=BG_HEADER))
+        ModernTooltip(self.hamburger, "Toggle Workspace Navigation")
 
-        title_lbl = tk.Label(top_bar, text="Sequent", font=("Segoe UI", 10, "bold"), bg=BG_HEADER, fg=TEXT_PRIMARY)
-        title_lbl.pack(side=tk.LEFT, padx=(6, 8))
-        title_lbl.bind("<Button-1>", self.start_drag)
-        title_lbl.bind("<B1-Motion>", self.drag_window)
+        brand = tk.Frame(top_bar, bg=BG_HEADER)
+        brand.pack(side=tk.LEFT, padx=(6, 20))
+        title = tk.Label(brand, text="SEQUENT", bg=BG_HEADER, fg=TEXT_PRIMARY,
+                         font=("Segoe UI", 12, "bold"))
+        title.pack(anchor="w")
+        tk.Label(brand, text="MACRO WORKSPACE", bg=BG_HEADER, fg=SYNTAX_BLUE,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        for widget in (brand, title):
+            widget.bind("<Button-1>", self.start_drag)
+            widget.bind("<B1-Motion>", self.drag_window)
 
-        btn_hud = tk.Label(top_bar, text="⧉ Mini HUD", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=SYNTAX_BLUE, cursor="hand2", padx=8, pady=2, highlightbackground=BG_BORDER, highlightthickness=1)
-        btn_hud.pack(side=tk.LEFT, padx=(0, 8))
-        btn_hud.bind("<Button-1>", lambda e: self.toggle_mini_hud())
-        btn_hud.bind("<Enter>", lambda e: btn_hud.config(bg=BG_HOVER, fg=TEXT_PRIMARY))
-        btn_hud.bind("<Leave>", lambda e: btn_hud.config(bg=BG_INPUT, fg=SYNTAX_BLUE))
-        ModernTooltip(btn_hud, "Collapse to Floating HUD", "Compact")
+        # Align the Mini HUD once with the expanded sidebar boundary.
+        # Its position is independent of sidebar opening/closing animations.
+        self._topbar_brand = brand
+        self.mini_hud_button = sequent_toolbar_button(top_bar, "▣  Mini HUD", self.toggle_mini_hud)
+        self.mini_hud_button.place(x=self.sidebar_width + 12, rely=0.5, anchor=tk.W)
+        top_bar.bind("<Configure>", self._position_mini_hud_button, add="+")
 
         win_controls = tk.Frame(top_bar, bg=BG_HEADER)
-        win_controls.pack(side=tk.RIGHT)
-
-        btn_close = tk.Label(win_controls, text=" ✕ ", font=("Segoe UI", 9), bg=BG_HEADER, fg=TEXT_MUTED, cursor="hand2", padx=12, pady=6)
-        btn_close.pack(side=tk.RIGHT)
+        win_controls.pack(side=tk.RIGHT, fill=tk.Y)
+        btn_close = tk.Label(win_controls, text="✕", bg=BG_HEADER,
+                             fg=TEXT_MUTED, font=("Segoe UI", 10),
+                             cursor="hand2", padx=17)
+        btn_close.pack(side=tk.RIGHT, fill=tk.Y)
         btn_close.bind("<Button-1>", lambda e: self.root.destroy())
-        btn_close.bind("<Enter>", lambda e: btn_close.config(bg=COLOR_DANGER, fg="white"))
+        btn_close.bind("<Enter>", lambda e: btn_close.config(bg=COLOR_DANGER, fg="#fff"))
         btn_close.bind("<Leave>", lambda e: btn_close.config(bg=BG_HEADER, fg=TEXT_MUTED))
-
-        btn_min = tk.Label(win_controls, text=" — ", font=("Segoe UI", 9), bg=BG_HEADER, fg=TEXT_MUTED, cursor="hand2", padx=12, pady=6)
-        btn_min.pack(side=tk.RIGHT)
+        btn_min = tk.Label(win_controls, text="—", bg=BG_HEADER,
+                           fg=TEXT_MUTED, font=("Segoe UI", 10),
+                           cursor="hand2", padx=16)
+        btn_min.pack(side=tk.RIGHT, fill=tk.Y)
         btn_min.bind("<Button-1>", lambda e: self.minimize_window())
-        btn_min.bind("<Enter>", lambda e: btn_min.config(bg=BG_HOVER, fg=TEXT_PRIMARY))
-        btn_min.bind("<Leave>", lambda e: btn_min.config(bg=BG_HEADER, fg=TEXT_MUTED))
+        btn_min.bind("<Enter>", lambda e: btn_min.config(bg=BG_HOVER))
+        btn_min.bind("<Leave>", lambda e: btn_min.config(bg=BG_HEADER))
+        # The native title bar already supplies Windows minimize/close controls.
+        if self.native_window_resize:
+            win_controls.pack_forget()
 
-        self.status_text = tk.Label(top_bar, text="● Ready", font=("Segoe UI", 9, "bold"), bg=BG_HEADER, fg=COLOR_SUCCESS)
-        self.status_text.pack(side=tk.RIGHT, padx=(10, 15))
-        self.status_text.bind("<Button-1>", self.start_drag)
-        self.status_text.bind("<B1-Motion>", self.drag_window)
+        self.status_text = tk.Label(top_bar, text="● Ready", bg=BG_HEADER,
+                                    fg=COLOR_SUCCESS, font=("Segoe UI", 9, "bold"))
+        self.status_text.pack(side=tk.RIGHT, padx=(4, 16))
 
         preset_card = ModernCard(top_bar, bg_card=BG_INPUT)
-        preset_card.pack(side=tk.RIGHT, padx=(0, 10), pady=4)
-
-        tk.Label(preset_card, text="📁 PRESET", font=("Segoe UI", 7, "bold"), bg=BG_INPUT, fg=TEXT_MUTED).pack(side=tk.LEFT, padx=(8, 2))
-
+        self.preset_card = preset_card  # Walkthrough highlights the complete preset selector.
+        preset_card.pack(side=tk.RIGHT, padx=(0, 12), pady=7)
+        tk.Label(preset_card, text="PRESET", bg=BG_INPUT, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(10, 6))
         self.preset_var = tk.StringVar(value="-- Select Preset --")
         self.preset_menu = tk.OptionMenu(preset_card, self.preset_var, "-- Select Preset --")
-        self.preset_menu.config(
-            bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
-            font=("Segoe UI", 8, "bold"), highlightthickness=0, bd=0, relief="flat", cursor="hand2"
-        )
-        self.preset_menu["menu"].config(
-            bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, activeforeground=TEXT_PRIMARY,
-            font=("Segoe UI", 9), bd=1, relief="flat"
-        )
-        self.preset_menu.pack(side=tk.LEFT, padx=(2, 2), pady=2)
-
-        btn_refresh = tk.Label(preset_card, text="🔄", font=("Segoe UI", 8), bg=BG_INPUT, fg=TEXT_MUTED, cursor="hand2", padx=6, pady=2)
+        self.preset_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
+                                font=("Segoe UI", 9), highlightthickness=0,
+                                bd=0, relief="flat", cursor="hand2")
+        self.preset_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                        activebackground=COLOR_ACCENT,
+                                        activeforeground="#ffffff", bd=0)
+        self.preset_menu.pack(side=tk.LEFT, pady=2)
+        self.preset_menu.configure(width=17)
+        btn_refresh = sequent_toolbar_button(preset_card, "↻", self.refresh_preset_menu)
         btn_refresh.pack(side=tk.LEFT, padx=(0, 4), pady=2)
-        btn_refresh.bind("<Button-1>", lambda e: self.refresh_preset_menu())
-        btn_refresh.bind("<Enter>", lambda e: btn_refresh.config(fg=TEXT_PRIMARY, bg=BG_HOVER))
-        btn_refresh.bind("<Leave>", lambda e: btn_refresh.config(fg=TEXT_MUTED, bg=BG_INPUT))
-        ModernTooltip(btn_refresh, "Reload presets directory", "Sync")
+        ModernTooltip(btn_refresh, "Refresh Saved Presets")
 
         tk.Frame(self.main_container, bg=BG_BORDER, height=1).pack(fill=tk.X)
+        # Status dock is permanent and visible while switching pages.
+        self.footer = tk.Frame(self.main_container, bg=BG_HEADER, height=29)
+        self.footer.pack(side=tk.BOTTOM, fill=tk.X)
+        self.footer.pack_propagate(False)
+        tk.Label(self.footer, text="●", bg=BG_HEADER, fg=COLOR_SUCCESS,
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(12, 4))
+        self.footer_status = tk.Label(self.footer, text="Ready for input", bg=BG_HEADER,
+                                      fg=TEXT_MUTED, font=("Segoe UI", 8), anchor="w")
+        self.footer_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(self.footer, text="SEQUENT  •  WORKSPACE", bg=BG_HEADER,
+                 fg=TEXT_MUTED, font=("Consolas", 8)).pack(side=tk.RIGHT, padx=12)
+        tk.Frame(self.main_container, bg=BG_BORDER, height=1).pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.content_frame = tk.Frame(self.main_container, bg=BG_APP)
+        self.workspace = tk.Frame(self.main_container, bg=BG_APP)
+        self.workspace.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # Docked navigation: the sidebar and content occupy separate regions.
+        # Keep the content's width stable while animating its x position, then
+        # resize the content once at the end (avoids per-frame widget reflow).
+        self.sidebar_width = int(184 * self.dpi_scale)
+        self.sidebar_host = tk.Frame(self.workspace, bg=BG_SIDEBAR,
+                                     width=self.sidebar_width + 1)
+        self.sidebar_host.pack_propagate(False)
+        self.sidebar_frame = tk.Frame(self.sidebar_host, bg=BG_SIDEBAR)
+        self.sidebar_frame.pack_propagate(False)
+        self.sidebar_divider = tk.Frame(self.sidebar_host, bg=BG_BORDER)
+        self._sidebar_visible_width = self.sidebar_width if self.sidebar_open else 0
+        self._sidebar_committed_width = self._sidebar_visible_width
+        self.build_sidebar()
+        # Playback and Sequencer have constrained viewports. Both the visible
+        # left edge and its own content width animate together, keeping the
+        # header, toolbar and editor aligned while Controls stays stationary.
+        self.queue_viewport = tk.Frame(
+            self.workspace, bg=BG_BORDER,
+            highlightthickness=1, highlightbackground=BG_BORDER
+        )
+        self._queue_animation_active = False
+        self._queue_resize_job = None
+        # The Macro Chain timeline has its own independent anchored viewport.
+        self.seq_timeline_viewport = tk.Frame(
+            self.workspace, bg=BG_BORDER,
+            highlightthickness=1, highlightbackground=BG_BORDER
+        )
+        self._seq_timeline_content_width = None
+        self.workspace.bind("<Configure>", self._on_workspace_configure, add="+")
+        self.workspace_main = tk.Frame(self.workspace, bg=BG_APP)
+        # Negative absolute width is an offset against relwidth=1: when docked,
+        # the workspace is exactly parent_width - sidebar_width wide.
+        self.workspace_main.place(
+            x=self._sidebar_visible_width, y=0, relwidth=1,
+            width=-self._sidebar_committed_width, relheight=1
+        )
+        self.sidebar_frame.place(x=0, y=0, width=self.sidebar_width, relheight=1)
+        self.sidebar_divider.place(x=self.sidebar_width, y=0, width=1, relheight=1)
+        self._set_sidebar_visible_width(self._sidebar_visible_width)
+        subhead = tk.Frame(self.workspace_main, bg=BG_APP, height=62)
+        subhead.pack(fill=tk.X)
+        subhead.pack_propagate(False)
+        self.workspace_heading = tk.Label(subhead, text="Playback", bg=BG_APP,
+                                           fg=TEXT_PRIMARY, font=("Segoe UI", 16, "bold"))
+        self.workspace_heading.pack(side=tk.LEFT, padx=(18, 8), pady=13)
+        self.workspace_subtitle = tk.Label(subhead, text="Record, edit and execute actions",
+                                            bg=BG_APP, fg=TEXT_MUTED,
+                                            font=("Segoe UI", 9))
+        self.workspace_subtitle.pack(side=tk.LEFT, pady=16)
+        tk.Frame(self.workspace_main, bg=BG_BORDER, height=1).pack(fill=tk.X)
+
+        self.content_frame = tk.Frame(self.workspace_main, bg=BG_APP)
         self.content_frame.pack(fill=tk.BOTH, expand=True)
-
         self.current_tab_name = None
         self._tab_anim_id = None
-
         self.frame_playback = tk.Frame(self.content_frame, bg=BG_APP)
         self.frame_sequencer = tk.Frame(self.content_frame, bg=BG_APP)
-        self.frame_settings = tk.Frame(self.content_frame, bg=BG_APP)
-
+        # Settings is a peer of the independent Playback/Sequencer docks.
+        # If it stays nested in content_frame, the dock windows always paint
+        # above it during page transitions, obscuring the Settings controls.
+        self.frame_settings = tk.Frame(self.workspace, bg=BG_APP)
+        # Settings has a large native-widget form. During a page change we
+        # move ONE temporary image of that form, not its live child windows.
+        # This makes the whole preferences panel bounce without Tk redraw trails.
+        self._settings_motion_view = tk.Canvas(
+            self.workspace, bg=BG_APP, highlightthickness=0, bd=0
+        )
+        self._settings_motion_image = None
+        self._settings_motion_active = False
+        # Reuse the last fully painted Settings panel when animating back in.
+        # Screen-grabbing a freshly mapped form mid-transition can flash it.
+        self._settings_cached_image = None
         self.build_playback_view()
         self.build_sequencer_view()
         self.build_settings_view()
-
-        self.overlay = tk.Canvas(self.root, highlightthickness=0, bg=BG_APP)
-        self.overlay.bind("<Button-1>", lambda e: self.close_sidebar())
-
-        self.sidebar_frame = tk.Frame(self.root, bg=BG_SIDEBAR, width=self.sidebar_width)
-        self.sidebar_frame.pack_propagate(False)
-        self.build_sidebar()
-
+        # Separate transition canvas (for page effects, not sidebar movement).
+        self.overlay = tk.Canvas(self.root, bg=BG_APP, highlightthickness=0)
         self.show_tab(initial_tab, animate=animate)
-
-
 
     def _on_scrub_nav(self, action):
         focus = self.root.focus_get()
@@ -3114,236 +3898,418 @@ class BuiltInMacroApp:
         return "break"
         
     def build_sidebar(self):
-        header_frame = tk.Frame(self.sidebar_frame, bg=BG_SIDEBAR, height=40)
-        header_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        tk.Label(header_frame, text="SEQUENT", font=("Segoe UI", 9, "bold"), bg=BG_SIDEBAR, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, padx=16)
-        tk.Frame(self.sidebar_frame, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=8)
+        nav_head = tk.Frame(self.sidebar_frame, bg=BG_SIDEBAR)
+        nav_head.pack(fill=tk.X, padx=14, pady=(20, 18))
+        tk.Label(nav_head, text="WORKSPACE", bg=BG_SIDEBAR, fg=TEXT_PRIMARY,
+                 font=("Segoe UI", 10, "bold"), anchor="w").pack(fill=tk.X)
+        tk.Label(nav_head, text="AUTOMATION STUDIO", bg=BG_SIDEBAR,
+                 fg=TEXT_MUTED, font=("Segoe UI", 7, "bold"),
+                 anchor="w").pack(fill=tk.X, pady=(3, 0))
+        tk.Frame(self.sidebar_frame, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(0, 12))
+        self.btn_tab_playback = SidebarButton(
+            self.sidebar_frame, text="▣  PLAYBACK",
+            command=lambda: self.show_tab("playback"))
+        self.btn_tab_playback.pack(fill=tk.X, padx=7, pady=2)
+        self.btn_tab_sequencer = SidebarButton(
+            self.sidebar_frame, text="⇄  SEQUENCER",
+            command=lambda: self.show_tab("sequencer"))
+        self.btn_tab_sequencer.pack(fill=tk.X, padx=7, pady=2)
+        self.btn_tab_settings = SidebarButton(
+            self.sidebar_frame, text="⚙  SETTINGS",
+            command=lambda: self.show_tab("settings"))
+        self.btn_tab_settings.pack(fill=tk.X, padx=7, pady=2)
+        tk.Frame(self.sidebar_frame, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(20, 10))
+        self.btn_tab_guide = SidebarButton(
+            self.sidebar_frame, text="?  GUIDED TOUR", command=self.start_walkthrough)
+        self.btn_tab_guide.pack(fill=tk.X, padx=7, pady=(0, 12))
+        tk.Label(self.sidebar_frame, text="Ctrl+F in Action Library\nF7 Record   •   F9 Run",
+                 bg=BG_SIDEBAR, fg=TEXT_MUTED, justify="left",
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=18)
 
-        self.btn_tab_playback = SidebarButton(self.sidebar_frame, text="PLAYBACK", command=lambda: self.show_tab("playback"))
-        self.btn_tab_playback.pack(fill=tk.X)
+    def _place_controls_dock(self):
+        """Pin Playback's Controls dock to the right side of the window.
 
-        self.btn_tab_sequencer = SidebarButton(self.sidebar_frame, text="SEQUENCER", command=lambda: self.show_tab("sequencer"))
-        self.btn_tab_sequencer.pack(fill=tk.X)
+        Controls deliberately lives outside workspace_main, whose x-position
+        animates with navigation. Its position changes only when the actual
+        application window is resized, never during a sidebar transition.
+        """
+        if not hasattr(self, "control_dock") or not self.control_dock.winfo_exists():
+            return
+        # workspace_main contains: 62px subheading, 1px separator, then a
+        # content frame with 13px margins on all four sides.
+        self.control_dock.place(
+            relx=1.0, x=-13, y=76, anchor="ne",
+            width=289, relheight=1.0, height=-89
+        )
+        self.control_dock.lift()
 
-        self.btn_tab_settings = SidebarButton(self.sidebar_frame, text="SETTINGS", command=lambda: self.show_tab("settings"))
-        self.btn_tab_settings.pack(fill=tk.X)
-    
+    def _queue_available_width(self, sidebar_width):
+        """Space between the sidebar gutter and the pinned Controls dock."""
+        return max(1, self.workspace.winfo_width() - int(sidebar_width) - 324)
+
+    def _place_action_queue(self, sidebar_width=None, resize_content=True):
+        """Animate the queue's left edge and contents, with its right edge fixed.
+
+        Only the Action Queue's internal width changes. The Controls dock and
+        parent workspace remain stationary, avoiding whole-workspace reflow.
+        """
+        if not hasattr(self, "queue_dock") or not self.queue_dock.winfo_exists():
+            return
+        if sidebar_width is None:
+            sidebar_width = self._sidebar_visible_width
+        left = int(sidebar_width) + 13
+        # Right boundary is 9px left of Controls. Controls has width 289 and
+        # a 13px right margin, leaving a 311px total right inset.
+        right_inset = 311
+        self.queue_viewport.place(
+            x=left, y=76, relwidth=1.0, width=-(left + right_inset),
+            relheight=1.0, height=-89
+        )
+        if resize_content:
+            target_width = self._queue_available_width(sidebar_width)
+            # Avoid redundant geometry requests when an animation tick rounds
+            # to the same pixel width as the previous tick.
+            if getattr(self, "_queue_content_width", None) != target_width:
+                self._queue_content_width = target_width
+                self.queue_dock.place_configure(width=target_width)
+        self.queue_viewport.lift()
+        if hasattr(self, "control_dock") and self.control_dock.winfo_exists():
+            self.control_dock.lift()
+
+    def _place_stage_builder_dock(self):
+        """Keep Stage Builder pinned to the application's right edge."""
+        dock = getattr(self, "stage_builder_dock", None)
+        if dock is None or not dock.winfo_exists():
+            return
+        dock.place(
+            relx=1.0, x=-13, y=76, anchor="ne",
+            width=289, relheight=1.0, height=-89
+        )
+        dock.lift()
+
+    def _place_sequencer_timeline(self, sidebar_width=None, resize_content=True):
+        """Resize the stage timeline from its left edge; pin its right edge.
+
+        Stage Builder never moves with the sidebar. As the sidebar slides,
+        both the timeline's frame and its actual contents resize together.
+        """
+        dock = getattr(self, "seq_timeline_dock", None)
+        if dock is None or not dock.winfo_exists():
+            return
+        if sidebar_width is None:
+            sidebar_width = self._sidebar_visible_width
+        left = int(sidebar_width) + 13
+        self.seq_timeline_viewport.place(
+            x=left, y=76, relwidth=1.0, width=-(left + 311),
+            relheight=1.0, height=-89
+        )
+        if resize_content:
+            target_width = self._queue_available_width(sidebar_width)
+            if self._seq_timeline_content_width != target_width:
+                self._seq_timeline_content_width = target_width
+                dock.place_configure(width=target_width)
+        self.seq_timeline_viewport.lift()
+        if hasattr(self, "stage_builder_dock") and self.stage_builder_dock.winfo_exists():
+            self.stage_builder_dock.lift()
+
+    def _prepare_queue_for_transition(self):
+        """Mark the animation active without jumping the Queue's width."""
+        tab = getattr(self, "current_tab_name", None)
+        if tab == "playback":
+            if not hasattr(self, "queue_dock") or not self.queue_dock.winfo_exists():
+                return
+            self._queue_animation_active = True
+            self._place_action_queue(self._sidebar_visible_width, resize_content=True)
+        elif tab == "sequencer":
+            if not hasattr(self, "seq_timeline_dock") or not self.seq_timeline_dock.winfo_exists():
+                return
+            self._queue_animation_active = True
+            self._place_sequencer_timeline(self._sidebar_visible_width, resize_content=True)
+        self.sidebar_host.lift()
+
+    def _on_workspace_configure(self, event):
+        """Debounce only resize events belonging to the current workspace."""
+        if (getattr(self, "_theme_rebuilding", False)
+                or event.widget is not getattr(self, "workspace", None)):
+            return
+        if getattr(self, "_queue_resize_job", None) is not None:
+            try:
+                self.root.after_cancel(self._queue_resize_job)
+            except tk.TclError:
+                pass
+            self._queue_resize_job = None
+        if self._queue_animation_active:
+            return
+        # Capture the workspace and generation. Old jobs must never be able
+        # to manipulate freshly rebuilt controls (or destroyed sidebar paths).
+        generation = self._ui_generation
+        workspace = self.workspace
+        self._queue_resize_job = self.root.after(
+            90, lambda: self._settle_queue_resize(workspace, generation)
+        )
+
+    def _settle_queue_resize(self, workspace=None, generation=None):
+        if (generation is not None and generation != self._ui_generation):
+            return
+        if (workspace is not None and workspace is not getattr(self, "workspace", None)):
+            return
+        self._queue_resize_job = None
+        if (getattr(self, "_theme_rebuilding", False)
+                or getattr(self, "_queue_animation_active", False)):
+            return
+        sidebar = getattr(self, "sidebar_host", None)
+        current_workspace = getattr(self, "workspace", None)
+        if (sidebar is None or current_workspace is None
+                or not sidebar.winfo_exists() or not current_workspace.winfo_exists()):
+            return
+        if (getattr(self, "current_tab_name", None) == "playback"
+                and hasattr(self, "queue_dock") and self.queue_dock.winfo_exists()):
+            self._place_action_queue(self._sidebar_visible_width, resize_content=True)
+        elif (getattr(self, "current_tab_name", None) == "sequencer"
+                and hasattr(self, "seq_timeline_dock") and self.seq_timeline_dock.winfo_exists()):
+            self._place_sequencer_timeline(self._sidebar_visible_width, resize_content=True)
+        # The original callback raised "bad window path name" here after
+        # theme changes destroyed and replaced sidebar_host.
+        sidebar.lift()
+
+    def _sync_controls_dock_visibility(self):
+        """Show only the active page's anchored docks, independent of page frames."""
+        tab = self.current_tab_name
+        if tab == "playback":
+            if hasattr(self, "stage_builder_dock"):
+                self.stage_builder_dock.place_forget()
+            if hasattr(self, "seq_timeline_viewport"):
+                self.seq_timeline_viewport.place_forget()
+            self._place_action_queue(
+                self._sidebar_visible_width,
+                resize_content=not self._queue_animation_active
+            )
+            self._place_controls_dock()
+        elif tab == "sequencer":
+            if hasattr(self, "control_dock"):
+                self.control_dock.place_forget()
+            if hasattr(self, "queue_viewport"):
+                self.queue_viewport.place_forget()
+            self._place_sequencer_timeline(
+                self._sidebar_visible_width,
+                resize_content=not self._queue_animation_active
+            )
+            self._place_stage_builder_dock()
+        else:
+            if hasattr(self, "control_dock"):
+                self.control_dock.place_forget()
+            if hasattr(self, "queue_viewport"):
+                self.queue_viewport.place_forget()
+            if hasattr(self, "stage_builder_dock"):
+                self.stage_builder_dock.place_forget()
+            if hasattr(self, "seq_timeline_viewport"):
+                self.seq_timeline_viewport.place_forget()
+        if hasattr(self, "sidebar_host") and self.sidebar_host.winfo_exists():
+            self.sidebar_host.lift()
+
     def build_playback_view(self):
-        playback_header = tk.Frame(self.frame_playback, bg=BG_APP)
-        playback_header.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(15, 8))
+        """Sequent layout: action queue as a primary dock, controls as an inspector dock."""
+        # Both Playback docks are independent of workspace_main: animation
+        # cannot move their boundary beside Controls by shifting the page.
+        # Other pages continue to use the normal workspace layout.
+        self.control_dock = ModernCard(self.workspace, bg_card=BG_PANEL)
+        self.control_dock.pack_propagate(False)
+        self._place_controls_dock()
+        sequent_dock_header(self.control_dock, "Controls", "REC / PLAY")
 
-        left_header = tk.Frame(playback_header, bg=BG_APP)
-        left_header.pack(side=tk.LEFT)
-
-        tk.Label(left_header, text="Playback Queue", font=("Segoe UI", 12, "bold"), bg=BG_APP, fg=TEXT_PRIMARY).pack(side=tk.LEFT)
-        self.action_badge = tk.Label(left_header, text="0 Actions", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_MUTED, padx=8, pady=2)
-        self.action_badge.pack(side=tk.LEFT, padx=(10, 0))
-
-        file_card = ModernCard(playback_header, bg_card=BG_PANEL)
-        file_card.pack(side=tk.RIGHT)
-
-        btn_load_file = tk.Label(file_card, text="📥 Import", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=10, pady=4)
-        btn_load_file.pack(side=tk.LEFT, padx=(3, 2), pady=3)
-        btn_load_file.bind("<Button-1>", lambda e: self.load_macro_from_file())
-        btn_load_file.bind("<Enter>", lambda e: btn_load_file.config(bg=BG_HOVER))
-        btn_load_file.bind("<Leave>", lambda e: btn_load_file.config(bg=BG_INPUT))
-        ModernTooltip(btn_load_file, "Import external macro routine", ".json")
-
-        btn_save_file = tk.Label(file_card, text="📤 Export", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=10, pady=4)
-        btn_save_file.pack(side=tk.LEFT, padx=(2, 3), pady=3)
-        btn_save_file.bind("<Button-1>", lambda e: self.save_macro_to_file())
-        btn_save_file.bind("<Enter>", lambda e: btn_save_file.config(bg=BG_HOVER))
-        btn_save_file.bind("<Leave>", lambda e: btn_save_file.config(bg=BG_INPUT))
-        ModernTooltip(btn_save_file, "Export current queue", ".json")
-
-        # Scrubber Header Card
-        self.scrub_card = ModernCard(self.frame_playback, bg_card=BG_PANEL)
-        self.scrub_card.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(0, 10))
-
-        top_scrub_row = tk.Frame(self.scrub_card, bg=BG_PANEL, padx=8, pady=6)
-        top_scrub_row.pack(fill=tk.X)
-
-        btn_reset = tk.Label(top_scrub_row, text="⏮", font=("Segoe UI", 10), bg=BG_PANEL, fg=TEXT_MUTED, cursor="hand2", padx=6, pady=2)
-        btn_reset.pack(side=tk.LEFT, padx=(0, 2))
-        btn_reset.bind("<Button-1>", lambda e: self.jump_to_start())
-        btn_reset.bind("<Enter>", lambda e: btn_reset.config(fg=TEXT_PRIMARY, bg=BG_HOVER))
-        btn_reset.bind("<Leave>", lambda e: btn_reset.config(fg=TEXT_MUTED, bg=BG_PANEL))
-        ModernTooltip(btn_reset, "Reset to Start", "Home")
-
-        btn_step_back = tk.Label(top_scrub_row, text="◀ Step", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
-        btn_step_back.pack(side=tk.LEFT, padx=(0, 4))
-        btn_step_back.bind("<Button-1>", lambda e: self.step_backward())
-        btn_step_back.bind("<Enter>", lambda e: btn_step_back.config(bg=BG_HOVER))
-        btn_step_back.bind("<Leave>", lambda e: btn_step_back.config(bg=BG_INPUT))
-        ModernTooltip(btn_step_back, "Previous Action", "Left Arrow")
-
-        btn_step_fwd = tk.Label(top_scrub_row, text="Step ▶", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
-        btn_step_fwd.pack(side=tk.LEFT, padx=(0, 6))
-        btn_step_fwd.bind("<Button-1>", lambda e: self.step_forward())
-        btn_step_fwd.bind("<Enter>", lambda e: btn_step_fwd.config(bg=BG_HOVER))
-        btn_step_fwd.bind("<Leave>", lambda e: btn_step_fwd.config(bg=BG_INPUT))
-        ModernTooltip(btn_step_fwd, "Next Action", "Right Arrow")
-
-        btn_step_run = tk.Label(top_scrub_row, text="⚡ Run Step", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=SYNTAX_GREEN, cursor="hand2", padx=8, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
-        btn_step_run.pack(side=tk.LEFT, padx=(0, 10))
-        btn_step_run.bind("<Button-1>", lambda e: self.run_single_step())
-        btn_step_run.bind("<Enter>", lambda e: btn_step_run.config(bg=BG_HOVER))
-        btn_step_run.bind("<Leave>", lambda e: btn_step_run.config(bg=BG_INPUT))
-        ModernTooltip(btn_step_run, "Execute Selected Step", "Space")
-
-        self.scrubber = ModernScrubberTrack(top_scrub_row, command=self.on_scrub)
-        self.scrubber.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-
-        self.scrub_badge = tk.Label(
-            top_scrub_row, text="[ 0 / 0 ]", font=("Consolas", 8, "bold"),
-            bg=BG_INPUT, fg=SYNTAX_BLUE, padx=8, pady=3,
-            highlightbackground=BG_BORDER, highlightthickness=1
-        )
+        controls = tk.Frame(self.control_dock, bg=BG_PANEL, padx=13, pady=14)
+        controls.pack(fill=tk.BOTH, expand=True)
+        tk.Label(controls, text="TRANSPORT", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(fill=tk.X, anchor="w")
+        self.scrub_card = tk.Frame(controls, bg=BG_PANEL)
+        self.scrub_card.pack(fill=tk.X, pady=(9, 9))
+        step_controls = tk.Frame(self.scrub_card, bg=BG_PANEL)
+        step_controls.pack(fill=tk.X, pady=(0, 12))
+        for title, callback, hint in [
+            ("⏮", self.jump_to_start, "Home"),
+            ("◀", self.step_backward, "Previous"),
+            ("▶", self.step_forward, "Next"),
+            ("⚡ Step", self.run_single_step, "Execute selected action"),
+        ]:
+            btn = sequent_toolbar_button(step_controls, title, callback)
+            btn.pack(side=tk.LEFT, padx=(0, 5))
+            ModernTooltip(btn, hint)
+        tk.Label(self.scrub_card, text="PLAYHEAD", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        scrub_row = tk.Frame(self.scrub_card, bg=BG_PANEL)
+        scrub_row.pack(fill=tk.X, pady=(5, 9))
+        self.scrub_badge = tk.Label(scrub_row, text="[ 0 / 0 ]",
+                                    bg=BG_INPUT, fg=SYNTAX_BLUE,
+                                    font=("Consolas", 8, "bold"), padx=7, pady=4)
         self.scrub_badge.pack(side=tk.RIGHT)
-        ModernTooltip(self.scrub_badge, "Nudge Selected Coordinates", "Alt + Arrows")
-
+        self.scrubber = ModernScrubberTrack(scrub_row, command=self.on_scrub)
+        self.scrubber.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 7))
+        options = tk.Frame(self.scrub_card, bg=BG_PANEL)
+        options.pack(fill=tk.X, pady=(2, 4))
+        tk.Label(options, text="Repeat", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT)
         self.loop_var = tk.StringVar(value=self.loop_mode)
-        self.loop_menu = tk.OptionMenu(
-            top_scrub_row, self.loop_var, *self.loop_options,
-            command=lambda val: setattr(self, 'loop_mode', val)
-        )
-        self.loop_menu.config(
-            bg=BG_INPUT, fg=SYNTAX_PURPLE, activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
-            font=("Segoe UI", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER,
-            bd=0, relief="flat", cursor="hand2"
-        )
-        self.loop_menu["menu"].config(
-            bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat"
-        )
-        self.loop_menu.pack(side=tk.RIGHT, padx=(0, 6))
-        ModernTooltip(self.loop_menu, "Loop Repetitions", "Cycle")
-
-        bot_preview_row = tk.Frame(self.scrub_card, bg=BG_HEADER, padx=10, pady=4)
-        bot_preview_row.pack(fill=tk.X)
-
-        tk.Label(bot_preview_row, text="PLAYHEAD:", font=("Segoe UI", 7, "bold"), bg=BG_HEADER, fg=TEXT_MUTED).pack(side=tk.LEFT, padx=(0, 8))
-
-        self.lbl_active_action = tk.Label(
-            bot_preview_row, text="// Queue idle", font=("Consolas", 8, "bold"),
-            bg=BG_HEADER, fg=TEXT_MUTED, anchor="w"
-        )
-        self.lbl_active_action.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # Bottom Action Buttons - Packed to BOTTOM first to prevent truncation
-        controls_frame = tk.Frame(self.frame_playback, bg=BG_APP)
-        controls_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(0, 20))
-
-        self.record_btn = ModernButton(
-            controls_frame, text=self.get_btn_text("start_rec"), 
-            bg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOV, command=self.toggle_recording
-        )
-        self.record_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        ModernTooltip(self.record_btn, "Toggle Recording", self.hotkeys["start_rec"]["name"])
-
-        self.pause_btn = ModernButton(
-            controls_frame, text="Pause (F9)",
-            bg_color=BG_BORDER, hover_color=BG_HOVER, command=self.toggle_pause
-        )
-        self.pause_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self.loop_menu = tk.OptionMenu(options, self.loop_var, *self.loop_options,
+                                       command=lambda val: setattr(self, 'loop_mode', val))
+        self.loop_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
+                              activeforeground=TEXT_PRIMARY, font=("Segoe UI", 9),
+                              highlightthickness=1, highlightbackground=BG_BORDER,
+                              bd=0, relief="flat", cursor="hand2")
+        self.loop_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                      activebackground=COLOR_ACCENT, bd=0)
+        self.loop_menu.pack(side=tk.RIGHT)
+        tk.Frame(controls, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=(12, 14))
+        tk.Label(controls, text="CURRENT ACTION", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        self.lbl_active_action = tk.Label(controls, text="// Queue idle", bg=BG_INPUT,
+                                          fg=SYNTAX_BLUE, font=("Consolas", 9),
+                                          anchor="w", padx=10, pady=10,
+                                          wraplength=245, justify="left")
+        self.lbl_active_action.pack(fill=tk.X, pady=(6, 0))
+        tk.Frame(controls, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=14)
+        tk.Label(controls, text="EXECUTION", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        self.record_btn = ModernButton(controls, text=self.get_btn_text("start_rec"),
+                                       bg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOV,
+                                       command=self.toggle_recording)
+        self.record_btn.pack(fill=tk.X, pady=(9, 7))
+        self.play_btn = ModernButton(controls, text=self.get_btn_text("start_play"),
+                                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                                     command=self.toggle_playback)
+        self.play_btn.pack(fill=tk.X, pady=(0, 7))
+        self.pause_btn = ModernButton(controls, text="Pause (F9)",
+                                      bg_color=BG_BORDER, hover_color=BG_HOVER,
+                                      command=self.toggle_pause)
+        self.pause_btn.pack(fill=tk.X)
         self.pause_btn.set_state("disabled")
-        ModernTooltip(self.pause_btn, "Pause / Resume Execution", "F9")
+        ModernTooltip(self.record_btn, "Toggle Recording", self.hotkeys["start_rec"]["name"])
+        ModernTooltip(self.play_btn, "Run Active Macro", self.hotkeys["start_play"]["name"])
+        ModernTooltip(self.pause_btn, "Pause or Resume", "F9")
 
-        self.play_btn = ModernButton(
-            controls_frame, text=self.get_btn_text("start_play"), 
-            bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=self.toggle_playback
+        self.queue_dock = ModernCard(self.queue_viewport, bg_card=BG_PANEL)
+        queue_dock = self.queue_dock
+        # Anchor the actual Queue to the viewport's right edge so it doesn't
+        # shift with the animated boundary on the left.
+        initial_queue_width = self._queue_available_width(self._sidebar_visible_width)
+        queue_dock.place(
+            relx=1.0, x=0, y=-1, anchor="ne",
+            width=initial_queue_width,
+            relheight=1.0, height=2
         )
-        self.play_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
-        ModernTooltip(self.play_btn, "Run Active Sequence", self.hotkeys["start_play"]["name"])
-
-        # Center Queue Viewer - Expands into all remaining vertical space
-        self.queue_viewer = VSCodeQueueViewer(self.frame_playback, app_instance=self)
-        self.queue_viewer.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=20, pady=(0, 15))
+        self._queue_content_width = initial_queue_width
+        self._place_action_queue()
+        qhead = sequent_dock_header(queue_dock, "Action Queue", "RECORD / EDIT / DEBUG")
+        self.action_badge = tk.Label(qhead, text="0 Actions", bg=BG_INPUT,
+                                     fg=TEXT_MUTED, font=("Segoe UI", 8, "bold"),
+                                     padx=8, pady=3)
+        self.action_badge.pack(side=tk.RIGHT, padx=(3, 9))
+        filebar = tk.Frame(queue_dock, bg=BG_PANEL, padx=11, pady=9)
+        filebar.pack(fill=tk.X)
+        self.import_macro_button = sequent_toolbar_button(filebar, "↥  Import", self.load_macro_from_file)
+        self.import_macro_button.pack(side=tk.LEFT, padx=(0, 5))
+        sequent_toolbar_button(filebar, "↧  Export", self.save_macro_to_file).pack(side=tk.LEFT)
+        # The lengthy instruction consumed more width than the queue could
+        # supply at its default size. Keep the help accessible via a tooltip.
+        help_label = tk.Label(filebar, text="?", bg=BG_PANEL, fg=TEXT_MUTED,
+                              font=("Segoe UI", 9, "bold"), padx=7)
+        help_label.pack(side=tk.RIGHT)
+        ModernTooltip(help_label, "Double-click to edit • Right-click for options")
+        self.queue_viewer = VSCodeQueueViewer(queue_dock, app_instance=self)
+        self.queue_viewer.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self.queue_viewer.append_line("// Awaiting input...", SYNTAX_GREEN)
-
-        nudge_keys = [
+        for seq, dx, dy in [
             ("<Alt-Left>", -1, 0), ("<Alt-Right>", 1, 0),
             ("<Alt-Up>", 0, -1), ("<Alt-Down>", 0, 1),
             ("<Alt-Shift-Left>", -5, 0), ("<Alt-Shift-Right>", 5, 0),
             ("<Alt-Shift-Up>", 0, -5), ("<Alt-Shift-Down>", 0, 5),
-        ]
-        for seq, dx, dy in nudge_keys:
-            self.queue_viewer.code_text.bind(seq, lambda e, x=dx, y=dy: self.nudge_active_coordinate(x, y))
+        ]:
+            self.queue_viewer.code_text.bind(
+                seq, lambda e, x=dx, y=dy: self.nudge_active_coordinate(x, y))
 
-
-        
     def build_sequencer_view(self):
-        seq_header = tk.Frame(self.frame_sequencer, bg=BG_APP)
-        seq_header.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(15, 8))
+        """Independent sequencer docks: animated timeline and pinned Stage Builder."""
+        # Match Playback's dock geometry. Both docks belong to the stationary
+        # workspace, not workspace_main (which moves during sidebar animation).
+        self.stage_builder_dock = ModernCard(self.workspace, bg_card=BG_PANEL)
+        right = self.stage_builder_dock
+        right.pack_propagate(False)
+        self._place_stage_builder_dock()
+        sequent_dock_header(right, "Stage Builder", "CONFIGURE")
+        config = tk.Frame(right, bg=BG_PANEL, padx=14, pady=14)
+        config.pack(fill=tk.BOTH, expand=True)
 
-        left_header = tk.Frame(seq_header, bg=BG_APP)
-        left_header.pack(side=tk.LEFT)
-
-        tk.Label(left_header, text="Macro Chain Sequencer", font=("Segoe UI", 12, "bold"), bg=BG_APP, fg=TEXT_PRIMARY).pack(side=tk.LEFT)
-        self.chain_badge = tk.Label(left_header, text="0 Stages", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_MUTED, padx=8, pady=2)
-        self.chain_badge.pack(side=tk.LEFT, padx=(10, 0))
-
-        file_card = ModernCard(seq_header, bg_card=BG_PANEL)
-        file_card.pack(side=tk.RIGHT)
-
-        btn_load_chain = tk.Label(file_card, text="↑ Import Chain", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=10, pady=3)
-        btn_load_chain.pack(side=tk.LEFT, padx=(3, 2), pady=3)
-        btn_load_chain.bind("<Button-1>", lambda e: self.load_chain_from_file())
-        btn_load_chain.bind("<Enter>", lambda e: btn_load_chain.config(bg=BG_HOVER))
-        btn_load_chain.bind("<Leave>", lambda e: btn_load_chain.config(bg=BG_INPUT))
-
-        btn_save_chain = tk.Label(file_card, text="↓ Export Chain", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=10, pady=3)
-        btn_save_chain.pack(side=tk.LEFT, padx=(2, 3), pady=3)
-        btn_save_chain.bind("<Button-1>", lambda e: self.save_chain_to_file())
-        btn_save_chain.bind("<Enter>", lambda e: btn_save_chain.config(bg=BG_HOVER))
-        btn_save_chain.bind("<Leave>", lambda e: btn_save_chain.config(bg=BG_INPUT))
-
-        # Add Stage Card Builder
-        add_card = ModernCard(self.frame_sequencer, bg_card=BG_PANEL)
-        add_card.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(0, 10))
-
-        add_row = tk.Frame(add_card, bg=BG_PANEL, padx=10, pady=8)
-        add_row.pack(fill=tk.X)
-
-        tk.Label(add_row, text="Preset:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT, padx=(0, 4))
-        
+        def field_title(text):
+            tk.Label(config, text=text.upper(), bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=("Segoe UI", 8, "bold"), anchor="w").pack(
+                         fill=tk.X, pady=(10, 5))
+        field_title("Macro preset")
         self.seq_preset_var = tk.StringVar(value="-- Select Preset --")
-        self.seq_preset_menu = tk.OptionMenu(add_row, self.seq_preset_var, "-- Select Preset --")
-        self.seq_preset_menu.config(
-            bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
-            font=("Segoe UI", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER,
-            bd=0, relief="flat", cursor="hand2"
-        )
-        self.seq_preset_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
-        self.seq_preset_menu.pack(side=tk.LEFT, padx=(0, 10))
-
-        tk.Label(add_row, text="Loops:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT, padx=(0, 4))
-        self.seq_loops_entry = tk.Entry(add_row, width=4, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), bd=0, highlightbackground=BG_BORDER, highlightthickness=1, justify="center")
+        self.seq_preset_menu = tk.OptionMenu(config, self.seq_preset_var,
+                                             "-- Select Preset --")
+        self.seq_preset_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                    activebackground=BG_HOVER, font=("Segoe UI", 9),
+                                    highlightthickness=1, highlightbackground=BG_BORDER,
+                                    bd=0, relief="flat", cursor="hand2")
+        self.seq_preset_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                            activebackground=COLOR_ACCENT, bd=0)
+        self.seq_preset_menu.pack(fill=tk.X, ipady=3)
+        field_title("Loop count")
+        self.seq_loops_entry = tk.Entry(config, bg=BG_INPUT, fg=SYNTAX_PURPLE,
+                                        insertbackground=TEXT_PRIMARY,
+                                        font=("Consolas", 10), bd=0,
+                                        highlightbackground=BG_BORDER,
+                                        highlightthickness=1)
         self.seq_loops_entry.insert(0, "1")
-        self.seq_loops_entry.pack(side=tk.LEFT, padx=(0, 10), ipady=2)
-
-        tk.Label(add_row, text="Post-Delay:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT, padx=(0, 4))
-        self.seq_delay_entry = tk.Entry(add_row, width=5, bg=BG_INPUT, fg=SYNTAX_BLUE, font=("Consolas", 9, "bold"), bd=0, highlightbackground=BG_BORDER, highlightthickness=1, justify="center")
+        self.seq_loops_entry.pack(fill=tk.X, ipady=6)
+        field_title("Post-stage delay (seconds)")
+        self.seq_delay_entry = tk.Entry(config, bg=BG_INPUT, fg=SYNTAX_BLUE,
+                                        insertbackground=TEXT_PRIMARY,
+                                        font=("Consolas", 10), bd=0,
+                                        highlightbackground=BG_BORDER,
+                                        highlightthickness=1)
         self.seq_delay_entry.insert(0, "1.0")
-        self.seq_delay_entry.pack(side=tk.LEFT, padx=(0, 12), ipady=2)
+        self.seq_delay_entry.pack(fill=tk.X, ipady=6)
+        btn_add_stage = ModernButton(config, text="+ Add Stage",
+                                     bg_color=COLOR_ACCENT,
+                                     hover_color=COLOR_ACCENT_HOV,
+                                     command=self.add_chain_stage)
+        btn_add_stage.pack(fill=tk.X, pady=(18, 0))
+        tk.Frame(config, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=18)
+        tk.Label(config, text="CHAIN TRANSPORT", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        self.btn_run_chain = ModernButton(config, text="▶ Run Macro Chain (F9)",
+                                          bg_color=COLOR_SUCCESS,
+                                          hover_color="#278761",
+                                          command=self.toggle_chain_run)
+        self.btn_run_chain.pack(fill=tk.X, pady=(10, 7))
+        sequent_toolbar_button(config, "Clear All Stages", self.clear_chain).pack(fill=tk.X)
 
-        btn_add_stage = ModernButton(add_row, text="+ Add Stage", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=self.add_chain_stage)
-        btn_add_stage.pack(side=tk.RIGHT)
-
-        # Bottom Chain Controls - Packed to BOTTOM first to prevent truncation
-        chain_controls = tk.Frame(self.frame_sequencer, bg=BG_APP)
-        chain_controls.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(0, 20))
-
-        btn_clear_chain = ModernButton(chain_controls, text="Clear All Stages", bg_color=BG_BORDER, hover_color=COLOR_DANGER, command=self.clear_chain)
-        btn_clear_chain.pack(side=tk.LEFT, padx=(0, 6))
-
-        self.btn_run_chain = ModernButton(chain_controls, text="▶ Run Macro Chain (F9)", bg_color=COLOR_SUCCESS, hover_color="#1d8a4b", command=self.toggle_chain_run)
-        self.btn_run_chain.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(6, 0))
-
-        # Scrollable Chain Stages Timeline - Expands into all remaining vertical space
-        self.chain_scroll = ModernScrollableFrame(self.frame_sequencer, bg=BG_APP)
-        self.chain_scroll.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=20, pady=(0, 15))
-
+        self.seq_timeline_dock = ModernCard(
+            self.seq_timeline_viewport, bg_card=BG_PANEL
+        )
+        left = self.seq_timeline_dock
+        initial_timeline_width = self._queue_available_width(self._sidebar_visible_width)
+        left.place(
+            relx=1.0, x=0, y=-1, anchor="ne",
+            width=initial_timeline_width,
+            relheight=1.0, height=2
+        )
+        self._seq_timeline_content_width = initial_timeline_width
+        self._place_sequencer_timeline()
+        head = sequent_dock_header(left, "Macro Chain", "STAGE TIMELINE")
+        self.chain_badge = tk.Label(head, text="0 Stages", bg=BG_INPUT,
+                                    fg=TEXT_MUTED, font=("Segoe UI", 8, "bold"),
+                                    padx=8, pady=3)
+        self.chain_badge.pack(side=tk.RIGHT, padx=(3, 9))
+        filebar = tk.Frame(left, bg=BG_PANEL, padx=11, pady=9)
+        filebar.pack(fill=tk.X)
+        sequent_toolbar_button(filebar, "↥  Import Chain", self.load_chain_from_file).pack(
+            side=tk.LEFT, padx=(0, 6))
+        sequent_toolbar_button(filebar, "↧  Export Chain", self.save_chain_to_file).pack(
+            side=tk.LEFT)
+        self.chain_scroll = ModernScrollableFrame(left, bg=BG_PANEL)
+        self.chain_scroll.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.refresh_chain_ui()
 
     def refresh_sequencer_preset_dropdown(self):
         menu = self.seq_preset_menu["menu"]
@@ -3600,7 +4566,14 @@ class BuiltInMacroApp:
                     while self.is_paused and self.chain_running:
                         time.sleep(0.04)
 
-                    self.execute_single_action(act)
+                    try:
+                        self.execute_single_action(act)
+                    except Exception as error:
+                        reason = str(error) if isinstance(error, MacroExecutionError) else type(error).__name__
+                        self.chain_running = False
+                        self.playing = False
+                        self.root.after(0, lambda msg=reason: self._finish_chain_failed(msg))
+                        return
 
                     actual_delay = max(0.01, self.action_delay / self.playback_speed)
                     steps = max(1, int(actual_delay / 0.02))
@@ -3620,7 +4593,14 @@ class BuiltInMacroApp:
                     if not self.chain_running: break
                     time.sleep(0.05)
 
-        self.root.after(0, self.finish_chain)
+        if self.chain_running:
+            self.root.after(0, self.finish_chain)
+
+    def _finish_chain_failed(self, reason):
+        self.stop_chain()
+        self.update_status(f"Chain failed: {reason}", COLOR_DANGER)
+        if self.audio_cues:
+            play_cue("error")
 
     def finish_chain(self):
         self.chain_running = False
@@ -3729,6 +4709,8 @@ class BuiltInMacroApp:
             return f"🖱️ mouse.scroll({direction} delta={action.get('delta', 120)}, at=({action.get('x', 0)},{action.get('y', 0)}))"
         elif act_type == "wait_pixel": 
             return f"🎯 condition.wait_pixel(x={action.get('x', 0)}, y={action.get('y', 0)}, color='{action.get('color', '#FFFFFF')}')"
+        elif act_type == "wait_text":
+            return f"🔎 ocr.wait_text({action.get('text', '')!r}, {action.get('mode', 'appears')})"
         elif act_type == "read_clipboard": 
             kws = action.get('keywords', [])
             preview = kws[0] if len(kws) == 1 else f"{len(kws)} keywords"
@@ -3771,7 +4753,7 @@ class BuiltInMacroApp:
         act_type = action.get("type", "") if action else ""
         if act_type in ("label", "goto", "if_var", "read_clipboard", "type_variable", "prompt_input"): return SYNTAX_PURPLE
         if act_type == "disclaimer": return SYNTAX_ORANGE
-        if act_type == "wait_pixel": return COLOR_SUCCESS
+        if act_type in ("wait_pixel", "wait_text"): return COLOR_SUCCESS
         if act_type in ("move", "click", "drag", "scroll"): return SYNTAX_BLUE
         if act_type in ("key", "press", "enter", "backspace"): return SYNTAX_ORANGE
         if act_type in ("combo", "select_all", "copy", "paste", "delay", "search_area"): return SYNTAX_PURPLE
@@ -3868,15 +4850,36 @@ class BuiltInMacroApp:
             self.current_action_idx = 0
 
         action = self.recorded_actions[self.current_action_idx]
+        if action.get("type") == "wait_text":
+            index = self.current_action_idx
+            self.update_status(f"Checking text at step #{index + 1}...", COLOR_ACCENT)
+            def worker():
+                try:
+                    matched = self.wait_for_screen_text(action, allow_idle=True)
+                    if not matched:
+                        raise MacroExecutionError(f"Text timeout at step {index + 1}")
+                except Exception as error:
+                    reason = str(error) if isinstance(error, MacroExecutionError) else type(error).__name__
+                    self.root.after(0, lambda msg=reason: self.update_status(f"Step failed: {msg}", COLOR_DANGER))
+                    return
+                self.root.after(0, lambda: self._finish_single_step(index))
+            Thread(target=worker, daemon=True).start()
+            return
+
         try:
             self.execute_single_action(action)
-            self.update_status(f"Ran step #{self.current_action_idx + 1}", COLOR_SUCCESS)
-        except Exception as e:
-            self.update_status(f"Step Error: {e}", COLOR_DANGER)
+        except Exception as error:
+            self.update_status(f"Step Error: {error}", COLOR_DANGER)
+            return
+        self._finish_single_step(self.current_action_idx)
 
-        if self.current_action_idx < len(self.recorded_actions) - 1:
+    def _finish_single_step(self, index):
+        if self.playing or self.recording or index != self.current_action_idx:
+            return
+        if index < len(self.recorded_actions) - 1:
             self.current_action_idx += 1
             self.update_scrubber_ui()
+            self.update_status(f"Ran step #{index + 1}", COLOR_SUCCESS)
         else:
             self.update_status("End of sequence", COLOR_SUCCESS)
         
@@ -3954,6 +4957,9 @@ class BuiltInMacroApp:
             press_key_combo(VK_CONTROL, VK_V)
         elif act_type == "combo":
             press_key_combo(action.get("mods", []), action.get("vk", 0))
+        elif act_type == "wait_text":
+            if not self.wait_for_screen_text(action):
+                raise MacroExecutionError("Wait Text timed out")
         elif act_type == "wait_pixel":
             cur = get_pixel_color(action.get("x", 0), action.get("y", 0))
             expected = action.get("color", "#FFFFFF").upper()
@@ -4354,12 +5360,78 @@ try {{
             try: os.remove(temp_bmp)
             except Exception: pass
 
+    def wait_for_screen_text(self, action, allow_idle=False):
+        """Poll WinRT OCR for user-defined text; False means timeout or cancellation.
+
+        OCR is an external PowerShell call, so timeouts are approximate and each
+        recognition attempt can take longer than the configured polling interval.
+        """
+        area = action.get("area")
+        if not isinstance(area, (list, tuple)) or len(area) != 4:
+            raise MacroExecutionError("Wait Text needs a selected screen area")
+        try:
+            x, y, w, h = (int(n) for n in area)
+            timeout = float(action.get("timeout", 15))
+        except (ValueError, TypeError, OverflowError):
+            raise MacroExecutionError("Invalid Wait Text screen area or timeout") from None
+        if w <= 0 or h <= 0 or not math.isfinite(timeout) or timeout < 0:
+            raise MacroExecutionError("Invalid Wait Text screen area or timeout")
+
+        target = str(action.get("text", "")).strip()
+        mode = action.get("mode", "appears")
+        if not target or mode not in ("appears", "disappears"):
+            raise MacroExecutionError("Invalid Wait Text target or mode")
+
+        def normalize(text):
+            return " ".join(re.sub(r"[^\w\s]", " ", text.casefold()).split())
+
+        target_normalized = normalize(target)
+        if not target_normalized:
+            raise MacroExecutionError("Wait Text target contains no searchable characters")
+
+        deadline = time.monotonic() + timeout
+        absent_checks = 0
+        first_check = True
+        while allow_idle or self.playing:
+            pause_start = None
+            while self.is_paused and self.playing:
+                if pause_start is None:
+                    pause_start = time.monotonic()
+                time.sleep(0.05)
+            if pause_start is not None:
+                deadline += time.monotonic() - pause_start
+            if not allow_idle and not self.playing:
+                return False
+            if not first_check and time.monotonic() >= deadline:
+                return False
+
+            raw = self.ocr_screen_area(x, y, w, h)
+            if raw.startswith("ERR:"):
+                raise MacroExecutionError("OCR failed while checking text")
+            # Stop requests can arrive during the blocking OCR operation.
+            if not allow_idle and not self.playing:
+                return False
+
+            present = target_normalized in normalize(raw)
+            if mode == "appears" and present:
+                return True
+            if mode == "disappears":
+                absent_checks = 0 if present else absent_checks + 1
+                if absent_checks >= 2:
+                    return True
+
+            first_check = False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        return False
+
     def switch_to_preset_and_start(self, preset_name):
         self.switching_preset = False
         preset_file = os.path.join(self.presets_dir, f"{preset_name}.json")
         if not os.path.exists(preset_file):
             self.update_status(f"Preset '{preset_name}' Missing", COLOR_DANGER)
-            self.finish_macro()
+            self.finish_macro("failed", "Macro file not found")
             return
 
         self.on_preset_file_selected(preset_name, preset_file)
@@ -4370,7 +5442,7 @@ try {{
         self.switching_preset = False
         if not os.path.exists(file_path):
             self.update_status(f"File Missing: {os.path.basename(file_path)}", COLOR_DANGER)
-            self.finish_macro()
+            self.finish_macro("failed", "Macro file not found")
             return
 
         stem = os.path.splitext(os.path.basename(file_path))[0]
@@ -4435,6 +5507,19 @@ try {{
         except Exception as e:
             self.update_status(f"Error saving settings: {e}", COLOR_DANGER)
 
+    def start_walkthrough(self):
+        """Launch a safe, on-screen guide over the existing interface."""
+        if self.recording or self.playing or self.chain_running or self.is_binding:
+            self.update_status("Finish recording/playback before starting the walkthrough", COLOR_DANGER)
+            return
+        existing = getattr(self, "_walkthrough", None)
+        if existing is not None and not existing._closed:
+            existing.card.lift()
+            return
+        # Any in-flight navigation must finish before highlighting widgets.
+        self._settle_tab_transition()
+        self._walkthrough = SequentWalkthrough(self)
+
     def build_settings_view(self):
         self.settings_scroll = ModernScrollableFrame(self.frame_settings, bg=BG_APP)
         self.settings_scroll.pack(fill=tk.BOTH, expand=True)
@@ -4442,9 +5527,12 @@ try {{
         scroll_container = self.settings_scroll.scrollable_frame
 
         tk.Label(
-            scroll_container, text="Settings & Preferences",
-            font=("Segoe UI", 16, "bold"), bg=BG_APP, fg=TEXT_PRIMARY
-        ).pack(anchor="w", padx=20, pady=(20, 14))
+            scroll_container, text="Preferences",
+            font=("Segoe UI", 15, "bold"), bg=BG_APP, fg=TEXT_PRIMARY
+        ).pack(anchor="w", padx=20, pady=(19, 3))
+        tk.Label(scroll_container, text="Configure interface, playback, input, audio and hotkeys.",
+                 font=("Segoe UI", 9), bg=BG_APP, fg=TEXT_MUTED).pack(
+                     anchor="w", padx=20, pady=(0, 16))
 
         def add_setting_toggle(container, text, initial, callback):
             r = tk.Frame(container, bg=BG_PANEL)
@@ -4466,6 +5554,20 @@ try {{
 
         add_setting_toggle(f_app, "Light Mode Theme", self.light_mode, self.set_light_mode)
         self.build_entertain_me_toggle(f_app)
+
+        # Guided help can be restarted without reopening Sequent.
+        tk.Label(scroll_container, text="HELP & ONBOARDING", font=("Segoe UI", 8, "bold"),
+                 bg=BG_APP, fg=TEXT_MUTED).pack(anchor="w", padx=22, pady=(0, 4))
+        tour_card = ModernCard(scroll_container, bg_card=BG_PANEL)
+        tour_card.pack(fill=tk.X, padx=20, pady=(0, 16))
+        tour_row = tk.Frame(tour_card, bg=BG_PANEL, padx=16, pady=12)
+        tour_row.pack(fill=tk.X)
+        tk.Label(tour_row, text="New to Sequent?", bg=BG_PANEL, fg=TEXT_PRIMARY,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        tk.Label(tour_row, text="Explore the application with highlighted controls and step-by-step guidance.",
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=("Segoe UI", 9),
+                 anchor="w").pack(fill=tk.X, pady=(3, 8))
+        sequent_toolbar_button(tour_row, "▶  Start Guided Walkthrough", self.start_walkthrough).pack(anchor="w")
 
         # --- SECTION 2: PLAYBACK & TIMING ---
         tk.Label(scroll_container, text="PLAYBACK & TIMING", font=("Segoe UI", 8, "bold"), bg=BG_APP, fg=TEXT_MUTED).pack(anchor="w", padx=22, pady=(0, 4))
@@ -4634,87 +5736,147 @@ try {{
         self.light_mode = bool(enabled)
         self.apply_theme("light" if self.light_mode else "dark")
 
-    def apply_theme(self, theme_name):
-        if getattr(self, '_theme_lock', False): return
-        self._theme_lock = True
-
-        global BG_APP, BG_SIDEBAR, BG_HEADER, BG_PANEL, BG_INPUT, BG_GUTTER
-        global BG_SCROLL_TRACK, BG_BORDER, BG_HOVER, TRACK_INACTIVE, TRACK_HOVER, TRACK_ACTIVE
-        global TEXT_PRIMARY, TEXT_MUTED, TEXT_HEADER, COLOR_ACCENT, COLOR_ACCENT_HOV
-
-        if theme_name == "light":
-            BG_APP = "#f0f2f5"
-            BG_SIDEBAR = "#e2e5e9"
-            BG_HEADER = "#d3d7de"
-            BG_PANEL = "#ffffff"
-            BG_INPUT = "#e4e7eb"
-            BG_GUTTER = "#e2e5e9"
-            BG_SCROLL_TRACK = "#dcdfe4"
-            BG_BORDER = "#b8bcc4"
-            BG_HOVER = "#d1d5db"
-            TRACK_INACTIVE = "#b0b5be"
-            TRACK_HOVER = "#888e99"
-            TRACK_ACTIVE = "#4752c4"
-            TEXT_PRIMARY = "#111214"
-            TEXT_MUTED = "#4a4f57"
-            TEXT_HEADER = "#111214"
-        else:
-            BG_APP = "#313338"
-            BG_SIDEBAR = "#2b2d31"
-            BG_HEADER = "#1e1f22"
-            BG_PANEL = "#2b2d31"
-            BG_INPUT = "#1e1f22"
-            BG_GUTTER = "#16171a"
-            BG_SCROLL_TRACK = "#141517"
-            BG_BORDER = "#3f4147"
-            BG_HOVER = "#35373c"
-            TRACK_INACTIVE = "#3f4147"
-            TRACK_HOVER = "#585b64"
-            TRACK_ACTIVE = "#5865f2"
-            TEXT_PRIMARY = "#ffffff"
-            TEXT_MUTED = "#a6acb5"
-            TEXT_HEADER = "#ffffff"
-
-        if getattr(self, '_sparkle_anim_id', None):
-            try: self.root.after_cancel(self._sparkle_anim_id)
-            except Exception: pass
-            self._sparkle_anim_id = None
+    def _cancel_old_ui_jobs(self):
+        """Cancel asynchronous jobs and widget animations before UI teardown."""
+        self._ui_generation += 1
+        self._queue_animation_active = False
+        self._cancel_sidebar_animation()
+        for name in ("_queue_resize_job", "_tab_anim_id", "_sparkle_anim_id",
+                     "_resize_job", "_resize_repaint_job"):
+            job = getattr(self, name, None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, name, None)
         self._sparkle_particles.clear()
 
-        if getattr(self, '_tab_anim_id', None):
-            try: self.root.after_cancel(self._tab_anim_id)
-            except Exception: pass
-            self._tab_anim_id = None
+        container = getattr(self, "main_container", None)
+        if container is None or not container.winfo_exists():
+            return
+        stack = [container]
+        while stack:
+            widget = stack.pop()
+            stack.extend(widget.winfo_children())
+            # ModernButton / ModernPillToggle animations are widget-local.
+            for name in ("_fade_job", "_anim_id", "_after_id"):
+                job = getattr(widget, name, None)
+                if job is not None:
+                    try:
+                        widget.after_cancel(job)
+                    except tk.TclError:
+                        pass
+                    setattr(widget, name, None)
+            for tip in getattr(widget, "_sequent_tooltips", ()):
+                tip._cancel()
+                tip.hide()
 
-        active_tab = getattr(self, 'current_tab_name', "settings") or "settings"
+    def apply_theme(self, theme_name):
+        if getattr(self, '_theme_lock', False): return
+        if getattr(self, "_walkthrough", None) is not None:
+            self._walkthrough.close(restore=False)
+        self._theme_lock = True
+        self._theme_rebuilding = True
 
-        self.root.configure(bg=BG_APP)
+        global BG_APP, BG_SIDEBAR, BG_HEADER, BG_PANEL, BG_INPUT, BG_GUTTER
+        global BG_SCROLL_TRACK, BG_BORDER, BG_HOVER, BG_SELECTED, TRACK_INACTIVE, TRACK_HOVER, TRACK_ACTIVE
+        global TEXT_PRIMARY, TEXT_MUTED, TEXT_HEADER, COLOR_ACCENT, COLOR_ACCENT_HOV
+        global SYNTAX_BLUE, SYNTAX_GREEN, SYNTAX_PURPLE, SYNTAX_ORANGE, DISABLED
 
-        # Sync persistent grip backgrounds to the new theme so they don't leave ghost lines
-        if hasattr(self, 'grip_e'):
-            self.grip_e.config(bg=BG_APP)
-            self.grip_s.config(bg=BG_APP)
-            self.grip_w.config(bg=BG_APP)
-            self.grip_se.config(bg=BG_APP)
+        if theme_name == "light":
+            BG_APP = "#eef1f5"
+            BG_SIDEBAR = "#e4e9ef"
+            BG_HEADER = "#d6dde7"
+            BG_PANEL = "#ffffff"
+            BG_INPUT = "#f2f5f9"
+            BG_GUTTER = "#e7ebf1"
+            BG_SCROLL_TRACK = "#dce3eb"
+            BG_BORDER = "#c5ceda"
+            BG_HOVER = "#d6e1ef"
+            BG_SELECTED = "#c6dcf8"
+            TRACK_INACTIVE = "#a8b4c3"
+            TRACK_HOVER = "#798da5"
+            TRACK_ACTIVE = "#347bd8"
+            TEXT_PRIMARY = "#17202b"
+            TEXT_MUTED = "#506073"
+            TEXT_HEADER = "#17202b"
+            SYNTAX_BLUE = "#245da8"
+            SYNTAX_GREEN = "#146a52"
+            SYNTAX_PURPLE = "#7b53a7"
+            SYNTAX_ORANGE = "#a46f23"
+            DISABLED = "#d6dce5"
+        else:
+            BG_APP = "#17191e"
+            BG_SIDEBAR = "#1c1f26"
+            BG_HEADER = "#111318"
+            BG_PANEL = "#23262e"
+            BG_INPUT = "#181b21"
+            BG_GUTTER = "#15171c"
+            BG_SCROLL_TRACK = "#15171c"
+            BG_BORDER = "#353a43"
+            BG_HOVER = "#303642"
+            BG_SELECTED = "#293b54"
+            TRACK_INACTIVE = "#4a5260"
+            TRACK_HOVER = "#657185"
+            TRACK_ACTIVE = "#4089eb"
+            TEXT_PRIMARY = "#edf1f6"
+            TEXT_MUTED = "#a0aab8"
+            TEXT_HEADER = "#ffffff"
+            SYNTAX_BLUE = "#79b8ff"
+            SYNTAX_GREEN = "#65d4aa"
+            SYNTAX_PURPLE = "#c4a3ed"
+            SYNTAX_ORANGE = "#f3ba65"
+            DISABLED = "#363b45"
 
-        if hasattr(self, 'main_container') and self.main_container.winfo_exists():
-            self.main_container.destroy()
-        if hasattr(self, 'sidebar_frame') and self.sidebar_frame.winfo_exists():
-            self.sidebar_frame.destroy()
-        if hasattr(self, 'overlay') and self.overlay.winfo_exists():
-            self.overlay.destroy()
+        active_tab = getattr(self, 'current_tab_name', 'playback') or 'playback'
+        self._cancel_old_ui_jobs()
+        try:
+            self.root.configure(bg=BG_APP)
 
-        self.setup_ui(initial_tab=active_tab, animate=False)
-        if self.recorded_actions:
-            self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+            # Resize grips live outside main_container and persist between themes.
+            for grip_name in ('grip_e', 'grip_s', 'grip_w', 'grip_se'):
+                grip = getattr(self, grip_name, None)
+                if grip is not None and grip.winfo_exists():
+                    grip.configure(bg=BG_APP)
 
-        self.root.after(350, lambda: setattr(self, '_theme_lock', False))
+            # All sidebar, dock, Settings, and overlay children belong to the
+            # main UI hierarchy except the overlay. Destroy the tree only
+            # after all its delayed jobs have been cancelled.
+            old_main = getattr(self, 'main_container', None)
+            old_overlay = getattr(self, 'overlay', None)
+            if old_main is not None and old_main.winfo_exists():
+                old_main.destroy()
+            if old_overlay is not None and old_overlay.winfo_exists():
+                old_overlay.destroy()
+
+            self.setup_ui(initial_tab=active_tab, animate=False)
+            if self.recorded_actions:
+                self.display_actions_in_queue(
+                    self.recorded_actions, self.current_source_label
+                )
+        finally:
+            self._theme_rebuilding = False
+            self._theme_lock = False
+
+        # Recompute once, after the new widgets have been fully constructed.
+        # Generation guard protects against any deferred event from an old UI.
+        generation = self._ui_generation
+        workspace = self.workspace
+        self.root.after_idle(
+            lambda: self._settle_queue_resize(workspace, generation)
+        )
 
 
-        
     def toggle_entertain_me(self, state):
         self.entertain_me = bool(state)
         BuiltInMacroApp.entertain_mode = bool(state)
+        # Disabling entertainment also finishes any ongoing navigation slide.
+        if not self.entertain_me:
+            self._cancel_sidebar_animation()
+            self._set_sidebar_visible_width(
+                self.sidebar_width if self.sidebar_open else 0, commit=True
+            )
 
         # Clear any ongoing animation jobs and particles
         if self._sparkle_anim_id:
@@ -4810,7 +5972,7 @@ try {{
         row.pack(fill=tk.X, pady=(0, 8))
 
         tk.Label(row, text=label_text, font=("Segoe UI", 10, "bold"), bg=BG_PANEL, fg=TEXT_PRIMARY, width=20, anchor="w").pack(side=tk.LEFT)
-        hk_field = OBSHotkeyField(row, action_key, self.hotkeys[action_key]["name"], self)
+        hk_field = SequentHotkeyField(row, action_key, self.hotkeys[action_key]["name"], self)
         hk_field.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def refresh_preset_menu(self, selected=None):
@@ -4962,131 +6124,543 @@ try {{
         self.update_scrubber_ui()
         self.queue_viewer.redraw_breakpoints()
     
+    def _place_settings_page(self):
+        """Place the Settings form at rest; never move it per animation frame.
+
+        The scrollable canvas has many embedded Tk windows. Repositioning and
+        resizing them 18 times during a tab transition caused corrupted draws
+        on some Windows/Tk configurations.
+        """
+        left = int(self._sidebar_visible_width) + 13
+        self.frame_settings.place(
+            x=left, y=76,
+            relwidth=1.0, width=-(left + 13),
+            relheight=1.0, height=-89
+        )
+
+    def _capture_settings_snapshot(self):
+        """Capture the *visible* Settings panel as one Tk PhotoImage.
+
+        Windows uses native GDI and Python's built-in Tk PhotoImage; no extra
+        packages are needed. On non-Windows development machines, Pillow is
+        an optional preview/test fallback. If capture fails, callers skip the
+        animation rather than animate an unrelated grey rectangle.
+        """
+        form = self.frame_settings
+        if not form.winfo_ismapped():
+            return None
+        self.root.update_idletasks()
+        width, height = form.winfo_width(), form.winfo_height()
+        if width < 2 or height < 2:
+            return None
+        sx, sy = form.winfo_rootx(), form.winfo_rooty()
+
+        if os.name != "nt":
+            try:
+                from PIL import ImageGrab, ImageTk
+                return ImageTk.PhotoImage(
+                    ImageGrab.grab(bbox=(sx, sy, sx + width, sy + height))
+                )
+            except (ImportError, OSError, RuntimeError):
+                return None
+
+        import ctypes.wintypes as wt
+        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        # Set handle/pointer types explicitly for 64-bit Python.
+        user32.GetDC.argtypes = [wt.HWND]
+        user32.GetDC.restype = wt.HDC
+        user32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+        gdi32.CreateCompatibleDC.argtypes = [wt.HDC]
+        gdi32.CreateCompatibleDC.restype = wt.HDC
+        gdi32.CreateCompatibleBitmap.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int]
+        gdi32.CreateCompatibleBitmap.restype = wt.HBITMAP
+        gdi32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
+        gdi32.SelectObject.restype = wt.HGDIOBJ
+        gdi32.DeleteObject.argtypes = [wt.HGDIOBJ]
+        gdi32.DeleteDC.argtypes = [wt.HDC]
+        gdi32.BitBlt.argtypes = [
+            wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wt.HDC, ctypes.c_int, ctypes.c_int, wt.DWORD
+        ]
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ("biSize", wt.DWORD), ("biWidth", ctypes.c_int32),
+                ("biHeight", ctypes.c_int32), ("biPlanes", wt.WORD),
+                ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+                ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", ctypes.c_int32),
+                ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", wt.DWORD),
+                ("biClrImportant", wt.DWORD)
+            ]
+
+        screen_dc = memory_dc = bitmap = old_bitmap = None
+        try:
+            screen_dc = user32.GetDC(None)
+            if not screen_dc:
+                return None
+            memory_dc = gdi32.CreateCompatibleDC(screen_dc)
+            if not memory_dc:
+                return None
+            bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+            if not bitmap:
+                return None
+            old_bitmap = gdi32.SelectObject(memory_dc, bitmap)
+            if not gdi32.BitBlt(memory_dc, 0, 0, width, height,
+                                screen_dc, sx, sy, 0x00CC0020):
+                return None
+            stride = ((width * 3 + 3) // 4) * 4
+            count = stride * height
+            pixels = ctypes.create_string_buffer(count)
+            header = BITMAPINFOHEADER()
+            header.biSize = ctypes.sizeof(header)
+            header.biWidth = width
+            header.biHeight = -height   # top-down scan lines
+            header.biPlanes = 1
+            header.biBitCount = 24
+            header.biSizeImage = count
+            # GetDIBits requires the bitmap NOT to be selected into a DC.
+            if old_bitmap:
+                gdi32.SelectObject(memory_dc, old_bitmap)
+                old_bitmap = None
+            gdi32.GetDIBits.argtypes = [
+                wt.HDC, wt.HBITMAP, wt.UINT, wt.UINT, ctypes.c_void_p,
+                ctypes.c_void_p, wt.UINT
+            ]
+            gdi32.GetDIBits.restype = ctypes.c_int
+            if gdi32.GetDIBits(memory_dc, bitmap, 0, height, pixels,
+                                ctypes.byref(header), 0) != height:
+                return None
+            bgr = b"".join(pixels.raw[i:i + width * 3]
+                           for i in range(0, count, stride))
+            rgb = bytearray(width * height * 3)
+            rgb[0::3] = bgr[2::3]
+            rgb[1::3] = bgr[1::3]
+            rgb[2::3] = bgr[0::3]
+            return tk.PhotoImage(
+                data=f"P6\n{width} {height}\n255\n".encode("ascii") + rgb,
+                format="PPM"
+            )
+        except (OSError, ValueError, tk.TclError):
+            return None
+        finally:
+            if old_bitmap and memory_dc:
+                gdi32.SelectObject(memory_dc, old_bitmap)
+            if bitmap:
+                gdi32.DeleteObject(bitmap)
+            if memory_dc:
+                gdi32.DeleteDC(memory_dc)
+            if screen_dc:
+                user32.ReleaseDC(None, screen_dc)
+
+    def _settings_snapshot_size(self):
+        """Expected Settings size in the current workspace (screen coordinates)."""
+        left = int(self._sidebar_visible_width) + 13
+        return (max(1, self.workspace.winfo_width() - left - 13),
+                max(1, self.workspace.winfo_height() - 89))
+
+    def _prepare_settings_motion(self):
+        """Animate a static copy of Settings, without moving its native widgets.
+
+        Prefer an already-painted snapshot. Capturing newly shown widgets every
+        time caused the incoming Settings page to flash at its final position
+        before its bounce-in animation had even started.
+        """
+        expected_width, expected_height = self._settings_snapshot_size()
+        shot = getattr(self, "_settings_cached_image", None)
+        if shot is not None and (shot.width(), shot.height()) != (expected_width, expected_height):
+            shot = None
+
+        if shot is None:
+            if not self.frame_settings.winfo_ismapped():
+                # First visit only: Settings has never been painted. We need
+                # an initial real rendering to obtain a faithful snapshot.
+                self._place_settings_page()
+                self.frame_settings.lift()
+                # This call is only for the first ever capture (or after a
+                # window-size change). Later visits use the cached image.
+                self.root.update()
+            shot = self._capture_settings_snapshot()
+            if shot is None:
+                return False
+            self._settings_cached_image = shot
+
+        self._settings_motion_image = shot
+        self._settings_motion_view.delete("all")
+        self._settings_motion_view.config(width=shot.width(), height=shot.height())
+        self._settings_motion_view.create_image(0, 0, anchor="nw", image=shot)
+        # Hide the actual controls BEFORE the first animation frame.
+        self.frame_settings.place_forget()
+        self._settings_motion_active = True
+        return True
+
+    def _position_settings_motion(self, offset):
+        """Slide the entire frozen form as one composited panel."""
+        if not self._settings_motion_active:
+            return
+        left = int(self._sidebar_visible_width) + 13
+        self._settings_motion_view.place(
+            x=left + int(offset), y=76,
+            width=self._settings_motion_image.width(),
+            height=self._settings_motion_image.height()
+        )
+        tk.Misc.tkraise(self._settings_motion_view)
+
+    def _clear_settings_motion(self):
+        self._settings_motion_view.place_forget()
+        self._settings_motion_view.delete("all")
+        self._settings_motion_image = None
+        self._settings_motion_active = False
+
+    def _show_docks_for_tab(self, tab_name):
+        """Stage a page's actual docks without hiding another page's docks.
+
+        Tab animations must move the independent dock containers, not just
+        frame_playback / frame_sequencer (which no longer own those docks).
+        """
+        if tab_name == "playback":
+            self._place_action_queue(self._sidebar_visible_width, resize_content=True)
+            self._place_controls_dock()
+        elif tab_name == "sequencer":
+            self._place_sequencer_timeline(self._sidebar_visible_width, resize_content=True)
+            self._place_stage_builder_dock()
+
+    def _offset_tab_docks(self, tab_name, offset):
+        """Slide a docked page without resizing any of its child widgets.
+
+        The stationary, right-anchored positions are restored by
+        _sync_controls_dock_visibility() at the end of the transition.
+        """
+        offset = int(offset)
+        left = self._sidebar_visible_width + 13 + offset
+        if tab_name == "playback":
+            if self.queue_viewport.winfo_manager() == "place":
+                self.queue_viewport.place_configure(x=left)
+            if self.control_dock.winfo_manager() == "place":
+                self.control_dock.place_configure(x=-13 + offset)
+        elif tab_name == "sequencer":
+            if self.seq_timeline_viewport.winfo_manager() == "place":
+                self.seq_timeline_viewport.place_configure(x=left)
+            if self.stage_builder_dock.winfo_manager() == "place":
+                self.stage_builder_dock.place_configure(x=-13 + offset)
+
+    def _settle_tab_transition(self):
+        """Finish/interupt animation and leave exactly one page visible."""
+        job = getattr(self, "_tab_anim_id", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._tab_anim_id = None
+        self._tab_anim_phase = None
+        if hasattr(self, "_settings_motion_view"):
+            self._clear_settings_motion()
+        current = self.current_tab_name
+        if current in ("playback", "sequencer", "settings"):
+            self._set_tab_heading(current)
+        for name, frame in (
+            ("playback", self.frame_playback),
+            ("sequencer", self.frame_sequencer),
+            ("settings", self.frame_settings),
+        ):
+            if name != current:
+                frame.place_forget()
+            elif name == "settings":
+                self._place_settings_page()
+            else:
+                frame.place(x=0, y=0, relwidth=1, relheight=1)
+
+        self._sync_controls_dock_visibility()
+        if current == "settings":
+            # Settings must appear above the dock siblings, not behind them.
+            self.frame_settings.lift()
+        else:
+            self.frame_playback.tkraise() if current == "playback" else self.frame_sequencer.tkraise()
+        if hasattr(self, "sidebar_host") and self.sidebar_host.winfo_exists():
+            self.sidebar_host.lift()
+
+    def _set_tab_heading(self, tab_name):
+        headings = {
+            "playback": ("Playback", "Record, edit and execute actions"),
+            "sequencer": ("Sequencer", "Arrange presets into repeatable pipelines"),
+            "settings": ("Settings", "Customize your automation workspace"),
+        }
+        title, subtitle = headings[tab_name]
+        self.workspace_heading.config(text=title)
+        self.workspace_subtitle.config(text=subtitle)
+
     def show_tab(self, tab_name, animate=True):
+        guide = getattr(self, "_walkthrough", None)
+        if guide is not None and not guide._closed and not guide._navigate:
+            guide.close(restore=False)
         self.root.focus_set()
-        if hasattr(self, 'active_hotkey_field') and self.active_hotkey_field:
+        if hasattr(self, "active_hotkey_field") and self.active_hotkey_field:
             self.active_hotkey_field.focus_out()
         self.is_binding = False
 
-        # Retract sidebar smoothly
-        self.close_sidebar()
+        headings = {
+            "playback": ("Playback", "Record, edit and execute actions"),
+            "sequencer": ("Sequencer", "Arrange presets into repeatable pipelines"),
+            "settings": ("Settings", "Customize your automation workspace"),
+        }
+        if tab_name not in headings:
+            return
 
+        old_tab = getattr(self, "current_tab_name", None)
+        if old_tab == tab_name:
+            return
+
+        # If navigation is clicked rapidly, finish the previous transition
+        # first, so no widgets are stranded at an intermediate x-offset.
+        interrupted = (getattr(self, "_tab_anim_id", None) is not None
+                       or getattr(self, "_tab_anim_phase", None) is not None)
+        if interrupted:
+            self._settle_tab_transition()
+
+        # Settings is already fully painted while active. Snapshot it BEFORE
+        # switching pages, instead of flashing the live form during next entry.
+        if (old_tab == "settings" and not interrupted
+                and self.frame_settings.winfo_ismapped()):
+            # A just-settled transition may not have painted the form yet.
+            # Keep its previously valid cached image in that case.
+            self._settings_cached_image = self._capture_settings_snapshot()
+
+        # Keep the outgoing page title until its exit animation has finished.
+        # We update the heading when the new page actually begins entering.
         self.btn_tab_playback.set_active(tab_name == "playback")
         self.btn_tab_sequencer.set_active(tab_name == "sequencer")
         self.btn_tab_settings.set_active(tab_name == "settings")
-
         if tab_name == "sequencer":
             self.refresh_sequencer_preset_dropdown()
 
-        if getattr(self, 'current_tab_name', None) == tab_name:
-            return
-
-        old_tab = getattr(self, 'current_tab_name', None)
         self.current_tab_name = tab_name
-
         tab_frames = {
             "playback": self.frame_playback,
             "sequencer": self.frame_sequencer,
-            "settings": self.frame_settings
+            "settings": self.frame_settings,
         }
 
-        # Keep overlay and sidebar elevated without canvas method conflict
-        if hasattr(self, 'overlay') and self.overlay.winfo_exists() and self.overlay.winfo_ismapped():
-            tk.Misc.tkraise(self.overlay)
-        if hasattr(self, 'sidebar_frame') and self.sidebar_frame.winfo_exists():
-            self.sidebar_frame.lift()
-
-        if not animate or not getattr(self, 'entertain_me', True) or old_tab is None or old_tab not in tab_frames:
-            for name, frame in tab_frames.items():
-                if name == tab_name:
-                    frame.place(x=0, y=0, relwidth=1, relheight=1)
-                    frame.tkraise()
-                else:
-                    frame.place_forget()
+        if not animate or not self.entertain_me or old_tab not in tab_frames:
+            self._set_tab_heading(tab_name)
+            self._settle_tab_transition()
             return
 
-        if getattr(self, '_tab_anim_id', None):
-            try: self.root.after_cancel(self._tab_anim_id)
-            except Exception: pass
-            self._tab_anim_id = None
-
-        outgoing_frame = tab_frames[old_tab]
-        incoming_frame = tab_frames[tab_name]
-
-        tab_order = {"playback": 0, "sequencer": 1, "settings": 2}
-        direction = 1 if tab_order.get(tab_name, 0) > tab_order.get(old_tab, 0) else -1
-
+        # The exit and entrance are TWO animations, deliberately not a crossfade.
+        # Playback/Sequencer each move two docks; Settings moves one cohesive
+        # panel. Phase 2 only begins after Phase 1 has fully finished.
         for name, frame in tab_frames.items():
-            if name != old_tab and name != tab_name:
+            if name not in (old_tab, tab_name):
                 frame.place_forget()
+        order = {"playback": 0, "sequencer": 1, "settings": 2}
+        direction = 1 if order[tab_name] > order[old_tab] else -1
+        self._tab_transition_from = old_tab
+        self._tab_transition_to = tab_name
+        self._tab_transition_direction = direction
+        self._start_tab_animation_phase("out")
 
-        self.animate_tab_transition(outgoing_frame, incoming_frame, direction)
+    def _hide_tab_visual(self, tab_name):
+        """Hide only the page that just completed its exit animation."""
+        if tab_name == "playback":
+            self.queue_viewport.place_forget()
+            self.control_dock.place_forget()
+            self.frame_playback.place_forget()
+        elif tab_name == "sequencer":
+            self.seq_timeline_viewport.place_forget()
+            self.stage_builder_dock.place_forget()
+            self.frame_sequencer.place_forget()
+        elif tab_name == "settings":
+            self._clear_settings_motion()
+            self.frame_settings.place_forget()
 
+    def _start_tab_animation_phase(self, phase):
+        """Stage one real page at a time: exit first, then enter."""
+        if not self.root.winfo_exists():
+            return
+        tab = (self._tab_transition_from if phase == "out"
+               else self._tab_transition_to)
+        if phase == "in":
+            self._set_tab_heading(tab)
+        self._tab_anim_phase = phase
+        self._tab_anim_id = None
 
-    def animate_tab_transition(self, outgoing_frame, incoming_frame, direction, step=0, total_steps=18):
-        def _back_out(t, s=1.5):
-            t -= 1.0
-            return t * t * ((s + 1.0) * t + s) + 1.0
+        if tab == "settings":
+            # Settings contains a scrollable native-widget form. Capture its
+            # visible controls once so the whole form can bounce as one panel
+            # without forcing Tk to redraw each embedded window per frame.
+            if not self._prepare_settings_motion():
+                if phase == "out":
+                    self._hide_tab_visual("settings")
+                    self._start_tab_animation_phase("in")
+                else:
+                    self._settle_tab_transition()
+                return
+        else:
+            self._show_docks_for_tab(tab)
+            frame = (self.frame_playback if tab == "playback"
+                     else self.frame_sequencer)
+            frame.place(x=0, y=0, relwidth=1, relheight=1)
 
-        def _ease_out_quad(t):
-            return 1.0 - (1.0 - t) * (1.0 - t)
+        self.animate_tab_transition(phase, step=0)
 
-        dpi = getattr(self, 'dpi_scale', 1.0)
-        start_distance = int(220 * dpi) * direction
-        exit_distance = int(120 * dpi) * direction
+    def animate_tab_transition(self, phase, step=0, total_steps=18):
+        """Bounce OUT the previous page, then bounce IN the selected page.
 
-        t = min(1.0, step / total_steps)
-        in_offset = int((1.0 - _back_out(t, s=1.5)) * start_distance)
-        out_offset = int(-_ease_out_quad(t) * exit_distance)
+        No entering docks appear until the exiting docks are fully hidden.
+        This ensures Settings is one animated panel; the other pages animate
+        their two docks together, all with consistent timing and easing.
+        """
+        if not self.root.winfo_exists():
+            return
+        tab = (self._tab_transition_from if phase == "out"
+               else self._tab_transition_to)
+        direction = self._tab_transition_direction
+        dpi = getattr(self, "dpi_scale", 1.0)
+        progress = min(1.0, step / total_steps)
 
-        outgoing_frame.place(x=out_offset, y=0, relwidth=1, relheight=1)
-        incoming_frame.place(x=in_offset, y=0, relwidth=1, relheight=1)
-        incoming_frame.tkraise()
+        def back_in(t, s=1.5):
+            return t * t * ((s + 1.0) * t - s)
 
-        # Lift overlay and sidebar using clean hierarchy calls
-        if hasattr(self, 'overlay') and self.overlay.winfo_exists() and self.overlay.winfo_ismapped():
+        def back_out(t, s=1.5):
+            u = t - 1.0
+            return u * u * ((s + 1.0) * u + s) + 1.0
+
+        if phase == "out":
+            # Exiting dock(s) retract with a small anticipation/bounce.
+            offset = round(-direction * 120 * dpi * back_in(progress))
+        else:
+            # Incoming dock(s) overshoot their target, then spring into place.
+            offset = round(direction * 220 * dpi * (1.0 - back_out(progress)))
+
+        if tab == "settings":
+            self._position_settings_motion(offset)
+        else:
+            self._offset_tab_docks(tab, offset)
+
+        if (hasattr(self, "overlay") and self.overlay.winfo_exists()
+                and self.overlay.winfo_ismapped()):
             tk.Misc.tkraise(self.overlay)
-        if hasattr(self, 'sidebar_frame') and self.sidebar_frame.winfo_exists():
-            self.sidebar_frame.lift()
+        if hasattr(self, "sidebar_host") and self.sidebar_host.winfo_exists():
+            self.sidebar_host.lift()
 
         if step < total_steps:
             self._tab_anim_id = self.root.after(
-                14, lambda: self.animate_tab_transition(outgoing_frame, incoming_frame, direction, step + 1, total_steps)
+                14, lambda: self.animate_tab_transition(
+                    phase, step + 1, total_steps
+                )
             )
+            return
+
+        self._tab_anim_id = None
+        if phase == "out":
+            self._hide_tab_visual(tab)
+            self._start_tab_animation_phase("in")
         else:
-            self._tab_anim_id = None
-            outgoing_frame.place_forget()
-            incoming_frame.place(x=0, y=0, relwidth=1, relheight=1)
+            self._settle_tab_transition()
 
+    def _position_mini_hud_button(self, event=None):
+        """Keep Mini HUD fixed beside the expanded sidebar boundary."""
+        button = getattr(self, "mini_hud_button", None)
+        brand = getattr(self, "_topbar_brand", None)
+        if not button or not button.winfo_exists() or not brand or not brand.winfo_exists():
+            return
+        brand_right = brand.winfo_x() + brand.winfo_width()
+        # Use the sidebar's full width, not its animated visible width.
+        x = max(brand_right + 8, self.sidebar_width + 12)
+        if button.winfo_x() != x:
+            button.place_configure(x=x)
 
-    def toggle_sidebar(self):
-        if self.sidebar_open: self.close_sidebar()
-        else: self.open_sidebar()
+    def _cancel_sidebar_animation(self):
+        """Cancel a pending frame before reversing or rebuilding navigation."""
+        job = getattr(self, "_sidebar_anim_id", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._sidebar_anim_id = None
 
-    def open_sidebar(self):
-        if not self.sidebar_open:
-            self.sidebar_open = True
-            if getattr(self, '_sidebar_anim_id', None):
-                try: self.root.after_cancel(self._sidebar_anim_id)
-                except Exception: pass
+    def _set_sidebar_visible_width(self, visible_width, commit=False):
+        """Slide navigation and the Queue viewport without per-frame reflow.
+
+        The Queue's visible left border follows the sidebar continuously.
+        Controls and the Queue's right edge stay fixed on screen.
+        """
+        if not self.sidebar_host.winfo_exists():
+            return
+        width = max(0, min(self.sidebar_width, round(visible_width)))
+        self._sidebar_visible_width = width
+        self.sidebar_host.place(
+            x=width - self.sidebar_width, y=0,
+            width=self.sidebar_width + 1, relheight=1
+        )
+        # The heading and non-Playback pages still travel with navigation.
+        # Keep their widths stable until the transition commits.
+        if commit:
+            self._sidebar_committed_width = width
+        self.workspace_main.place_configure(
+            x=width, width=-self._sidebar_committed_width
+        )
+        if getattr(self, 'current_tab_name', None) == 'playback':
+            # Keep queue border, toolbar, and editor moving as one.
+            self._place_action_queue(width, resize_content=True)
+        elif getattr(self, 'current_tab_name', None) == 'sequencer':
+            # The Stage Builder stays pinned; the timeline's left edge follows
+            # the sidebar, including its header, filebar, and stage list.
+            self._place_sequencer_timeline(width, resize_content=True)
+        elif getattr(self, 'current_tab_name', None) == 'settings':
+            # Do not drag/rescale the entire Settings Canvas every 20ms.
+            # Allow the sidebar to pass over the stationary form; commit the
+            # final Settings layout once when the animation has finished.
+            if commit and hasattr(self, 'frame_settings') and self.frame_settings.winfo_exists():
+                self._place_settings_page()
+        if commit:
+            self._queue_animation_active = False
+        self.sidebar_host.lift()
+
+    def _set_sidebar_open(self, opened):
+        """Animate only with Entertain Me enabled; support rapid reversals."""
+        opened = bool(opened)
+        self._cancel_sidebar_animation()
+        if getattr(self, "_tab_anim_id", None) is not None:
+            self._settle_tab_transition()
+        self.sidebar_open = opened
+        target_width = self.sidebar_width if opened else 0
+
+        if not self.entertain_me or self._sidebar_visible_width == target_width:
+            self._set_sidebar_visible_width(target_width, commit=True)
+            return
+
+        # Animate only the active page's primary dock (Action Queue or
+        # Macro Chain timeline); its right-hand inspector stays anchored.
+        self._prepare_queue_for_transition()
+
+        start_width = self._sidebar_visible_width
+        started = time.perf_counter()
+        duration = 0.22
+
+        def tick():
+            if not self.sidebar_host.winfo_exists():
+                self._sidebar_anim_id = None
+                return
+            progress = min(1.0, (time.perf_counter() - started) / duration)
+            eased = 1.0 - (1.0 - progress) ** 3  # ease out cubic
+            self._set_sidebar_visible_width(
+                start_width + (target_width - start_width) * eased
+            )
+            if progress < 1.0:
+                self._sidebar_anim_id = self.root.after(20, tick)
+            else:
+                self._set_sidebar_visible_width(target_width, commit=True)
                 self._sidebar_anim_id = None
 
-            if getattr(self, 'entertain_me', True):
-                self.generate_blur_overlay()
-            else:
-                self.overlay.delete("all")
-                self.overlay.create_rectangle(0, 0, 3000, 3000, fill="#1e1f22")
+        tick()
 
-            # Place the overlay across the window and place the sidebar above it
-            self.overlay.place(x=0, y=0, relwidth=1, relheight=1)
-            self.sidebar_frame.place(x=self.current_sidebar_x, y=0, width=self.sidebar_width, relheight=1)
-            
-            # Use tk.Misc.tkraise to elevate the canvas without triggering Canvas.tag_raise
-            tk.Misc.tkraise(self.overlay)
-            self.sidebar_frame.lift()
-            
-            self.animate_sidebar(0)
-    
+    def toggle_sidebar(self):
+        self._set_sidebar_open(not self.sidebar_open)
+
+    def open_sidebar(self):
+        self._set_sidebar_open(True)
+
     def generate_blur_overlay(self):
         h_screen_dc = None
         h_dc_small = None
@@ -5215,52 +6789,8 @@ try {{
 
                 
     def close_sidebar(self):
-        if self.sidebar_open:
-            self.sidebar_open = False
-            if getattr(self, '_sidebar_anim_id', None):
-                try: self.root.after_cancel(self._sidebar_anim_id)
-                except Exception: pass
-                self._sidebar_anim_id = None
-            self.animate_sidebar(-self.sidebar_width)
+        self._set_sidebar_open(False)
 
-
-    def animate_sidebar(self, target_x):
-        if not getattr(self, 'entertain_me', True):
-            self.current_sidebar_x = target_x
-            self.sidebar_frame.place(x=self.current_sidebar_x, y=0, width=self.sidebar_width, relheight=1)
-            self.sidebar_frame.lift()
-            if target_x < 0:
-                self.overlay.place_forget()
-                self.sidebar_frame.place_forget()
-                self.overlay.delete("all")
-                self.blur_image = None
-            return
-
-        diff = target_x - self.current_sidebar_x
-
-        if abs(diff) <= 2:
-            self.current_sidebar_x = target_x
-            self.sidebar_frame.place(x=self.current_sidebar_x, y=0, width=self.sidebar_width, relheight=1)
-            self.sidebar_frame.lift()
-            if target_x < 0:
-                self.overlay.place_forget()
-                self.sidebar_frame.place_forget()
-                self.overlay.delete("all")
-                self.blur_image = None
-            self._sidebar_anim_id = None
-            return
-
-        step = int(diff * 0.34)
-        if step == 0:
-            step = 1 if diff > 0 else -1
-
-        self.current_sidebar_x += step
-        self.sidebar_frame.place(x=self.current_sidebar_x, y=0, width=self.sidebar_width, relheight=1)
-        self.sidebar_frame.lift()
-
-        self._sidebar_anim_id = self.root.after(12, lambda: self.animate_sidebar(target_x))        
-
-    
     def on_hotkey_change(self, action_key, vk, mod_vks, name):
         self.hotkeys[action_key] = {"vk": vk, "mod_vks": mod_vks, "name": name}
         self.update_main_buttons()
@@ -5790,7 +7320,7 @@ try {{
             card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
             # Header bar with drag handles
-            head = tk.Frame(card, bg=BG_HEADER, height=28, cursor="fleur")
+            head = tk.Frame(card, bg=BG_HEADER, height=40, cursor="fleur")
             head.pack(fill=tk.X)
 
             drag_icon = tk.Label(head, text=" ⠇ ", font=("Segoe UI", 9), bg=BG_HEADER, fg=TEXT_MUTED, cursor="fleur")
@@ -5911,7 +7441,7 @@ try {{
             card = tk.Frame(dlg, bg=BG_PANEL)
             card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
-            head = tk.Frame(card, bg=BG_HEADER, height=28, cursor="fleur")
+            head = tk.Frame(card, bg=BG_HEADER, height=40, cursor="fleur")
             head.pack(fill=tk.X)
 
             drag_icon = tk.Label(head, text=" ⠇ ", font=("Segoe UI", 9), bg=BG_HEADER, fg=TEXT_MUTED, cursor="fleur")
@@ -5998,6 +7528,7 @@ try {{
         time.sleep(0.3) 
 
         held_modifiers = set()
+        failure_reason = ""
         max_loops = float('inf') if self.loop_mode == "∞ Loop" else int(self.loop_mode.replace("x", ""))
         current_loop = 0
 
@@ -6165,6 +7696,18 @@ try {{
                         step_ptr += 1
                         continue
 
+                    # --- Wait for Text ---
+                    if act_type == "wait_text":
+                        matched = self.wait_for_screen_text(action)
+                        if not self.playing:
+                            break
+                        if not matched:
+                            raise MacroExecutionError(f"Wait Text timed out at step {step_ptr + 1}")
+                        if self.audio_cues:
+                            play_cue("match")
+                        step_ptr += 1
+                        continue
+
                     # --- Wait Pixel Condition ---
                     if act_type == "wait_pixel":
                         tx, ty = action.get("x", 0), action.get("y", 0)
@@ -6186,10 +7729,12 @@ try {{
                             if time.time() - start_wait >= timeout_sec: break
                             time.sleep(0.01)
 
-                        if matched and self.audio_cues: play_cue("match")
-                        if not matched and self.playing:
-                            if self.audio_cues: play_cue("error")
-                            self.root.after(0, lambda: self.update_status(f"Pixel timeout ({expected_color})", COLOR_DANGER))
+                        if not self.playing:
+                            break
+                        if not matched:
+                            raise MacroExecutionError(f"Pixel timeout at step {step_ptr + 1}")
+                        if self.audio_cues:
+                            play_cue("match")
 
                         step_ptr += 1
                         continue
@@ -6355,25 +7900,38 @@ try {{
 
                     step_ptr += 1
 
-        except Exception as e:
-            if self.audio_cues: play_cue("error")
-            self.root.after(0, self.update_status, f"Error: {e}", COLOR_DANGER)
+        except Exception as error:
+            failure_reason = (str(error) if isinstance(error, MacroExecutionError)
+                              else f"Unexpected {type(error).__name__}")
+            self.playing = False
+            if self.audio_cues:
+                play_cue("error")
         finally:
             for m in list(held_modifiers):
                 m_scan = ctypes.windll.user32.MapVirtualKeyW(m, 0)
                 ctypes.windll.user32.keybd_event(m, m_scan, KEYEVENTF_KEYUP, 0)
             if not self.switching_preset:
-                self.root.after(0, self.finish_macro)
+                outcome = ("failed" if failure_reason else
+                           "cancelled" if not self.playing else "completed")
+                self.root.after(0, self.finish_macro, outcome, failure_reason)
 
 
-    def finish_macro(self):
+    def finish_macro(self, outcome="completed", reason=""):
         self.playback_run_id = time.time()
         self._playback_ui_pending = False
         self.playing = False
         self.is_paused = False
-        self.update_status("Finished", COLOR_SUCCESS)
-        if self.audio_cues: play_cue("stop")
-        self.lbl_active_action.config(text="// Execution complete", fg=SYNTAX_GREEN)
+        if outcome == "failed":
+            self.update_status(f"Failed: {reason}", COLOR_DANGER)
+            self.lbl_active_action.config(text="// Execution failed", fg=COLOR_DANGER)
+        elif outcome == "cancelled":
+            self.update_status("Cancelled", SYNTAX_ORANGE)
+            self.lbl_active_action.config(text="// Execution cancelled", fg=SYNTAX_ORANGE)
+        else:
+            self.update_status("Completed", COLOR_SUCCESS)
+            self.lbl_active_action.config(text="// Execution complete", fg=SYNTAX_GREEN)
+            if self.audio_cues:
+                play_cue("stop")
 
         if hasattr(self, 'ghost_reticle'):
             self.ghost_reticle.hide()
