@@ -1,95 +1,72 @@
 # Sequent
 
-**A Windows macro recorder, visual debugger, and automation workflow engine built with Python and native Windows APIs.**
+**A visual desktop automation IDE for Windows — record, edit, debug, and replay workflows.**
 
-Sequent helps turn repetitive desktop work into editable, repeatable workflows. Record keyboard and mouse actions, inspect the resulting action queue, add conditions and visual checks, then replay a macro or combine saved macros into multi-stage sequences.
+Sequent combines a macro recorder, an editable action queue, screen recognition, conditional logic, and a visual debugger in one Python application. Start by recording a repetitive task, then refine it with variables, waits, branching, and position-aware actions instead of relying on a fixed sequence of clicks.
 
-Designed for people who want more control than a basic click recorder—without having to write an automation script from scratch.
+Built with Python's standard library and native Windows APIs. **No third-party Python packages are required.** An **optional experimental C DLL** is available for fully borderless, natively resizable windows.
 
-> **Project status:** Sequent is under active development. Some features described here are from the latest development build and may not yet be present in the version published on GitHub. Test automations with harmless data before relying on them for important work.
+> **Development status:** Sequent is actively developed and should be treated as experimental, especially its new native window chrome and screen-based targeting. The features below describe the current development source (v6.6); the public repository may lag until the corresponding code is committed. Test workflows in a safe application before using them with important data.
 
 ## Contents
 
-- [Features](#features)
+- [Highlights](#highlights)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
-- [Workspace guide](#workspace-guide)
-- [Action reference](#action-reference)
+- [Find Color & Click](#find-color--click)
+- [Workspace and debugger](#workspace-and-debugger)
+- [Actions and automation logic](#actions-and-automation-logic)
 - [Presets and macro chains](#presets-and-macro-chains)
+- [Appearance and window management](#appearance-and-window-management)
 - [Hotkeys](#hotkeys)
-- [Settings and customization](#settings-and-customization)
 - [Troubleshooting and limitations](#troubleshooting-and-limitations)
 - [Contributing and license](#contributing-and-license)
 
-## Features
+## Highlights
 
-### Recording and playback
+### Record and replay
 
-- **Windows-native input handling:** Captures keyboard events, mouse clicks, drags, and scroll-wheel input using Win32 APIs and low-level hooks.
-- **Live action queue:** Watch recorded actions appear in order, then edit or remove them before playback.
-- **Window-relative coordinates:** Save client-area coordinates alongside window information to help macros adapt when an application window moves.
-- **Keyboard shortcuts:** Record modifier combinations, key presses, typing, and familiar editing commands.
-- **Playback controls:** Start, stop, pause, repeat, and change playback speed or timing behavior.
-- **Optional humanized motion:** Bézier-based cursor movement and timing variation for more natural-looking playback.
+- Capture keyboard input, shortcuts, clicks, movement, dragging, and wheel scrolling using Windows APIs and low-level hooks.
+- Watch events appear in the live Action Queue, then reorder your workflow by inserting, editing, or removing actions.
+- Replay with pause/stop controls, loops, adjustable speed, window-relative coordinates, and optional Bézier mouse movement or timing variation.
+- Use the compact Mini HUD when you want playback controls without the full workspace visible.
 
-### Visual Action Queue and debugger
+### Build visually
 
-- **Syntax-style action viewer:** Readable, color-coded action summaries and line numbers.
-- **Searchable Action Library:** Browse actions by category, find them by name, and configure them in a dedicated properties panel.
-- **Breakpoints:** Click the queue gutter to pause before a particular action.
-- **Playhead and step controls:** Navigate through the queue and execute individual steps while troubleshooting.
-- **Coordinate nudging:** Adjust a selected position by one pixel with `Alt + Arrow`, or five pixels with `Alt + Shift + Arrow`.
-- **Ghost reticles:** Preview click and movement positions on the desktop; multi-selection can display a trail of locations.
+- Browse a searchable, categorized **Action Library** with dedicated properties editors.
+- Use **breakpoints**, an execution playhead, step controls, and syntax-style line descriptions to debug actions.
+- Preview mouse positions with an on-screen **Ghost Reticle**, including multi-action trajectory previews.
+- Add OCR, pixel checks, variables, prompts, and control-flow actions to turn a recording into a more adaptive workflow.
+- Combine saved presets into repeatable, multi-stage **Macro Chains**.
 
-### Recognition, conditions, and variables
+### New in the latest development build
 
-- **Wait for Pixel:** Poll a screen coordinate for an expected hexadecimal color, with a configurable timeout.
-- **Wait for Text:** Use Windows OCR to wait until text **appears** or **disappears** in a chosen screen region; a failed check can stop playback.
-- **Search Selected Area:** Run OCR on a selected region and optionally branch to a preset when a match is found.
-- **Clipboard checks:** Detect keywords in copied text and store values in runtime variables.
-- **User input prompts:** Ask for a value while a macro runs.
-- **Variable typing:** Enter a stored value into the active application.
-- **Conditional flow:** Compare variables and jump to labels, switch presets, or launch another macro file.
-- **Labels and GOTO:** Create reusable checkpoints and conditional paths within a recorded sequence.
-
-> OCR uses the Windows OCR engine and is not infallible. Its timing depends on the screen capture and recognition process; a configured timeout may not be a strict wall-clock deadline.
-
-### Macro Chain Sequencer
-
-- Build a **Macro Chain** from existing saved presets.
-- Configure a loop count and post-stage delay for each stage.
-- Reorder or remove stages, then run the chain as a sequence.
-- Import and export chain configurations in `.chain.json` format.
-
-### Interface and onboarding
-
-- **Three workspaces:** Playback, Sequencer, and Settings, accessed from a collapsible navigation sidebar.
-- **Docked panels:** A large Action Queue beside pinned Controls; a Macro Chain timeline beside a pinned Stage Builder.
-- **Custom borderless window:** Sequent-styled window controls and resize grips.
-- **Entertain Me:** Optional animated sidebar, panel, and workspace transitions; turn it off for immediate navigation.
-- **Dark and light themes:** Switch themes in Settings. Recent development builds coalesce rapid theme-toggle requests to reduce repeated UI rebuilds.
-- **Guided Tour:** A 12-step, non-destructive walkthrough that highlights real controls, including Import, saved presets, Mini HUD, recording, debugging, and chain building. Start it from the sidebar or Help & Onboarding in Settings.
-- **Mini HUD:** Compact floating status and playback controls, including Pause, Stop, and Expand, while the main workspace is hidden.
-- **Audio feedback:** Built-in Classic, Subtle, and Sci-Fi cues plus configurable custom WAV sounds.
-- **Configurable global hotkeys:** Change the default recording and playback hotkeys in Settings.
+| Area | Improvements |
+| --- | --- |
+| Color targeting | Connected-color-region detection, adjustable RGB tolerance, selectable anchors, and relative click offsets |
+| Visual editor | Draggable Ghost Reticle that can sit **inside or outside** the detected bounds, keyboard nudging, and live detection feedback |
+| Action editing | Double-click **Find Color & Click** to redefine search bounds, resample color, and preserve saved targeting options |
+| Click reliability | Shared targeting calculations across playback paths, cursor-settle checks, and checked `SendInput` click events |
+| Appearance | **Dark / Light / Match System** themes, saved accent colors, custom color picker with hue, saturation/brightness, HEX/RGB input, and presets |
+| Window chrome | Custom headers and live Windows-managed resizing; optional experimental native borderless DLL with safe fallback modes |
+| Stability | 64-bit GDI handle signatures, shared `POINT` type for cursor polling, and cleaner terminal interrupt handling |
 
 ## Requirements
 
 | Requirement | Details |
 | --- | --- |
-| OS | Windows 10 or Windows 11 |
-| Python | Python 3.8 or later; compatibility can vary by Python/Tk version |
-| Libraries | Python standard library, including `ctypes`, `tkinter`, `json`, `threading`, `subprocess`, and `winsound` |
+| Operating system | Windows 10 or Windows 11 |
+| Python | Python 3.8+ with Tkinter; behavior can vary by Python/Tk and Windows version |
+| Python dependencies | Standard library only (`ctypes`, `tkinter`, `threading`, `json`, `winsound`, etc.) |
 | OCR | Windows OCR support and an installed OCR language pack |
+| Optional native borderless mode | 64-bit Windows/Python; MSVC C++ Build Tools and the Windows SDK to compile the included DLL |
 
-Sequent does not require third-party `pip` packages for its current Python implementation. OCR uses Windows' built-in `Windows.Media.Ocr` through a PowerShell/WinRT bridge.
-
-**Permissions:** Many desktop workflows can run without administrator rights, but Sequent cannot guarantee control over elevated windows, secured desktops, or applications that block simulated input. Follow your organization's automation and information-security policies.
+OCR uses Windows' `Windows.Media.Ocr` through a PowerShell/WinRT bridge. **Administrator privileges are not a blanket requirement**, but Windows input security prevents Sequent from controlling some elevated, protected, or security-sensitive interfaces.
 
 ## Installation
 
-1. Install Python for Windows and ensure **Tkinter** is available.
+1. Install Python for Windows with Tkinter support.
 2. Clone the repository:
 
    ```powershell
@@ -97,105 +74,128 @@ Sequent does not require third-party `pip` packages for its current Python imple
    cd SequentMacroEngine
    ```
 
-3. Launch Sequent:
+3. Launch:
 
    ```powershell
    py Sequent.py
    ```
 
-   Alternatively, run `python Sequent.py` if `python` is the configured command on your machine.
+   Or use `python Sequent.py` if that is your configured command.
 
-4. Open **Settings** to choose a preset directory, set hotkeys, and customize the interface.
+4. Open **Settings** to configure the appearance, preset paths, hotkeys, and playback preferences.
 
-No separate installation or build step is required when running the Python source.
+**No `pip install` step is needed** to run the Python application. The native window DLL described below is optional and is **not** included as a compiled binary in the v6.6 source bundle.
 
 ## Quick start
 
-### 1. Learn the interface
+### 1. Record a test macro
 
-Open the **sidebar → Guided Tour**. It points to the controls used throughout Sequent and does **not** record input, run macros, or alter your current preset.
+1. Open a harmless target such as Notepad.
+2. In **Playback**, click **Start Recording** or press `F7`.
+3. Type a short phrase or perform a small sequence of actions.
+4. Stop with `F8`.
+5. Inspect the Action Queue and edit any unwanted actions.
+6. Run with **Run Macro** or `F9`; stop with `F10`.
 
-### 2. Record a harmless macro
+> **Privacy:** A macro recorder can capture sensitive typing and clipboard contents. Avoid recording passwords, tokens, private messages, or confidential data. Review exported presets before sharing them.
 
-1. Open a safe test application such as Notepad.
-2. In Sequent's **Playback** workspace, click **Start Recording** or press `F7`.
-3. Perform a short sequence, such as typing a line in Notepad.
-4. Stop recording with `F8`.
-5. Review the actions in the **Action Queue** before playback.
-6. Click **Run Macro** or press `F9` to replay. Press `F10` to stop playback.
+### 2. Modify an action
 
-**Tip:** Avoid recording passwords, private messages, or confidential business information. Review a recorded macro before exporting or sharing it.
+- **Double-click** an action in the queue to open its editor.
+- Use the queue gutter, plus control, or right-click menu to insert actions from the Action Library.
+- Set breakpoints and use the playhead/step controls to check what the action actually does.
+- Save presets as JSON to reuse or chain later.
 
-### 3. Edit or add an action
+### 3. Add a smarter wait
 
-- **Double-click** an existing action to edit it.
-- **Right-click** a queue line or use the line gutter to open the **Action Library**.
-- Search or select an action category, configure its properties, and save it.
-- Use the playhead, breakpoints, and step controls to test individual actions.
+Instead of assuming a page finishes loading after a fixed delay, add **Wait for Text** or **Wait Pixel**, configure its expected result and search position, then test how it behaves when the application is slow or the result is missing.
 
-### 4. Wait for a visual result
+## Find Color & Click
 
-For an interface with unpredictable loading times, add a **Wait for Text** action:
+**Find Color & Click** uses a color on the desktop as a *visual reference point*. The mouse target is calculated relative to that reference—not restricted to the colored object itself.
 
-1. Set the text to look for (for example, `Complete`).
-2. Choose **Appears** or **Disappears**.
-3. Select the relevant screen region.
-4. Set a timeout and save the action.
+**Detection region** → **matching color component** → **bounding-box anchor** → **X/Y offsets** → **mouse destination**
 
-This is generally safer than assuming an application finishes after a fixed delay. Visual checks still require testing; OCR can miss text, and the target application can change its layout.
+### Configure a new color action
 
-### 5. Save or load a macro
+1. In the Action Queue, add **Find Color & Click** from **Screen & Recognition**.
+2. Choose **Define Search Box** and drag a search region on your desktop. You can also enter its `X`, `Y`, `Width`, and `Height` numerically.
+3. Click **Sample Color** or enter a `#RRGGBB` value, then choose the RGB tolerance.
+4. Select an anchor (Center by default, or another edge/corner anchor).
+5. Set **When found** to **Move Only**, **Single Click**, or **Double Click**.
+6. Choose **Save & Open Live Reticle Editor** to preview and refine the final cursor position.
 
-Use **Export** above the Action Queue to save the current actions as a `.json` file. Use **Import** to load a file, or select an existing preset from the toolbar's **Preset** menu.
+### Refine with the Ghost Reticle
 
-**Important:** Importing or selecting a preset **replaces the current queue**; export unfinished work first. Loading a preset does not execute it automatically.
+- A **search-area outline** shows where Sequent is looking.
+- A **match bounding box** shows the largest connected region matching your selected color, subject to tolerance.
+- The **Ghost Reticle** marks the actual cursor destination. **Drag it anywhere, including outside the match box**, to change the saved anchor-relative X/Y offsets.
+- While editing, use **Arrow keys** for 1-pixel nudges or **Shift + Arrow** for 5-pixel nudges. The queue's `Alt + Arrow` / `Alt + Shift + Arrow` shortcuts are also supported.
+- A live readout displays the current match position/size and calculated target. Color scanning occurs independently of the reticle's movement to reduce overlay flashing.
+- Finish reticle editing before executing the action; the interactive overlay is dismissed before mouse input is sent.
 
-## Workspace guide
+To change an action later, **double-click the same queue entry** and use **Redefine Search Box on Desktop**, edit the coordinate fields, or sample a new color. Existing anchors and offsets are preserved unless you change them.
 
-| Workspace | Purpose | Main components |
+**Example:** If a reference color's center is `(500, 300)` and your offset is `(+250, +120)`, the click target is `(750, 420)`. If the reference moves to `(900, 500)`, the target becomes `(1150, 620)`.
+
+A color action in an exported JSON preset can look like this:
+
+```json
+{
+  "type": "find_color",
+  "area": [100, 100, 600, 400],
+  "color": "#35A879",
+  "tolerance": 8,
+  "anchor": "Center",
+  "ox": 40,
+  "oy": 15,
+  "action": "Single Click"
+}
+```
+
+**Important limitations:** The preview outlines a **rectangular bounding box**, not a traced pixel-perfect silhouette. Matching chooses the largest connected region; multiple similar-colored objects or changes in lighting, scaling, and antialiasing can still affect the result. An accepted synthetic mouse event does not guarantee the target application acts on it. Test each visual target carefully.
+
+## Workspace and debugger
+
+| Workspace | Purpose | Key tools |
 | --- | --- | --- |
-| **Playback** | Record, edit, inspect, and execute macros | Action Queue, debugger/playhead, Controls dock, Import/Export |
-| **Sequencer** | Chain saved macros together | Macro Chain timeline, Stage Builder, chain Import/Export |
-| **Settings** | Customize Sequent and access help | Appearance, playback options, sound, directories, hotkeys, Guided Tour |
+| **Playback** | Record, edit, run, and debug macros | Action Queue, breakpoints, playhead, scrubber, Controls, Import/Export |
+| **Sequencer** | Build and execute macro chains | Stage Builder, chain timeline, loops, delays, Import/Export |
+| **Settings** | Customize the application | Themes, accent colors, hotkeys, playback, sound, paths, onboarding |
 
-### Mini HUD
+**Guided Tour:** A 12-step, non-destructive walkthrough introduces the interface, recording, presets, Mini HUD, debugger, and sequencer. Open it from the sidebar or **Settings → Help & Onboarding**.
 
-Choose **Mini HUD** in the top toolbar to hide the main workspace and show a small floating control bar. Use its controls to pause/resume playback, stop playback, or **Expand** back into the application. The Guided Tour explains the HUD without activating it.
+**Mini HUD:** A small floating control panel for pause/resume, stop, and returning to the main workspace.
 
-## Action reference
+**Debugging:** Queue line numbers, click-to-select playhead navigation, breakpoints, step execution, and visual reticles help you inspect a macro rather than replay the entire sequence each time.
 
-The Action Queue shows *readable representations* of actions. These are not Python commands to paste into a script; use Sequent's recorder and Action Library to create or edit them.
+## Actions and automation logic
 
-| Action shown in queue | Purpose |
+The queue displays readable *action summaries*, not executable Python code. Create them through recording or the Action Library.
+
+| Action | Purpose |
 | --- | --- |
-| `mouse.move(x, y)` | Move the cursor to a recorded position. |
-| `mouse.left_click(x, y)` | Click at a recorded position (right-click is also supported). |
-| `mouse.drag((x1, y1) ➔ (x2, y2))` | Drag between two positions. |
-| `mouse.scroll(delta, x, y)` | Scroll at a recorded location. |
-| `keyboard.type('text')` | Type recorded text. |
-| `keyboard.press('Enter')` | Press a named key. |
-| `keyboard.hotkey('Ctrl + C')` | Execute a key combination. |
-| `system.delay(1.50s)` | Wait for a specified duration. |
-| `condition.wait_pixel(x, y, color)` | Wait for a pixel to match a color. |
-| `ocr.wait_text('Complete', appears)` | Wait for text to appear or disappear. |
-| `ocr.search_area('target')` | Search a region using OCR and optionally branch on a match. |
-| `clipboard.find('keyword' ➔ …)` | Check clipboard text and set a variable on a match. |
-| `user.prompt('Message' ➔ $variable)` | Ask the user for a runtime value. |
-| `keyboard.type_var('$variable')` | Type a stored variable's value. |
-| `flow.label('checkpoint_1')` | Define a named point in the queue. |
-| `flow.goto('checkpoint_1')` | Jump to a named point. |
-| `flow.if('var' == 'value' ➔ …)` | Branch based on a variable comparison. |
-| `ui.disclaimer('Message')` | Display a warning or message during execution. |
+| Mouse move / click / drag / scroll | Interact at a recorded position or follow the recorded mouse path |
+| Keyboard type / press / hotkey | Enter text and send key combinations |
+| Delay | Wait a specified amount of time |
+| Wait Pixel | Wait for a pixel to match a chosen color |
+| Wait for Text | Watch a screen region for OCR text to appear or disappear |
+| Search selected area | OCR a region and optionally branch to a preset |
+| **Find Color & Click** | Locate a connected color region and move/click at an anchored, offset position |
+| Read Clipboard | Detect keywords and store a value in a variable |
+| Request Input | Ask the user for a value during playback |
+| Type Variable | Type the current contents of a variable |
+| If Variable Condition | Branch according to a variable comparison |
+| Label / Jump to Label | Mark a location and jump to it |
+| Disclaimer / Warning | Display a user-facing message during execution |
 
-The Action Library groups available additions under **Timing & Waiting**, **Screen & Recognition**, **Variables & Inputs**, **Logic & Flow**, and **User Interaction**.
+OCR and visual recognition are best-effort. A failed match, timeout, or unexpected UI state may stop a workflow; avoid blindly repeating destructive actions.
 
 ## Presets and macro chains
 
-### Preset files (`.json`)
+### Macros (`.json`)
 
-Preset files contain a JSON list of action objects. By default, Sequent looks for presets in a `presets` directory relative to the **current working directory**; you can change that directory in Settings.
-
-For example, a minimal delay-only preset can look like this:
+Export from the Playback workspace or import a saved preset. By default, Sequent uses the `presets` folder relative to the working directory unless configured otherwise.
 
 ```json
 [
@@ -203,13 +203,11 @@ For example, a minimal delay-only preset can look like this:
 ]
 ```
 
-Import macros from other folders with **Import**, or use the top toolbar's Preset selector for files in the configured preset directory.
+**Loading a preset replaces the current queue**; export unfinished work before switching presets. Importing does not automatically run it.
 
-### Chain files (`.chain.json`)
+### Macro chains (`.chain.json`)
 
-In **Sequencer**, choose saved presets in **Stage Builder**, then configure how often they run and how long to wait afterward. Chain configurations are imported and exported as `.chain.json` files. The default chain folder is `chains` relative to the current working directory.
-
-A chain configuration contains entries like:
+Use the Sequencer's Stage Builder to choose saved macros, set each stage's loop count and post-stage delay, then reorder or export the chain.
 
 ```json
 [
@@ -217,7 +215,61 @@ A chain configuration contains entries like:
 ]
 ```
 
-The referenced preset must be available in the configured preset directory when the chain runs.
+The referenced preset must exist in the configured preset directory when the chain runs.
+
+## Appearance and window management
+
+### Themes and accent colors
+
+Go to **Settings → Appearance**:
+
+- **Dark** — use Sequent's dark color scheme.
+- **Light** — use its light color scheme.
+- **Match System** — follow Windows' app-theme preference while Sequent runs.
+- **Accent Color** — choose a quick swatch, enter a HEX value, or open **Customize...** for Sequent's own color editor.
+
+The custom picker has a hue strip, saturation/brightness selection, HEX and RGB fields, before/after preview, and **Apply/Cancel**. Accent changes update supported interface elements, including the **MACRO WORKSPACE** branding. Appearance settings persist in `settings.json`; older `light_mode` settings are supported for compatibility.
+
+### Custom window chrome (experimental)
+
+Sequent uses custom-painted headers while preserving Windows-managed movement and **live resizing**. The latest source offers an **optional native borderless mode** implemented by `native/SequentChrome.c` so low-level resize messages are handled in compiled C rather than Python callbacks.
+
+**Without the DLL**, Sequent still runs and uses the safer thin-frame resizing implementation. The fully borderless path is **not yet verified as a stable Windows release**.
+
+To try the optional mode on **Windows x64**:
+
+1. Install **Visual Studio Build Tools** with **Desktop development with C++** and a Windows SDK.
+2. Ensure the repository includes the `native` directory from the v6.6 source package.
+3. Open an **x64 Native Tools Command Prompt for VS** in the project directory.
+4. Build:
+
+   ```bat
+   native\build_native.cmd
+   ```
+
+5. The script should create `SequentChrome.dll` **beside `Sequent.py`**. Launch with `py Sequent.py` and test resizing, maximizing, snapping, and dialog focus.
+
+The DLL is loaded only when present and compatible. Keep it beside `Sequent.py`; it is not a Python `pip` dependency.
+
+**Window modes (PowerShell):**
+
+```powershell
+# Default: native borderless DLL if available, safe fallback otherwise
+$env:SEQUENT_WINDOW_MODE = "custom"
+py Sequent.py
+
+# Safe fallback: custom Sequent header + thin native resize frame
+$env:SEQUENT_WINDOW_MODE = "legacy"
+py Sequent.py
+
+# Diagnostic fallback: ordinary Windows decorations
+$env:SEQUENT_WINDOW_MODE = "native"
+py Sequent.py
+```
+
+Set one mode before each launch; these examples show alternatives, not commands that must all be run. You can also remove or rename the optional DLL **while Sequent is closed** to disable the experimental native mode.
+
+> **Technical note:** The native code handles `WM_NCCALCSIZE` and `WM_NCHITTEST` without a Python `WNDPROC` callback. This is intended to avoid the GIL-related interpreter crash observed when resizing through a Python-level window subclass. Native behavior still needs real Windows testing across different displays and versions.
 
 ## Hotkeys
 
@@ -228,52 +280,32 @@ The referenced preset must be available in the configured preset directory when 
 | `F9` | Start playback |
 | `F10` | Stop playback |
 
-Customize hotkeys (including modifier combinations) under **Settings → Global Hotkeys**. The Playback controls also expose pause/resume and step actions, independently of the configurable global hotkeys.
-
-## Settings and customization
-
-- **Appearance:** Dark/light theme; **Entertain Me** to enable or disable interface animations.
-- **Playback:** Timing controls, playback speed, movement behavior, and optional delay variation.
-- **Audio:** Built-in sound themes and supported custom `.wav` paths.
-- **Paths:** Preset directory and related file locations.
-- **Hotkeys:** Rebind start/stop controls.
-- **Help & Onboarding:** Relaunch the Guided Tour.
-
-If you need to isolate a problem involving Sequent's custom borderless window, you can launch with Windows' native window decorations for troubleshooting:
-
-```powershell
-$env:SEQUENT_WINDOW_MODE = "native"
-py Sequent.py
-```
-
-This is a diagnostic option; the normal default is Sequent's custom borderless window.
+Global hotkeys can be changed under **Settings → Global Hotkeys**. Other pause, step, and reticle controls are available from the interface.
 
 ## Troubleshooting and limitations
 
-**OCR doesn't find expected text**
+**Recording crashes with `expected LP_POINT instance`**  
+Update to the latest source. A previous window-motion implementation changed the shared `GetCursorPos` signature to an incompatible local structure type; the v6.6 source uses the common `POINT` type.
 
-Check the selected screen region, text spelling, display scaling, and installed Windows OCR language pack. Try a larger region and test again. OCR depends on what is actually visible on screen and may take longer than the selected polling interval.
+**The window has a border or resizing behaves unexpectedly**  
+The compiled native borderless DLL is optional and experimental. Set `SEQUENT_WINDOW_MODE=legacy` for the safer thin-frame resizing mode, or `native` for normal Windows decorations. Include your Windows/Python versions and a screenshot when reporting a problem.
 
-**A macro clicks the wrong location**
+**Find Color & Click misses, flickers, or clicks the wrong point**  
+Confirm the search rectangle, sampled HEX color, RGB tolerance, anchor, and offsets. Review the live bounding box and reticle. Avoid capturing multiple disconnected objects of the same color in one search region. For click delivery failures, verify that **When found** is not **Move Only** and that the target accepts simulated input.
 
-Ensure the target application is in the expected state. Window-relative coordinates can help when windows move, but changing layouts, minimized windows, scaling, or missing target windows can still cause incorrect clicks. Test with a harmless workflow first.
+**OCR misses text**  
+Check the selected screen area, scaling, target text, language pack, and whether the text is visible. Windows OCR can be slow or inaccurate.
 
-**A macro stops after a visual check**
+**A macro is blocked by another application**  
+Some elevated, protected, remote, or specialized applications ignore synthetic input. Sequent cannot bypass the Windows secure desktop or guarantee access across integrity levels.
 
-A `Wait for Text` or `Wait Pixel` timeout is treated as a failed condition in the current development build; inspect the failing action and its target before retrying. Don't automatically repeat a Save/Submit operation unless you know it is safe to do so.
+**Closing from a terminal shows `KeyboardInterrupt`**  
+Ctrl+C interrupts Tkinter's event loop. The current development source handles this more gracefully; use Sequent's normal window controls for ordinary shutdown.
 
-**Theme switching or animated panels render incorrectly**
-
-Try disabling **Entertain Me**, return to the default theme, and restart Sequent. Current development work includes safeguards for delayed Tkinter callbacks and rapid theme switching, but rendering may vary with your Windows and Python/Tk version. Include your Python version and a traceback when reporting the issue.
-
-**Global hotkeys or inputs don't work in a particular program**
-
-Some elevated, protected, remote, or specialized applications may not accept simulated input from Sequent. Follow application and organizational policies; don't assume macros will work universally.
-
-**Known limitations:** Sequent is a screen/input automation tool, not an application API integration. Text recognition, screen coordinates, and window matching can be sensitive to UI changes. It does not automatically understand every possible application error or guarantee transaction correctness.
+**General limitations:** Sequent is desktop screen/input automation, not a universal application API. A successful visual match or Windows input injection does not guarantee that a task was completed. Design macros to verify outcomes and avoid repeating irreversible actions without checking their state.
 
 ## Contributing and license
 
-Issues, bug reports, documentation improvements, and pull requests are welcome through the [GitHub repository](https://github.com/JortCorp/SequentMacroEngine). When reporting a problem, include reproduction steps, your Windows and Python versions, and relevant traceback details. Remove any confidential application data from screenshots, logs, or sample presets.
+Issues, reproducible bug reports, documentation improvements, and pull requests are welcome in the [SequentMacroEngine repository](https://github.com/JortCorp/SequentMacroEngine). For GUI issues, include your Windows version, Python version, window mode, DPI scaling, exact reproduction steps, and relevant traceback (without sensitive information).
 
-Sequent is distributed under the **GNU General Public License v3.0 (GPL-3.0)**. See [LICENSE](LICENSE) for the full license text.
+Sequent is licensed under the **GNU General Public License v3.0 (GPL-3.0)**. See [LICENSE](LICENSE).
