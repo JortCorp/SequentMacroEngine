@@ -1659,6 +1659,7 @@ class VSCodeQueueViewer(tk.Frame):
         ("Screen & Recognition", (
             ("Search selected area", "Read an area and branch to a preset.", "OCR"),
             ("Find Color & Click", "Find a color in an area and click it.", "FC"),
+            ("Find Text & Click", "Find text in an area and click it.", "FT"),
         )),
         ("Variables & Inputs", (
             ("Read Clipboard", "Capture and inspect clipboard contents.", "CB"),
@@ -2138,7 +2139,6 @@ class VSCodeQueueViewer(tk.Frame):
             self.open_action_submenu(self.hovered_line, event)
 
     def open_action_submenu(self, line_num, event, edit_idx=None):
-        """Open a searchable Sequent action browser and properties editor."""
         self.close_sub_menu()
         if not self.interactive_enabled:
             return
@@ -2154,6 +2154,7 @@ class VSCodeQueueViewer(tk.Frame):
             "wait_pixel": "Wait Pixel",
             "wait_text": "Wait for Text",
             "find_color": "Find Color & Click",
+            "find_text": "Find Text & Click",
             "label": "Label Marker",
             "goto": "Jump to Label",
         }
@@ -2167,9 +2168,6 @@ class VSCodeQueueViewer(tk.Frame):
         initial_action = type_to_label.get(
             edit_action.get("type"), "Delay") if edit_action else "Delay"
 
-        # The color editor must see the actual desktop, not our live overlays.
-        # Stop only when reopening a color action's properties; users can
-        # restart live preview after saving without losing their offsets.
         if (edit_action and edit_action.get("type") == "find_color" and
                 getattr(self.app, "_reticle_edit_index", None) is not None):
             self.app.stop_reticle_edit()
@@ -2334,7 +2332,6 @@ class VSCodeQueueViewer(tk.Frame):
             font=("Segoe UI", 9), anchor="w", justify="left",
             wraplength=max(200, menu_w - nav_width - 95))
         self._selected_action_desc.pack(fill=tk.X, pady=(5, 0))
-        # Keep text readable while the native window is resized live.
         detail.bind('<Configure>', lambda e: self._selected_action_desc.config(
             wraplength=max(170, e.width - 65)), add='+')
         tk.Frame(detail, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=23)
@@ -2379,8 +2376,6 @@ class VSCodeQueueViewer(tk.Frame):
         self._switch_action_view(initial_action, line_num, edit_idx=edit_idx)
         if os.name == 'nt' and getattr(self, '_action_editor_native_chrome', None):
             self._action_editor_grips = add_native_resize_grips(self.sub_menu, BG_BORDER)
-        # The action editor is a separate custom-chrome window. Give it keyboard
-        # focus when opened rather than leaving focus in the main queue.
         self.sub_menu.after_idle(self.restore_action_editor_focus)
 
 
@@ -2525,6 +2520,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Type Variable": self._render_type_variable_view,
             "Search selected area": self._render_search_area_view,
             "Find Color & Click": self._render_find_color_view,
+            "Find Text & Click": self._render_find_text_view,
             "Wait for Text": self._render_wait_text_view,
             "Wait Pixel": self._render_wait_pixel_view,
             "Label Marker": self._render_label_view,
@@ -3644,6 +3640,167 @@ class VSCodeQueueViewer(tk.Frame):
                      bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
                      command=lambda: save(start_reticle=True)).pack(fill=tk.X)
 
+    def _render_find_text_view(self, line_num, edit_idx=None):
+        body = self.action_content_frame
+        curr = (self.app.recorded_actions[edit_idx]
+                if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
+                and self.app.recorded_actions[edit_idx].get("type") == "find_text"
+                else {})
+
+        def text_label(parent, label):
+            return tk.Label(parent, text=label, font=("Segoe UI", 8, "bold"),
+                            bg=BG_PANEL, fg=TEXT_MUTED)
+
+        def entry(parent, value, width=7, fg=TEXT_PRIMARY):
+            widget = tk.Entry(parent, width=width, bg=BG_INPUT, fg=fg,
+                              insertbackground=TEXT_PRIMARY, font=("Consolas", 9),
+                              bd=0, highlightbackground=BG_BORDER,
+                              highlightthickness=1)
+            widget.insert(0, str(value))
+            return widget
+
+        def set_value(widget, value):
+            widget.delete(0, tk.END)
+            widget.insert(0, str(value))
+            widget.config(highlightbackground=BG_BORDER)
+
+        title = "EDIT TEXT DETECTION" if edit_idx is not None else "NEW TEXT DETECTION"
+        text_label(body, title).pack(anchor="w", pady=(0, 5))
+        tk.Label(body, text="Define where Sequent searches. The Ghost Reticle can click anywhere outside this box.",
+                 font=("Segoe UI", 8), bg=BG_PANEL, fg=TEXT_MUTED,
+                 anchor="w", justify="left", wraplength=460).pack(fill=tk.X, pady=(0, 8))
+
+        initial_area = curr.get("area", [0, 0, 0, 0])
+        if not isinstance(initial_area, (list, tuple)) or len(initial_area) != 4:
+            initial_area = [0, 0, 100, 100]
+        area_row = tk.Frame(body, bg=BG_PANEL)
+        area_row.pack(fill=tk.X, pady=(0, 4))
+        area_entries = []
+        for label, value in zip(("X", "Y", "Width", "Height"), initial_area):
+            field = tk.Frame(area_row, bg=BG_PANEL)
+            field.pack(side=tk.LEFT, padx=(0, 9))
+            text_label(field, label).pack(anchor="w")
+            control = entry(field, value, width=7)
+            control.pack(pady=(3, 0))
+            area_entries.append(control)
+
+        area_message = tk.Label(body, text="Search area is in absolute screen pixels (negative X/Y supported).",
+                                font=("Segoe UI", 8), bg=BG_PANEL, fg=TEXT_MUTED,
+                                anchor="w", wraplength=460)
+        area_message.pack(fill=tk.X, pady=(0, 5))
+
+        def resample_area_done(area):
+            if not body.winfo_exists():
+                return
+            for control, value in zip(area_entries, area):
+                set_value(control, value)
+            area_message.config(text=f"Selected search box: {area[2]}×{area[3]} at ({area[0]}, {area[1]})",
+                                fg=SYNTAX_GREEN)
+
+        def pick_new_area():
+            if self.sub_menu and self.sub_menu.winfo_exists():
+                self.sub_menu.withdraw()
+            try:
+                self.app.start_screen_selection(resample_area_done)
+            except Exception as exc:
+                self.app.restore_after_desktop_picker()
+                error_lbl.config(text=f"Could not open screen selector: {exc}")
+
+        search_box_label = "⛶ Redefine Search Box on Desktop" if curr else "Define Search Box"
+        ModernButton(body, text=search_box_label,
+                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                     command=pick_new_area).pack(fill=tk.X, pady=(0, 12))
+
+        txt_row = tk.Frame(body, bg=BG_PANEL)
+        txt_row.pack(fill=tk.X, pady=(0, 8))
+        text_label(txt_row, "Target Text:").pack(side=tk.LEFT)
+        txt_entry = tk.Entry(txt_row, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        txt_entry.insert(0, curr.get("text", ""))
+        txt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0), ipady=3)
+
+        off_row = tk.Frame(body, bg=BG_PANEL)
+        off_row.pack(fill=tk.X, pady=(0, 7))
+        text_label(off_row, "Offset X:").pack(side=tk.LEFT)
+        ox_entry = entry(off_row, curr.get("ox", 0))
+        ox_entry.pack(side=tk.LEFT, padx=(4, 14))
+        text_label(off_row, "Offset Y:").pack(side=tk.LEFT)
+        oy_entry = entry(off_row, curr.get("oy", 0))
+        oy_entry.pack(side=tk.LEFT, padx=(4, 0))
+
+        anchor_row = tk.Frame(body, bg=BG_PANEL)
+        anchor_row.pack(fill=tk.X, pady=(0, 8))
+        text_label(anchor_row, "Anchor:").pack(side=tk.LEFT)
+        anchor_var = tk.StringVar(value=curr.get("anchor", "Center"))
+        anchor_menu = tk.OptionMenu(anchor_row, anchor_var, *COLOR_ANCHORS)
+        anchor_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8),
+                           highlightthickness=1, highlightbackground=BG_BORDER,
+                           bd=0, relief="flat", cursor="hand2")
+        anchor_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        anchor_menu.pack(side=tk.LEFT, padx=(6, 12))
+
+        act_row = tk.Frame(body, bg=BG_PANEL)
+        act_row.pack(fill=tk.X, pady=(0, 8))
+        text_label(act_row, "When found:").pack(side=tk.LEFT)
+        act_var = tk.StringVar(value=curr.get("action", "Single Click"))
+        act_menu = tk.OptionMenu(act_row, act_var, "Move Only", "Single Click", "Double Click")
+        act_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8),
+                        highlightthickness=1, highlightbackground=BG_BORDER,
+                        bd=0, relief="flat", cursor="hand2")
+        act_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        act_menu.pack(side=tk.LEFT, padx=(6, 0))
+
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8),
+                            highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(0, 7))
+
+        error_lbl = tk.Label(body, text="", font=("Segoe UI", 8),
+                             bg=BG_PANEL, fg=COLOR_DANGER, anchor="w", wraplength=450)
+        error_lbl.pack(fill=tk.X, pady=(0, 5))
+
+        def save(start_reticle=False):
+            try:
+                area = [int(field.get().strip()) for field in area_entries]
+                if area[2] <= 0 or area[3] <= 0:
+                    raise ValueError("Search Width and Height must be positive.")
+                if area[2] * area[3] > 16_000_000:
+                    raise ValueError("Search region is over 16 million pixels. Select a smaller area.")
+                ox, oy = int(ox_entry.get().strip()), int(oy_entry.get().strip())
+                target_text = txt_entry.get().strip()
+                if not target_text:
+                    raise ValueError("Target text cannot be empty.")
+            except ValueError as exc:
+                error_lbl.config(text=str(exc) or "Enter valid integer coordinates and offsets.")
+                return
+
+            updated_action = dict(curr)
+            updated_action.update({"type": "find_text", "area": area,
+                                   "text": target_text, "anchor": anchor_var.get(),
+                                   "ox": ox, "oy": oy, "action": act_var.get()})
+            if edit_idx is not None:
+                saved_idx = edit_idx
+                self.app.recorded_actions[edit_idx] = updated_action
+            else:
+                saved_idx = line_num - 1 if "After" in pos_var.get() else line_num - 2
+                saved_idx = max(0, min(saved_idx, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(saved_idx, updated_action)
+
+            self.close_sub_menu()
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.set_active_action_index(saved_idx)
+            self.app.update_status("Find Text settings saved; search box and target offsets updated", COLOR_SUCCESS)
+            if start_reticle:
+                self.app.root.after(90, self.app.toggle_reticle_edit)
+
+        ModernButton(body, text="Save Changes" if edit_idx is not None else "Add Find Text Action",
+                     bg_color=COLOR_SUCCESS, hover_color="#1d8a4b",
+                     command=save).pack(fill=tk.X, pady=(0, 5))
+        ModernButton(body, text="Save & Open Live Reticle Editor",
+                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                     command=lambda: save(start_reticle=True)).pack(fill=tk.X)
 
     def close_sub_menu(self):
         if self.sub_menu:
@@ -4479,7 +4636,7 @@ class GhostReticle:
         idx = self._live_index
         if (idx is None or idx >= len(app.recorded_actions) or
                 getattr(app, "_reticle_edit_index", None) != idx or
-                app.recorded_actions[idx].get("type") != "find_color" or
+                app.recorded_actions[idx].get("type") not in ("find_color", "find_text") or
                 app.playing or app.recording or app.chain_running):
             app.stop_reticle_edit()
             return
@@ -4503,7 +4660,7 @@ class GhostReticle:
                 elif error:
                     app._set_color_live_label(f"● Scan error: {error}", COLOR_DANGER)
                 else:
-                    app._set_color_live_label("○ LIVE • No matching color (last anchor held)",
+                    app._set_color_live_label("○ LIVE • No matching target (last anchor held)",
                                               SYNTAX_ORANGE)
         except Empty:
             pass
@@ -4512,17 +4669,20 @@ class GhostReticle:
         if (now >= self._live_next_scan and
                 (self._live_worker is None or not self._live_worker.is_alive())):
             act = app.recorded_actions[idx]
-            # Capture a snapshot of the action in the UI thread. The worker
-            # must not access Tk or mutable queue state.
             region = tuple(act.get("area", [0, 0, 0, 0]))
-            color = act.get("color", "#FFFFFF")
-            tolerance = act.get("tolerance", 8)
+            
             self._live_next_scan = now + self._live_interval
             results = self._live_queue
 
             def worker():
                 try:
-                    box = app.search_color_in_area(*region, color, tolerance=tolerance)
+                    if act.get("type") == "find_color":
+                        color = act.get("color", "#FFFFFF")
+                        tolerance = act.get("tolerance", 8)
+                        box = app.search_color_in_area(*region, color, tolerance=tolerance)
+                    else:
+                        text = act.get("text", "")
+                        box = app.find_text_rect(*region, text)
                     results.put((generation, box, None))
                 except Exception as exc:
                     results.put((generation, None, str(exc)))
@@ -4541,17 +4701,13 @@ class GhostReticle:
         color_rect = None
         self.last_target = None
 
-        if act.get("type") in ("move", "click", "wait_pixel", "scroll", "find_color", "search_area", "wait_text"):
-            if act.get("type") == "find_color":
+        if act.get("type") in ("move", "click", "wait_pixel", "scroll", "find_color", "search_area", "wait_text", "find_text"):
+            if act.get("type") in ("find_color", "find_text"):
                 area = act.get("area", [0, 0, 0, 0])
                 area_rect = (area[0], area[1], area[2], area[3], 0.85)
-                # While dragging or nudging keep the existing target anchor
-                # stable; do not repeatedly recapture the changing overlay.
                 if self.edit_active:
                     found_box = self.last_found_box
                 elif app is not None:
-                    # Don't allow last preview's colored outlines to become
-                    # the next scan's input. They are separate topmost windows.
                     for overlay in (self.area_win, self.color_win):
                         if overlay is not None and overlay.winfo_exists():
                             overlay.withdraw()
@@ -4559,9 +4715,11 @@ class GhostReticle:
                         if win.winfo_exists():
                             win.withdraw()
                     self.root.update_idletasks()
-                    found_box = app.search_color_in_area(
-                        *area, act.get("color", "#FFFFFF"),
-                        tolerance=act.get("tolerance", 8))
+                    
+                    if act.get("type") == "find_color":
+                        found_box = app.search_color_in_area(*area, act.get("color", "#FFFFFF"), tolerance=act.get("tolerance", 8))
+                    else:
+                        found_box = app.find_text_rect(*area, act.get("text", ""))
                 else:
                     found_box = None
 
@@ -4571,8 +4729,6 @@ class GhostReticle:
                     rx, ry = color_click_target(act, found_box)
                     color_rect = (x1, y1, x2 - x1, y2 - y1, 0.85)
                 else:
-                    # Before recognition, show a provisional reticle based on
-                    # the selected search area (not a fake detected object).
                     ax = area[0] + area[2] // 2
                     ay = area[1] + area[3] // 2
                     rx, ry = ax + int(act.get("ox", 0)), ay + int(act.get("oy", 0))
@@ -5500,10 +5656,10 @@ class BuiltInMacroApp:
             return "break"
 
         act = self.recorded_actions[self.current_action_idx]
-        if act.get("type") not in ("move", "click", "wait_pixel", "scroll", "find_color"):
+        if act.get("type") not in ("move", "click", "wait_pixel", "scroll", "find_color", "find_text"):
             return "break"
             
-        if act.get("type") == "find_color":
+        if act.get("type") in ("find_color", "find_text"):
             act["ox"] = int(act.get("ox", 0)) + dx
             act["oy"] = int(act.get("oy", 0)) + dy
         else:
@@ -5524,9 +5680,7 @@ class BuiltInMacroApp:
             fg=SYNTAX_GREEN
         )
 
-        # Move the existing HWND only. The detection box remains stable and
-        # scanning continues independently on the live-preview timer.
-        if act.get("type") == "find_color" and self._reticle_edit_index is not None:
+        if act.get("type") in ("find_color", "find_text") and self._reticle_edit_index is not None:
             tx, ty = self.ghost_reticle._move_target_only(act)
             self._set_color_live_label(
                 f"● LIVE {'MATCH' if self.ghost_reticle._live_is_found else 'SEARCH'}"
@@ -5563,8 +5717,8 @@ class BuiltInMacroApp:
             self.update_status("Stop playback/recording before editing the reticle", COLOR_DANGER)
             return
         idx = self.current_action_idx
-        if not 0 <= idx < len(self.recorded_actions) or self.recorded_actions[idx].get("type") != "find_color":
-            self.update_status("Select a Find Color & Click action first", SYNTAX_ORANGE)
+        if not 0 <= idx < len(self.recorded_actions) or self.recorded_actions[idx].get("type") not in ("find_color", "find_text"):
+            self.update_status("Select a Find Color or Find Text action first", SYNTAX_ORANGE)
             return
         try:
             self.ghost_reticle.update(self.recorded_actions, idx, app=self)
@@ -5579,7 +5733,7 @@ class BuiltInMacroApp:
         self._set_color_live_label("◌ LIVE PREVIEW • Searching for matching region…", SYNTAX_BLUE)
         self.ghost_reticle.start_live_preview(self, idx)
         if self.ghost_reticle.last_found_box is None:
-            self.update_status("Color isn't visible: preview uses search-area center. Show the color for precise alignment.", SYNTAX_ORANGE)
+            self.update_status("Target isn't visible: preview uses search-area center. Show the target for precise alignment.", SYNTAX_ORANGE)
         else:
             self.update_status("Drag reticle anywhere, or use Arrows (Shift: 5px); Alt+Arrows also work", COLOR_SUCCESS)
 
@@ -6455,6 +6609,9 @@ class BuiltInMacroApp:
             sub_action = action.get('action', 'Single Click')
             verb = "move" if sub_action == "Move Only" else ("double_click" if sub_action == "Double Click" else "click")
             return f"🎯 ocr.find_color('{action.get('color', '')}', offset=({action.get('ox', 0)},{action.get('oy', 0)}), do='{verb}')"
+        elif act_type == "find_text":
+            verb = "click" if action.get("action") == "Single Click" else "move"
+            return f"🎯 ocr.find_text('{action.get('text', '')}', offset=({action.get('ox', 0)},{action.get('oy', 0)}), do='{verb}')"
         elif act_type == "enter": 
             return "↵ keyboard.press('Enter')"
         elif act_type == "backspace": 
@@ -6472,7 +6629,7 @@ class BuiltInMacroApp:
         act_type = action.get("type", "") if action else ""
         if act_type in ("label", "goto", "if_var", "read_clipboard", "type_variable", "prompt_input"): return SYNTAX_PURPLE
         if act_type == "disclaimer": return SYNTAX_ORANGE
-        if act_type in ("wait_pixel", "wait_text", "find_color"): return COLOR_SUCCESS
+        if act_type in ("wait_pixel", "wait_text", "find_color", "find_text"): return COLOR_SUCCESS
         if act_type in ("move", "click", "drag", "scroll"): return SYNTAX_BLUE
         if act_type in ("key", "press", "enter", "backspace"): return SYNTAX_ORANGE
         if act_type in ("combo", "select_all", "copy", "paste", "delay", "search_area"): return SYNTAX_PURPLE
@@ -6700,7 +6857,6 @@ class BuiltInMacroApp:
 
             if found_box:
                 mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
-                # Schedule GUI feedback safely when called from a chain worker.
                 self.root.after(0, lambda b=found_box:
                                 self.draw_highlight_box(*b, COLOR_SUCCESS, 800))
                 self.root.after(0, lambda m=mode, x=tx, y=ty:
@@ -6708,6 +6864,18 @@ class BuiltInMacroApp:
                 if self.audio_cues: play_cue("match")
             else:
                 raise MacroExecutionError(f"Color {hex_color} not found in search area")
+        elif act_type == "find_text":
+            area = action.get("area", [0, 0, 100, 100])
+            target_text = action.get("text", "")
+            found_box = self.find_text_rect(*area, target_text)
+
+            if found_box:
+                mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
+                self.root.after(0, lambda b=found_box: self.draw_highlight_box(*b, COLOR_SUCCESS, 800))
+                self.root.after(0, lambda m=mode, x=tx, y=ty: self._report_color_execution(m, x, y))
+                if self.audio_cues: play_cue("match")
+            else:
+                raise MacroExecutionError(f"Text '{target_text}' not found in search area")
 
 
     def update_action_count_badge(self):
@@ -6952,7 +7120,8 @@ class BuiltInMacroApp:
         user32 = ctypes.windll.user32
         gdi32 = ctypes.windll.gdi32
 
-        scale = max(4, int(160 / max(1, h)))
+        # Fix: Change minimum scale from 4 to 1 so large windows aren't upscaled into massive 8K images.
+        scale = max(1, int(160 / max(1, h)))
         scale = min(scale, 6)
         tw = w * scale
         th = h * scale
@@ -7016,6 +7185,96 @@ class BuiltInMacroApp:
             gdi32.DeleteDC(h_mem_dc)
             user32.ReleaseDC(0, h_screen_dc)
 
+
+    def find_text_rect(self, x, y, w, h, target_text, match_any=False):
+        x, y, w, h = int(x), int(y), max(1, int(w)), max(1, int(h))
+        temp_fd, temp_bmp = tempfile.mkstemp(suffix=".bmp")
+        os.close(temp_fd)
+
+        # Match the scaling factor used by capture_screen_area_to_bmp 
+        # to accurately map OCR pixel coordinates back to the unscaled screen.
+        scale = max(1, int(160 / max(1, h)))
+        scale = min(scale, 6)
+
+        try:
+            self.capture_screen_area_to_bmp(x, y, w, h, temp_bmp)
+        except Exception:
+            try: os.remove(temp_bmp)
+            except Exception: pass
+            return None
+
+        abs_bmp_path = os.path.abspath(temp_bmp).replace("'", "''")
+
+        ps_script = f"""
+$ErrorActionPreference = 'Stop'
+try {{
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    [void][Windows.Globalization.Language, Windows.Globalization, ContentType=WindowsRuntime]
+    [void][Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime]
+    [void][Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType=WindowsRuntime]
+    [void][Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]
+
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 }})[0]
+    function Await-Op($asyncOp, $type) {{
+        $task = $asTaskGeneric.MakeGenericMethod($type).Invoke($null, @($asyncOp))
+        $task.Wait(9000) | Out-Null
+        return $task.Result
+    }}
+
+    $file = Await-Op ([Windows.Storage.StorageFile]::GetFileFromPathAsync('{abs_bmp_path}')) ([Windows.Storage.StorageFile])
+    $stream = Await-Op ($file.OpenReadAsync()) ([Windows.Storage.Streams.IRandomAccessStreamWithContentType])
+    $decoder = Await-Op ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+    $sBmp = Await-Op ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+
+    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+    if (-not $engine) {{ $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('en-US')) }}
+    
+    $ocrResult = Await-Op ($engine.RecognizeAsync($sBmp)) ([Windows.Media.Ocr.OcrResult])
+    $results = @()
+    if ($ocrResult -and $ocrResult.Lines) {{
+        foreach ($line in $ocrResult.Lines) {{
+            $rect = $line.BoundingRect
+            $results += [PSCustomObject]@{{ Text = $line.Text; X = $rect.X; Y = $rect.Y; Width = $rect.Width; Height = $rect.Height }}
+        }}
+    }}
+    Write-Output ($results | ConvertTo-Json -Compress)
+    if ($stream) {{ $stream.Dispose() }}
+}} catch {{}}
+"""
+        try:
+            encoded_cmd = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded_cmd],
+                stdout=subprocess.PIPE, text=True, creationflags=0x08000000, timeout=12
+            )
+            out = proc.stdout.strip()
+            if not out: return None
+            
+            lines_data = json.loads(out)
+            if not isinstance(lines_data, list): lines_data = [lines_data]
+            
+            target_lower = target_text.casefold()
+            target_clean = target_lower.replace(" ", "")
+            
+            for line in lines_data:
+                text_lower = line.get("Text", "").casefold()
+                text_clean = text_lower.replace(" ", "")
+                # Flexible matching: allows for standard substring match OR a space-stripped match
+                # (e.g. if OCR misreads "Find" as "F i n d" or "F ind")
+                if match_any or target_lower in text_lower or target_clean in text_clean:
+                    rx = x + int(line["X"] / scale)
+                    ry = y + int(line["Y"] / scale)
+                    rw = int(line["Width"] / scale)
+                    rh = int(line["Height"] / scale)
+                    return (rx, ry, rx + rw, ry + rh)
+            return None
+        except Exception:
+            return None
+        finally:
+            try: os.remove(temp_bmp)
+            except Exception: pass
+
+            
     def search_color_in_area(self, x, y, w, h, hex_color, tolerance=8):
         """Capture screen pixels and locate the largest connected color region.
 
