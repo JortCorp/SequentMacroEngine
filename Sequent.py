@@ -11,7 +11,9 @@ import subprocess
 import tkinter as tk
 from tkinter import filedialog
 from threading import Thread
+from queue import Queue, Empty
 import math
+import colorsys
 import random
 import winsound
 
@@ -197,6 +199,402 @@ if os.name == "nt":
     except (AttributeError, OSError):
         pass
 
+# --- Color targeting geometry (shared by preview, sequencer, and playback) ---
+COLOR_ANCHORS = (
+    "Top Left", "Top Center", "Top Right",
+    "Middle Left", "Center", "Middle Right",
+    "Bottom Left", "Bottom Center", "Bottom Right",
+)
+
+
+def color_anchor_position(box, anchor="Center"):
+    """Return the selected anchor within an exclusive-right/bottom pixel bbox."""
+    x1, y1, x2, y2 = box
+    xs = (x1, (x1 + x2 - 1) // 2, x2 - 1)
+    ys = (y1, (y1 + y2 - 1) // 2, y2 - 1)
+    if anchor not in COLOR_ANCHORS:
+        anchor = "Center"  # Compatibility with existing saved macros.
+    idx = COLOR_ANCHORS.index(anchor)
+    return xs[idx % 3], ys[idx // 3]
+
+
+def color_click_target(action, box):
+    """Unconstrained target: reticle may be anywhere, even beyond the bbox."""
+    ax, ay = color_anchor_position(box, action.get("anchor", "Center"))
+    return ax + int(action.get("ox", 0)), ay + int(action.get("oy", 0))
+
+
+def largest_color_component(raw, width, height, stride, rgb, tolerance=8):
+    """Return bounding box of largest 4-connected matching region, or None.
+
+    raw is a top-down 24-bit BGR screenshot; the returned box is relative to
+    that screenshot, with exclusive right and bottom edges. Isolated matches
+    never merge merely because they share a color.
+    """
+    from collections import deque
+
+    tolerance = max(0, min(255, int(tolerance)))
+    tr, tg, tb = rgb
+    mask = bytearray(width * height)
+    for y in range(height):
+        row = y * stride
+        base = y * width
+        for x in range(width):
+            idx = row + 3 * x
+            if (abs(raw[idx] - tb) <= tolerance and
+                abs(raw[idx + 1] - tg) <= tolerance and
+                abs(raw[idx + 2] - tr) <= tolerance):
+                mask[base + x] = 1
+
+    best_box = None
+    best_count = 0
+    for seed in range(len(mask)):
+        if not mask[seed]:
+            continue
+        mask[seed] = 0
+        pending = deque((seed,))
+        pixels = 0
+        x1, y1 = width, height
+        x2 = y2 = -1
+        while pending:
+            i = pending.popleft()
+            py, px = divmod(i, width)
+            pixels += 1
+            x1, y1 = min(x1, px), min(y1, py)
+            x2, y2 = max(x2, px), max(y2, py)
+            for neighbor in (i - width, i + width, i - 1, i + 1):
+                if ((neighbor == i - 1 and px == 0) or
+                    (neighbor == i + 1 and px == width - 1) or
+                    neighbor < 0 or neighbor >= len(mask)):
+                    continue
+                if mask[neighbor]:
+                    mask[neighbor] = 0
+                    pending.append(neighbor)
+        if pixels > best_count:
+            best_count = pixels
+            best_box = (x1, y1, x2 + 1, y2 + 1)
+    return best_box
+
+
+
+class SequentChromeRect(ctypes.Structure):
+    _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+
+
+class SequentChromeMonitorInfo(ctypes.Structure):
+    _fields_ = [('cbSize', ctypes.c_uint32), ('rcMonitor', SequentChromeRect),
+                ('rcWork', SequentChromeRect), ('dwFlags', ctypes.c_uint32)]
+
+
+# --- Optional native borderless DLL (never uses Python WNDPROC callbacks) ---
+_sequent_chrome_dll = None
+_sequent_chrome_attempted = False
+
+
+def get_sequent_native_chrome():
+    """Load the optional x64 DLL from beside Sequent.py, once per process.
+
+    SequentChrome.dll contains the Win32 subclass callback in compiled C.
+    Do not emulate it using ctypes.WINFUNCTYPE: a Python WNDPROC may crash
+    during Windows' nested native resize event loop (GIL released).
+    """
+    global _sequent_chrome_dll, _sequent_chrome_attempted
+    if _sequent_chrome_attempted:
+        return _sequent_chrome_dll
+    _sequent_chrome_attempted = True
+    if os.name != 'nt':
+        return None
+    dll_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'SequentChrome.dll')
+    if not os.path.isfile(dll_path):
+        print('[Sequent] Native borderless DLL not found; using reliable thin-frame resize mode.')
+        print('[Sequent] To enable borderless mode, build native\\build_native.cmd with MSVC.')
+        return None
+    try:
+        dll = ctypes.WinDLL(dll_path, use_last_error=True)
+        dll.SequentChromeVersion.argtypes = []
+        dll.SequentChromeVersion.restype = ctypes.c_int
+        if dll.SequentChromeVersion() != 1:
+            raise OSError('SequentChrome.dll has an incompatible ABI version')
+        dll.SequentInstallChrome.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        dll.SequentInstallChrome.restype = ctypes.c_int
+        dll.SequentRemoveChrome.argtypes = [ctypes.c_void_p]
+        dll.SequentRemoveChrome.restype = ctypes.c_int
+        _sequent_chrome_dll = dll   # Keep loaded until all Tk windows close.
+    except (OSError, AttributeError, ValueError) as exc:
+        print(f'[Sequent] Could not load native borderless DLL: {exc}')
+    return _sequent_chrome_dll
+
+
+# --- Sequent Windows-managed custom chrome (safe: no Python WNDPROC callbacks) ---
+# Never install a Python ctypes WNDPROC/SUBCLASSPROC on a Tk window. Windows
+# resize/move processing re-enters WNDPROC while ctypes may have released the
+# GIL; handing that traffic through a Python callback can terminate Python
+# with PyEval_RestoreThread. Let Tk's native C WNDPROC own all messages.
+class SequentNativeChrome:
+    """Use Windows-managed sizing with custom-painted Sequent window chrome.
+
+    Preserve WS_THICKFRAME for native live resizing, but ask the Windows 11
+    Desktop Window Manager not to paint its visible border. Never subclass
+    Tk's native WNDPROC from Python (a resize can otherwise crash the GIL).
+    """
+    WS_CAPTION = 0x00C00000
+    WS_THICKFRAME = 0x00040000
+    WS_SYSMENU = 0x00080000
+    WS_MINIMIZEBOX = 0x00020000
+    WS_MAXIMIZEBOX = 0x00010000
+    SWP_FRAMECHANGED = 0x0020
+    SWP_NOMOVE = 0x0002
+    SWP_NOSIZE = 0x0001
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+
+    def __init__(self, window, resizable=True):
+        self.window = window
+        self.resizable = resizable
+        self.hwnd = native_toplevel_hwnd(window)
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        user32.SetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_int, ctypes.c_uint]
+        user32.SetWindowPos.restype = ctypes.c_int
+
+        old_style = user32.GetWindowLongW(self.hwnd, -16)
+        style = (old_style & ~self.WS_CAPTION) | self.WS_SYSMENU | self.WS_MINIMIZEBOX
+        if resizable:
+            style |= self.WS_THICKFRAME | self.WS_MAXIMIZEBOX
+        else:
+            style &= ~(self.WS_THICKFRAME | self.WS_MAXIMIZEBOX)
+        user32.SetWindowLongW(self.hwnd, -16, style)
+        if not user32.SetWindowPos(self.hwnd, None, 0, 0, 0, 0,
+            self.SWP_FRAMECHANGED | self.SWP_NOMOVE | self.SWP_NOSIZE |
+            self.SWP_NOZORDER | self.SWP_NOACTIVATE):
+            # Restore the original style if Windows refuses the frame update.
+            user32.SetWindowLongW(self.hwnd, -16, old_style)
+            raise OSError('Could not update Sequent window frame')
+
+        # Ask DWM for rounded corners; this does not intercept window messages.
+        try:
+            value = ctypes.c_int(2)  # DWMWCP_ROUND
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                ctypes.c_void_p(self.hwnd), 33, ctypes.byref(value), ctypes.sizeof(value))
+        except (OSError, AttributeError):
+            pass
+        self.refresh_dwm_frame()
+        self.true_frameless = False
+        # Optional native, GIL-independent non-client-area handling. Retain
+        # the existing safe, thin-frame implementation if the DLL is absent.
+        if os.environ.get('SEQUENT_WINDOW_MODE', 'custom').lower() not in ('legacy', 'native'):
+            native = get_sequent_native_chrome()
+            if native is not None:
+                try:
+                    if native.SequentInstallChrome(ctypes.c_void_p(self.hwnd), 8 if resizable else 0):
+                        if user32.SetWindowPos(self.hwnd, None, 0, 0, 0, 0,
+                            self.SWP_FRAMECHANGED | self.SWP_NOMOVE | self.SWP_NOSIZE |
+                            self.SWP_NOZORDER | self.SWP_NOACTIVATE):
+                            self.true_frameless = True
+                        else:
+                            native.SequentRemoveChrome(ctypes.c_void_p(self.hwnd))
+                except (OSError, AttributeError) as exc:
+                    print(f'[Sequent] Native chrome unavailable: {exc}')
+
+    def refresh_dwm_frame(self):
+        """Hide the native white frame without losing Win32 live resizing.
+
+        DWMWA_BORDER_COLOR=DWMWA_COLOR_NONE (34, 0xFFFFFFFE) prevents Windows 11
+        from drawing its visible frame even with WS_THICKFRAME retained. The
+        caption's fallback color matches Sequent's current custom header,
+        so unsupported/partial DWM styling is less conspicuous. Unsupported
+        Windows versions safely retain the regular native resize border.
+        """
+        self.border_hidden = False
+        try:
+            dwm = ctypes.windll.dwmapi.DwmSetWindowAttribute
+            dwm.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                            ctypes.c_void_p, ctypes.c_uint32]
+            dwm.restype = ctypes.c_long
+            hwnd = ctypes.c_void_p(self.hwnd)
+            none = ctypes.c_uint32(0xFFFFFFFE)  # DWMWA_COLOR_NONE
+            hr = dwm(hwnd, 34, ctypes.byref(none), ctypes.sizeof(none))
+            self.border_hidden = (hr == 0)
+
+            # DWMWA_CAPTION_COLOR=35 (COLORREF is 0x00BBGGRR).
+            # This is updated again when the app switches light/dark themes.
+            header = globals().get('BG_HEADER', '#111318').lstrip('#')
+            if len(header) == 6:
+                r, g, b = (int(header[i:i+2], 16) for i in (0, 2, 4))
+                colorref = ctypes.c_uint32((b << 16) | (g << 8) | r)
+                dwm(hwnd, 35, ctypes.byref(colorref), ctypes.sizeof(colorref))
+        except (AttributeError, OSError, ValueError):
+            # Color attributes need Windows 11; avoid touching resizing/focus.
+            pass
+
+
+def install_sequent_chrome(window, *, resizable=True):
+    """Install safe custom window styling; Tk keeps its native WNDPROC."""
+    if os.name != 'nt' or os.environ.get('SEQUENT_WINDOW_MODE', 'custom') == 'native':
+        return None
+    window.update_idletasks()
+    return SequentNativeChrome(window, resizable=resizable)
+
+
+def begin_native_window_motion(window, hit_test=2):
+    """Queue native move/size after Tk's ButtonPress handler returns.
+
+    Posting avoids a nested synchronous SendMessage call into the Tk WNDPROC
+    while Tk is still executing the originating Python mouse callback.
+    """
+    user32 = ctypes.windll.user32
+    hwnd = native_toplevel_hwnd(window)
+    # Reuse the module-level POINT structure. ctypes checks structure class
+    # identity, not just compatible fields. Redefining POINT here would set
+    # GetCursorPos.argtypes globally to the nested type and break recording's
+    # get_mouse_pos() (and other screen-position callers).
+    point = POINT()
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+    user32.GetCursorPos.restype = ctypes.c_int
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        return False
+    # WM_NCLBUTTONDOWN expects signed virtual-desktop coordinates packed into LPARAM.
+    lparam = ((int(point.y) & 0xffff) << 16) | (int(point.x) & 0xffff)
+    user32.ReleaseCapture.argtypes = []
+    user32.ReleaseCapture.restype = ctypes.c_int
+    user32.ReleaseCapture()
+    user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                    ctypes.c_size_t, ctypes.c_ssize_t]
+    user32.PostMessageW.restype = ctypes.c_int
+    return bool(user32.PostMessageW(hwnd, 0x00A1, int(hit_test), lparam))
+
+
+def add_native_resize_grips(window, bg):
+    """Provide edge/corner hit targets for live OS-managed window resizing."""
+    grips = []
+    edge_specs = (
+        ('left_side', 10, dict(relx=0, rely=0, x=0, y=12, width=6, relheight=1, height=-24), 'size_we'),
+        ('right_side', 11, dict(relx=1, rely=0, x=-6, y=12, width=6, relheight=1, height=-24), 'size_we'),
+        ('top_side', 12, dict(relx=0, rely=0, x=12, y=0, relwidth=1, width=-24, height=6), 'size_ns'),
+        ('bottom_side', 15, dict(relx=0, rely=1, x=12, y=-6, relwidth=1, width=-24, height=6), 'size_ns'),
+        ('top_left', 13, dict(x=0, y=0, width=12, height=12), 'size_nw_se'),
+        ('top_right', 14, dict(relx=1, x=-12, y=0, width=12, height=12), 'size_ne_sw'),
+        ('bottom_left', 16, dict(x=0, rely=1, y=-12, width=12, height=12), 'size_ne_sw'),
+        ('bottom_right', 17, dict(relx=1, rely=1, x=-12, y=-12, width=12, height=12), 'size_nw_se'),
+    )
+    for name, code, geometry, cursor in edge_specs:
+        grip = tk.Frame(window, bg=bg, cursor=cursor, name='seq_grip_' + name)
+        grip.place(**geometry)
+        grip.bind('<Button-1>', lambda e, c=code: begin_native_window_motion(window, c))
+        grips.append(grip)
+    return grips
+
+
+# --- Native Tk toplevel placement and hit testing ---
+def native_toplevel_hwnd(window):
+    """Get the *wrapper* HWND. Tk's winfo_id() is its child HWND on Windows.
+
+    Moving or styling the child instead of the wrapper puts reticles/selection
+    overlays at a different position from their reported screen coordinates.
+    Explicit ctypes signatures avoid truncating 64-bit HWND values.
+    """
+    user32 = ctypes.windll.user32
+    user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    user32.GetAncestor.restype = ctypes.c_void_p
+    return user32.GetAncestor(window.winfo_id(), 2) or window.winfo_id()  # GA_ROOT
+
+
+def position_toplevel_on_screen(window, x, y, width, height, activate=False):
+    """Place a Tk Toplevel in *absolute virtual-screen pixels*, including negatives."""
+    x, y = int(x), int(y)
+    width, height = max(1, int(width)), max(1, int(height))
+    # Request size from Tk, then move its native outer wrapper (not the child).
+    # Tk's negative geometry notation is right/bottom-relative, so never pass
+    # negative screen coordinates through geometry() directly.
+    window.geometry(f"{width}x{height}")
+    window.update_idletasks()
+    hwnd = native_toplevel_hwnd(window)
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_uint]
+    user32.SetWindowPos.restype = ctypes.c_int
+    flags = 0x0040 | (0x0010 if not activate else 0)  # SHOWWINDOW | NOACTIVATE
+    if not user32.SetWindowPos(hwnd, ctypes.c_void_p(-1), x, y, width, height, flags):
+        raise OSError("Could not position screen overlay")
+
+
+def set_overlay_input_passthrough(window, enabled):
+    """Use the actual top-level HWND for click-through; disable it for dragging."""
+    hwnd = native_toplevel_hwnd(window)
+    user32 = ctypes.windll.user32
+    # LongPtr preserves Win64 styles and avoids accidental HWND truncation.
+    get_style = getattr(user32, "GetWindowLongPtrW", None)
+    set_style = getattr(user32, "SetWindowLongPtrW", None)
+    if get_style is None or set_style is None:
+        get_style = user32.GetWindowLongW
+        set_style = user32.SetWindowLongW
+        style_t = ctypes.c_long
+    else:
+        style_t = ctypes.c_ssize_t
+    get_style.argtypes, get_style.restype = [ctypes.c_void_p, ctypes.c_int], style_t
+    set_style.argtypes = [ctypes.c_void_p, ctypes.c_int, style_t]
+    set_style.restype = style_t
+    WS_EX_TRANSPARENT = 0x00000020
+    WS_EX_NOACTIVATE = 0x08000000
+    before = get_style(hwnd, -20)
+    after = (before | WS_EX_NOACTIVATE)
+    after = (after | WS_EX_TRANSPARENT) if enabled else (after & ~WS_EX_TRANSPARENT)
+    if after != before:
+        set_style(hwnd, -20, after)
+        # Refresh window manager state after changing extended styles.
+        user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_uint]
+        user32.SetWindowPos.restype = ctypes.c_int
+        user32.SetWindowPos(hwnd, None, 0, 0, 0, 0,
+                            0x0001 | 0x0002 | 0x0010 | 0x0020)
+        # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_FRAMECHANGED
+
+
+# --- Fast live-overlay movement and Windows capture exclusion ---
+def move_overlay_without_redraw(window, x, y):
+    """Move the real HWND without modifying Tk geometry or repainting its canvas.
+
+    Rebuilding a Toplevel on each arrow press makes the reticle flash. This
+    changes only its position; the existing pixels and drag bindings survive.
+    """
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_uint]
+    user32.SetWindowPos.restype = ctypes.c_int
+    # SWP_NOSIZE | SWP_NOACTIVATE. The Toplevel is already visible/topmost.
+    if not user32.SetWindowPos(native_toplevel_hwnd(window), None,
+                               int(x), int(y), 0, 0, 0x0001 | 0x0010):
+        raise OSError("Unable to move preview reticle")
+
+
+def exclude_overlay_from_capture(window):
+    """Exclude Sequent's own preview windows from Windows screen capture.
+
+    On supported Windows 10/11 builds WDA_EXCLUDEFROMCAPTURE keeps the green
+    outline out of BitBlt reads without hiding/redrawing anything. We do not
+    fall back to WDA_MONITOR: its black capture rectangle can cover the object
+    being searched and create false negatives.
+    """
+    try:
+        affinity = ctypes.windll.user32.SetWindowDisplayAffinity
+        affinity.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        affinity.restype = ctypes.c_int
+        hwnd = native_toplevel_hwnd(window)
+        return bool(affinity(hwnd, 0x00000011))  # WDA_EXCLUDEFROMCAPTURE
+    except (AttributeError, OSError):
+        return False
+
+
 # --- Native Windows API Constants & Structures ---
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
@@ -340,27 +738,152 @@ def get_mouse_pos():
     return pt.x, pt.y
 
 def move_mouse(x, y):
-    ctypes.windll.user32.SetCursorPos(int(x), int(y))
+    """Move the real cursor, reporting API failure instead of clicking at stale coordinates."""
+    user32 = ctypes.windll.user32
+    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    user32.SetCursorPos.restype = ctypes.c_int
+    if not user32.SetCursorPos(int(x), int(y)):
+        raise MacroExecutionError(f"Windows could not move the cursor to ({x}, {y})")
 
 def get_pixel_color(x, y):
-    """Fetches screen pixel color as an uppercase hex string (#RRGGBB) via Win32 GDI."""
-    hdc = ctypes.windll.user32.GetDC(0)
-    color = ctypes.windll.gdi32.GetPixel(hdc, int(x), int(y))
-    ctypes.windll.user32.ReleaseDC(0, hdc)
-    if color == -1:
-        return "#000000"
+    """Read a desktop pixel using correctly typed 64-bit Win32 GDI handles.
+
+    GetDC and GetPixel must agree on the HDC type. Otherwise, after the color
+    scanner sets GetDC.restype=c_void_p, an untyped GetPixel argument raises
+    ctypes.ArgumentError/OverflowError on 64-bit Windows.
+    """
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    HDC = ctypes.c_void_p
+    user32.GetDC.argtypes = [ctypes.c_void_p]
+    user32.GetDC.restype = HDC
+    user32.ReleaseDC.argtypes = [ctypes.c_void_p, HDC]
+    user32.ReleaseDC.restype = ctypes.c_int
+    gdi32.GetPixel.argtypes = [HDC, ctypes.c_int, ctypes.c_int]
+    gdi32.GetPixel.restype = ctypes.c_uint32  # COLORREF / CLR_INVALID
+
+    hdc = user32.GetDC(None)
+    if not hdc:
+        raise MacroExecutionError("Could not access desktop pixels (GetDC failed)")
+    try:
+        color = gdi32.GetPixel(hdc, int(x), int(y))
+    finally:
+        user32.ReleaseDC(None, hdc)
+    if color == 0xFFFFFFFF:  # CLR_INVALID; don't silently interpret as black
+        raise MacroExecutionError(f"Could not sample pixel at ({x}, {y})")
     r = color & 0xFF
     g = (color >> 8) & 0xFF
     b = (color >> 16) & 0xFF
     return f"#{r:02X}{g:02X}{b:02X}"
 
-def click(button="left"):
-    if button == "left":
-        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-    elif button == "right":
-        ctypes.windll.user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-        ctypes.windll.user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+
+# Native INPUT / MOUSEINPUT layout, including 64-bit ULONG_PTR alignment.
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_int32), ("dy", ctypes.c_int32),
+                ("mouseData", ctypes.c_uint32), ("dwFlags", ctypes.c_uint32),
+                ("time", ctypes.c_uint32), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_uint32), ("u", INPUT_UNION)]
+
+
+def wait_for_cursor_settled(x, y, timeout_s=0.90, settle_s=0.075, tolerance=2):
+    """Wait until the real cursor is at the target *continuously* for a short time.
+
+    SetCursorPos returning success doesn't mean an application's event loop has
+    processed the movement yet. Give the target a minimum hover/settling window,
+    independent of macro playback speed. A timeout cancels the click safely.
+    """
+    x, y = int(x), int(y)
+    deadline = time.monotonic() + timeout_s
+    stable_since = None
+    last_pos = get_mouse_pos()
+    while True:
+        last_pos = get_mouse_pos()
+        if abs(last_pos[0] - x) <= tolerance and abs(last_pos[1] - y) <= tolerance:
+            if stable_since is None:
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= settle_s:
+                return
+        else:
+            stable_since = None
+        if time.monotonic() >= deadline:
+            raise MacroExecutionError(
+                f"Cursor did not settle at ({x}, {y}); last position "
+                f"{last_pos}. Click cancelled."
+            )
+        time.sleep(0.01)
+
+
+def click(button="left", hold_s=0.055):
+    """Inject a checked mouse down, hold briefly, then inject mouse up.
+
+    A batched down+up can be processed in one application frame and appear to
+    do nothing. Send separate events with a minimum hold duration that doesn't
+    shrink when playback is accelerated. OS acceptance still doesn't guarantee
+    that a particular application responds to synthetic input.
+    """
+    flags = {
+        "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+    }.get(button)
+    if flags is None:
+        raise MacroExecutionError(f"Unsupported mouse button: {button!r}")
+
+    user32 = ctypes.windll.user32
+    user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
+    user32.SendInput.restype = ctypes.c_uint
+
+    def send_flag(flag):
+        event = INPUT()
+        event.type = 0  # INPUT_MOUSE
+        event.u.mi.dwFlags = flag
+        return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) == 1
+
+    if not send_flag(flags[0]):
+        raise MacroExecutionError(f"Windows rejected mouse-down for {button} click")
+    try:
+        time.sleep(max(0.03, float(hold_s)))
+    finally:
+        # Always try to release, even if the wait is interrupted.
+        released = send_flag(flags[1])
+    if not released:
+        raise MacroExecutionError(f"Windows rejected mouse-up for {button} click")
+
+
+def perform_color_target_action(action, found_box, playback_speed=1.0):
+    """Shared Find Color & Click behavior for player, debugger, and chains.
+
+    Only the visual detection coordinates influence the saved click target.
+    The reticle may be freely offset outside the object's bounding rectangle.
+    """
+    tx, ty = color_click_target(action, found_box)
+    mode = action.get("action", "Single Click")
+    if mode not in ("Move Only", "Single Click", "Double Click"):
+        raise MacroExecutionError(f"Unrecognized Find Color action: {mode!r}")
+    move_mouse(tx, ty)
+    # Not proportional to speed: the target UI still needs time to handle
+    # mouse movement even when macro playback is accelerated.
+    wait_for_cursor_settled(tx, ty)
+    if mode in ("Single Click", "Double Click"):
+        # Check again directly before sending mouse-down, as external input can
+        # move the cursor after the initial settling interval.
+        actual_x, actual_y = get_mouse_pos()
+        if abs(actual_x - tx) > 2 or abs(actual_y - ty) > 2:
+            raise MacroExecutionError(
+                f"Cursor moved to ({actual_x}, {actual_y}) after settling; "
+                f"expected ({tx}, {ty}). Click cancelled."
+            )
+        click("left")
+    if mode == "Double Click":
+        time.sleep(0.07)
+        click("left")
+    return (mode, tx, ty)
 
 def send_unicode_char(char):
     """Dispatches raw Unicode characters that lack a standard Virtual Key code."""
@@ -458,8 +981,9 @@ TEXT_PRIMARY = "#edf1f6"
 TEXT_MUTED = "#a0aab8"
 TEXT_HEADER = "#ffffff"
 
-COLOR_ACCENT = "#347bd8"
-COLOR_ACCENT_HOV = "#2667be"
+COLOR_ACCENT = "#347BD8"
+COLOR_ACCENT_HOV = "#2667BE"
+TEXT_ON_ACCENT = "#FFFFFF"
 COLOR_DANGER = "#d54d54"
 COLOR_DANGER_HOV = "#a73942"
 COLOR_SUCCESS = "#35a879"
@@ -469,6 +993,60 @@ SYNTAX_BLUE = "#79b8ff"
 SYNTAX_ORANGE = "#f3ba65"
 SYNTAX_PURPLE = "#c4a3ed"
 SYNTAX_GREEN = "#65d4aa"
+
+
+DEFAULT_ACCENT_COLOR = "#347BD8"
+ACCENT_PRESETS = (
+    ("Sequent Blue", "#347BD8"),
+    ("Blurple", "#5865F2"),
+    ("Violet", "#9256CC"),
+    ("Mint", "#1BA883"),
+    ("Coral", "#DE6752"),
+    ("Rose", "#D14C91"),
+    ("Amber", "#E9AC32"),
+)
+
+
+def normalize_accent_color(value):
+    """Return a canonical #RRGGBB or reject malformed user/config values."""
+    if not isinstance(value, str):
+        raise ValueError("Accent color must be a hexadecimal string")
+    value = value.strip().upper()
+    if re.fullmatch(r"#[0-9A-F]{3}", value):
+        value = "#" + "".join(ch * 2 for ch in value[1:])
+    if not re.fullmatch(r"#[0-9A-F]{6}", value):
+        raise ValueError("Enter a color such as #5865F2")
+    return value
+
+
+def blend_hex(foreground, background, foreground_weight):
+    """Blend RGB colors without third-party dependencies."""
+    ratio = max(0, min(1, float(foreground_weight)))
+    fg = [int(foreground[i:i + 2], 16) for i in (1, 3, 5)]
+    bg = [int(background[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(a * ratio + b * (1 - ratio)):02X}" for a, b in zip(fg, bg))
+
+
+def accent_text_color(hex_color):
+    """Prefer readable text on both bright and dark accent choices."""
+    channels = [int(hex_color[i:i + 2], 16) / 255.0 for i in (1, 3, 5)]
+    linear = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in channels]
+    luminance = sum(a * b for a, b in zip(linear, (0.2126, 0.7152, 0.0722)))
+    return "#111318" if luminance > 0.179 else "#FFFFFF"
+
+
+def read_windows_app_theme():
+    """Read Windows 'Default app mode'. Unavailable keys safely default to dark."""
+    if os.name != "nt":
+        return "dark"
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            value, _type = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        return "light" if int(value) else "dark"
+    except (OSError, ValueError, TypeError, ImportError):
+        return "dark"
 
 
 def sequent_dock_header(parent, title, subtitle="", right_text=""):
@@ -494,7 +1072,7 @@ def sequent_toolbar_button(parent, text, command, accent=False):
     base = COLOR_ACCENT if accent else BG_INPUT
     hover = COLOR_ACCENT_HOV if accent else BG_HOVER
     label = tk.Label(parent, text=text, bg=base,
-                     fg="#ffffff" if accent else TEXT_PRIMARY,
+                     fg=TEXT_ON_ACCENT if accent else TEXT_PRIMARY,
                      font=("Segoe UI", 9, "bold"), padx=11, pady=6,
                      cursor="hand2", highlightbackground=BG_BORDER,
                      highlightthickness=0 if accent else 1)
@@ -502,6 +1080,358 @@ def sequent_toolbar_button(parent, text, command, accent=False):
     label.bind("<Enter>", lambda e: label.config(bg=hover))
     label.bind("<Leave>", lambda e: label.config(bg=base))
     return label
+
+
+# --- Sequent native-looking, dependency-free custom accent color dialog ---
+class SequentAccentColorDialog:
+    """HSV square + hue strip with HEX/RGB controls; saves only when applied.
+
+    The desktop accent is NOT modified during preview. This prevents Sequent's
+    full theme rebuild from destroying the still-open editor on every drag.
+    """
+
+    SV_WIDTH = 242
+    SV_HEIGHT = 208
+    HUE_WIDTH = 26
+
+    def __init__(self, app):
+        self.app = app
+        self.original = app.accent_color
+        self.selected = self.original
+        self._closing = False
+        self._updating_fields = False
+        self._sv_image = None
+        self._sv_redraw_job = None
+        self.h, self.s, self.v = self.hex_to_hsv(self.original)
+
+        self.window = tk.Toplevel(app.root)
+        self.window.title("Sequent — Custom Accent Color")
+        self.window.configure(bg=BG_BORDER)
+        self.window.resizable(False, False)
+        self.window.transient(app.root)
+        self.window.attributes("-topmost", True)
+        self.window.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.window.bind("<Escape>", self.cancel)
+        self._chrome = None
+
+        # Place inside the current screen; preserve topmost behavior of Sequent's
+        # borderless root without hiding the chooser behind the main workspace.
+        self._build()
+        self.window.update_idletasks()
+        width = 596
+        # Use the actual requested size; fixed short heights can hide the footer.
+        height = min(max(620, self.window.winfo_reqheight()),
+                     max(480, self.window.winfo_screenheight() - 64))
+        app.root.update_idletasks()
+        left = app.root.winfo_rootx() + max(0, (app.root.winfo_width() - width) // 2)
+        top = app.root.winfo_rooty() + max(0, (app.root.winfo_height() - height) // 2)
+        left = max(0, min(left, self.window.winfo_screenwidth() - width))
+        top = max(0, min(top, self.window.winfo_screenheight() - height))
+        self.window.geometry(f"{width}x{height}+{left}+{top}")
+        if os.name == 'nt':
+            self._chrome = install_sequent_chrome(self.window, resizable=False)
+        self._render_sv_image()
+        self._draw_cursors()
+        self._update_preview()
+        self.window.grab_set()
+        self.window.lift()
+        self.window.focus_force()
+
+    @staticmethod
+    def hex_to_rgb(color):
+        color = normalize_accent_color(color)
+        return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+    @staticmethod
+    def rgb_to_hex(rgb):
+        return "#" + "".join(f"{max(0, min(255, round(c))):02X}" for c in rgb)
+
+    @classmethod
+    def hex_to_hsv(cls, color):
+        r, g, b = cls.hex_to_rgb(color)
+        return colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+
+    @staticmethod
+    def hsv_to_hex(h, s, v):
+        return SequentAccentColorDialog.rgb_to_hex(
+            tuple(c * 255 for c in colorsys.hsv_to_rgb(h % 1.0, s, v))
+        )
+
+    def _label(self, parent, text, *, size=9, color=None, bold=False, bg=None):
+        return tk.Label(parent, text=text, bg=bg or BG_PANEL, fg=color or TEXT_PRIMARY,
+                        font=("Segoe UI", size, "bold" if bold else "normal"),
+                        anchor="w")
+
+    def _build(self):
+        card = tk.Frame(self.window, bg=BG_PANEL)
+        card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        head = tk.Frame(card, bg=BG_HEADER, height=67)
+        head.pack(fill=tk.X)
+        head.pack_propagate(False)
+        if os.name == 'nt':
+            head.bind('<Button-1>', lambda e: begin_native_window_motion(self.window))
+        tk.Frame(head, bg=COLOR_ACCENT, width=4).pack(side=tk.LEFT, fill=tk.Y)
+        title_box = tk.Frame(head, bg=BG_HEADER)
+        title_box.pack(side=tk.LEFT, padx=18, pady=10)
+        self._label(title_box, "CUSTOM ACCENT COLOR", size=12, bold=True, bg=BG_HEADER).pack(anchor="w")
+        self._label(title_box, "Fine-tune Sequent's workspace highlight color", size=8,
+                    color=TEXT_MUTED, bg=BG_HEADER).pack(anchor="w", pady=(3, 0))
+        if os.name == 'nt':
+            for widget in [title_box, *title_box.winfo_children()]:
+                widget.bind('<Button-1>', lambda e: begin_native_window_motion(self.window))
+        close = tk.Label(head, text="✕", bg=BG_HEADER, fg=TEXT_MUTED,
+                         font=("Segoe UI", 13), padx=17, cursor="hand2")
+        close.pack(side=tk.RIGHT, fill=tk.Y)
+        close.bind("<Button-1>", lambda e: self.cancel())
+
+        # Reserve footer space before growing the content frame, so buttons
+        # are not packed offscreen when the desktop is small or DPI is high.
+        footer = tk.Frame(card, bg=BG_HEADER, height=66)
+        footer.pack(fill=tk.X, side=tk.BOTTOM)
+        footer.pack_propagate(False)
+        content = tk.Frame(card, bg=BG_PANEL, padx=20, pady=15)
+        content.pack(fill=tk.BOTH, expand=True)
+        self._label(content, "COLOR SPECTRUM", color=TEXT_MUTED, size=8, bold=True).pack(anchor="w", pady=(0, 8))
+        top = tk.Frame(content, bg=BG_PANEL)
+        top.pack(fill=tk.X)
+        spectrum = tk.Frame(top, bg=BG_PANEL)
+        spectrum.pack(side=tk.LEFT, anchor="n")
+
+        self.sv_canvas = tk.Canvas(spectrum, width=self.SV_WIDTH, height=self.SV_HEIGHT,
+                                   bg=BG_INPUT, highlightthickness=1,
+                                   highlightbackground=BG_BORDER, cursor="crosshair", bd=0)
+        self.sv_canvas.pack(side=tk.LEFT)
+        self.sv_canvas.bind("<Button-1>", self._on_sv_drag)
+        self.sv_canvas.bind("<B1-Motion>", self._on_sv_drag)
+        self._sv_image = tk.PhotoImage(width=self.SV_WIDTH, height=self.SV_HEIGHT)
+        self.sv_canvas.create_image(0, 0, image=self._sv_image, anchor="nw")
+
+        self.hue_canvas = tk.Canvas(spectrum, width=self.HUE_WIDTH, height=self.SV_HEIGHT,
+                                    bg=BG_INPUT, bd=0, highlightthickness=1,
+                                    highlightbackground=BG_BORDER, cursor="sb_v_double_arrow")
+        self.hue_canvas.pack(side=tk.LEFT, padx=(11, 0))
+        self.hue_canvas.bind("<Button-1>", self._on_hue_drag)
+        self.hue_canvas.bind("<B1-Motion>", self._on_hue_drag)
+        for y in range(self.SV_HEIGHT):
+            c = self.hsv_to_hex(y / max(1, self.SV_HEIGHT - 1), 1.0, 1.0)
+            self.hue_canvas.create_line(0, y, self.HUE_WIDTH, y, fill=c)
+
+        right = tk.Frame(top, bg=BG_PANEL)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(19, 0))
+        self._label(right, "BEFORE", size=8, bold=True, color=TEXT_MUTED).pack(anchor="w")
+        self.before_swatch = tk.Label(right, bg=self.original, height=2,
+                                      highlightthickness=1, highlightbackground=BG_BORDER)
+        self.before_swatch.pack(fill=tk.X, pady=(4, 7))
+        self._label(right, self.original, size=9, color=TEXT_MUTED).pack(anchor="w")
+        self._label(right, "AFTER", size=8, bold=True, color=TEXT_MUTED).pack(anchor="w", pady=(14, 0))
+        self.after_swatch = tk.Label(right, bg=self.selected, height=2,
+                                     highlightthickness=1, highlightbackground=BG_BORDER)
+        self.after_swatch.pack(fill=tk.X, pady=(4, 7))
+        self.after_code = self._label(right, self.selected, size=9, color=TEXT_MUTED)
+        self.after_code.pack(anchor="w")
+        self.brand_preview = tk.Label(right, text="MACRO WORKSPACE", bg=BG_INPUT,
+                                      fg=self.selected, font=("Segoe UI", 9, "bold"),
+                                      pady=10, padx=5)
+        self.brand_preview.pack(fill=tk.X, pady=(16, 0))
+
+        self._label(content, "HEX AND RGB", color=TEXT_MUTED, size=8, bold=True).pack(anchor="w", pady=(17, 7))
+        fields = tk.Frame(content, bg=BG_PANEL)
+        fields.pack(fill=tk.X)
+        self.hex_var = tk.StringVar(value=self.selected)
+        self.rgb_vars = [tk.StringVar(value=str(c)) for c in self.hex_to_rgb(self.selected)]
+
+        def field_box(title, var, width):
+            part = tk.Frame(fields, bg=BG_PANEL)
+            part.pack(side=tk.LEFT, padx=(0, 12))
+            self._label(part, title, size=8, color=TEXT_MUTED).pack(anchor="w")
+            entry = tk.Entry(part, textvariable=var, width=width, bg=BG_INPUT,
+                             fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                             relief="flat", font=("Consolas", 10),
+                             highlightbackground=BG_BORDER, highlightthickness=1)
+            entry.pack(ipady=6, pady=(3, 0))
+            return entry
+
+        hex_entry = field_box("Hexadecimal", self.hex_var, 13)
+        hex_entry.bind("<KeyRelease>", self._from_hex)
+        hex_entry.bind("<Return>", self._from_hex)
+        for name, var in zip(("Red", "Green", "Blue"), self.rgb_vars):
+            entry = field_box(name, var, 5)
+            entry.bind("<KeyRelease>", self._from_rgb)
+            entry.bind("<Return>", self._from_rgb)
+        self.validation_msg = self._label(content, "Drag the spectrum or enter a color value.",
+                                           size=8, color=TEXT_MUTED)
+        self.validation_msg.pack(anchor="w", pady=(6, 0))
+
+        presets = tk.Frame(content, bg=BG_PANEL)
+        presets.pack(fill=tk.X, pady=(11, 2))
+        self._label(presets, "PRESETS", color=TEXT_MUTED, bold=True, size=8).pack(side=tk.LEFT, padx=(0, 13))
+        for name, hex_value in ACCENT_PRESETS:
+            button = tk.Button(presets, bg=hex_value, activebackground=hex_value,
+                               width=3, height=1, relief="flat", bd=0,
+                               cursor="hand2", highlightthickness=1,
+                               highlightbackground=BG_BORDER,
+                               command=lambda c=hex_value: self._set_color(c))
+            button.pack(side=tk.LEFT, padx=(0, 9))
+            ModernTooltip(button, name)
+
+        buttons = tk.Frame(footer, bg=BG_HEADER)
+        buttons.pack(side=tk.RIGHT, padx=20, pady=13)
+        tk.Button(buttons, text="Cancel", command=self.cancel, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                  activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
+                  font=("Segoe UI", 9, "bold"), relief="flat", bd=0, cursor="hand2",
+                  padx=20, pady=8).pack(side=tk.LEFT, padx=(0, 9))
+        self.apply_button = tk.Button(buttons, text="Apply Accent", command=self.apply,
+                                      bg=self.selected, fg=accent_text_color(self.selected),
+                                      activebackground=self.selected,
+                                      activeforeground=accent_text_color(self.selected),
+                                      font=("Segoe UI", 9, "bold"), relief="flat", bd=0,
+                                      cursor="hand2", padx=19, pady=8)
+        self.apply_button.pack(side=tk.LEFT)
+
+    def _render_sv_image(self):
+        # PhotoImage is in the Python standard-library Tk distribution.
+        # Updating rows is significantly smoother than thousands of Canvas items.
+        hues = [colorsys.hsv_to_rgb(self.h, x / max(1, self.SV_WIDTH - 1), 1)
+                for x in range(self.SV_WIDTH)]
+        for y in range(self.SV_HEIGHT):
+            value = 1 - y / max(1, self.SV_HEIGHT - 1)
+            pixels = "{" + " ".join(self.rgb_to_hex((r * value * 255,
+                                                       g * value * 255,
+                                                       b * value * 255))
+                                          for r, g, b in hues) + "}"
+            self._sv_image.put(pixels, to=(0, y))
+
+    def _schedule_sv_render(self):
+        # Hue dragging can generate dozens of events per second. Coalesce
+        # gradient rebuilds without delaying the selected-color preview.
+        if self._sv_redraw_job is None:
+            self._sv_redraw_job = self.window.after(35, self._flush_sv_render)
+
+    def _flush_sv_render(self):
+        self._sv_redraw_job = None
+        if self.window.winfo_exists():
+            self._render_sv_image()
+            self._draw_cursors()
+
+    def _draw_cursors(self):
+        x = round(self.s * (self.SV_WIDTH - 1))
+        y = round((1 - self.v) * (self.SV_HEIGHT - 1))
+        self.sv_canvas.delete("selection")
+        self.sv_canvas.create_oval(x - 6, y - 6, x + 6, y + 6,
+                                   outline="#111318", width=3, tags="selection")
+        self.sv_canvas.create_oval(x - 6, y - 6, x + 6, y + 6,
+                                   outline="#FFFFFF", width=1, tags="selection")
+        hy = round(self.h * (self.SV_HEIGHT - 1))
+        self.hue_canvas.delete("selection")
+        self.hue_canvas.create_line(0, hy, self.HUE_WIDTH, hy,
+                                    fill="#111318", width=5, tags="selection")
+        self.hue_canvas.create_line(0, hy, self.HUE_WIDTH, hy,
+                                    fill="#FFFFFF", width=2, tags="selection")
+
+    def _update_preview(self):
+        self.after_swatch.configure(bg=self.selected)
+        self.after_code.configure(text=self.selected)
+        self.brand_preview.configure(fg=self.selected)
+        text_fg = accent_text_color(self.selected)
+        self.apply_button.configure(bg=self.selected, fg=text_fg,
+                                    activebackground=self.selected, activeforeground=text_fg)
+
+    def _set_color(self, value, *, from_hex=False, from_rgb=False):
+        value = normalize_accent_color(value)
+        old_hue = self.h
+        new_h, self.s, self.v = self.hex_to_hsv(value)
+        # Hue is undefined for grayscale; preserve the selected hue in that case.
+        if self.s > 0:
+            self.h = new_h
+        self.selected = value
+        self._updating_fields = True
+        try:
+            if not from_hex:
+                self.hex_var.set(value)
+            if not from_rgb:
+                for var, channel in zip(self.rgb_vars, self.hex_to_rgb(value)):
+                    var.set(str(channel))
+        finally:
+            self._updating_fields = False
+        if abs(old_hue - self.h) > 0.000001:
+            self._schedule_sv_render()
+        self._draw_cursors()
+        self._update_preview()
+        self.validation_msg.configure(text="Ready to apply.", fg=TEXT_MUTED)
+
+    def _on_sv_drag(self, event):
+        self.s = max(0.0, min(1.0, event.x / max(1, self.SV_WIDTH - 1)))
+        self.v = 1 - max(0.0, min(1.0, event.y / max(1, self.SV_HEIGHT - 1)))
+        self._set_color(self.hsv_to_hex(self.h, self.s, self.v))
+
+    def _on_hue_drag(self, event):
+        self.h = max(0.0, min(1.0, event.y / max(1, self.SV_HEIGHT - 1)))
+        self._schedule_sv_render()
+        self._set_color(self.hsv_to_hex(self.h, self.s, self.v))
+
+    def _from_hex(self, event=None):
+        if self._updating_fields:
+            return
+        try:
+            value = normalize_accent_color(self.hex_var.get())
+        except ValueError:
+            self.validation_msg.configure(text="Use #RGB or #RRGGBB hexadecimal format.", fg=COLOR_DANGER)
+            return
+        self._set_color(value, from_hex=True)
+
+    def _from_rgb(self, event=None):
+        if self._updating_fields:
+            return
+        try:
+            values = [int(v.get()) for v in self.rgb_vars]
+            if any(not 0 <= value <= 255 for value in values):
+                raise ValueError()
+        except ValueError:
+            self.validation_msg.configure(text="RGB values must be integers from 0 to 255.", fg=COLOR_DANGER)
+            return
+        self._set_color(self.rgb_to_hex(values), from_rgb=True)
+
+    def _close(self):
+        if self._closing:
+            return False
+        self._closing = True
+        if self._sv_redraw_job is not None:
+            try:
+                self.window.after_cancel(self._sv_redraw_job)
+            except tk.TclError:
+                pass
+            self._sv_redraw_job = None
+        try:
+            self.window.grab_release()
+        except tk.TclError:
+            pass
+        if self.window.winfo_exists():
+            self.window.destroy()
+        self.app._accent_color_dialog = None
+        return True
+
+    def cancel(self, event=None):
+        self._close()
+
+    def apply(self):
+        # Refuse to apply an incomplete/invalid value still being edited.
+        # A spectrum drag/preset selection always leaves valid fields.
+        try:
+            typed = normalize_accent_color(self.hex_var.get())
+            rgb = [int(v.get()) for v in self.rgb_vars]
+            if any(not 0 <= value <= 255 for value in rgb):
+                raise ValueError("RGB must be 0–255")
+            if typed != self.selected or self.rgb_to_hex(rgb) != self.selected:
+                raise ValueError("Finish editing the color fields before applying")
+        except ValueError:
+            self.validation_msg.configure(text="Correct the HEX/RGB fields before applying.",
+                                          fg=COLOR_DANGER)
+            return
+        chosen = self.selected
+        if self._close():
+            # Finish the modal event before Sequent rebuilds its themed widgets.
+            self.app.root.after_idle(lambda: self.app.set_accent_color(chosen))
+
 
 class ModernTooltip:
     """Renders a sleek Modern-themed floating micro-tooltip with hotkey badges."""
@@ -803,7 +1733,7 @@ class VSCodeQueueViewer(tk.Frame):
             bg=BG_GUTTER, fg=TEXT_MUTED, cursor="hand2", padx=0, pady=0,
             anchor="center"
         )
-        self.plus_btn.bind("<Enter>", lambda e: self.plus_btn.config(fg="#ffffff", bg=COLOR_ACCENT))
+        self.plus_btn.bind("<Enter>", lambda e: self.plus_btn.config(fg=TEXT_ON_ACCENT, bg=COLOR_ACCENT))
         self.plus_btn.bind("<Leave>", lambda e: self.plus_btn.config(fg=TEXT_MUTED, bg=BG_GUTTER))
         self.plus_btn.bind("<Button-1>", self._on_plus_btn_click)
 
@@ -829,7 +1759,7 @@ class VSCodeQueueViewer(tk.Frame):
 
         self.code_text.tag_configure("active_line", background="#36394a")
         self.code_text.tag_lower("active_line")
-        self.gutter.tag_configure("active_line", background=COLOR_ACCENT, foreground="#ffffff")
+        self.gutter.tag_configure("active_line", background=COLOR_ACCENT, foreground=TEXT_ON_ACCENT)
         self.gutter.tag_raise("active_line")
 
 
@@ -873,6 +1803,8 @@ class VSCodeQueueViewer(tk.Frame):
             pass
 
     def _on_text_selection_changed(self, event=None):
+        if getattr(self.app, "_reticle_edit_index", None) is not None:
+            return  # Live preview owns the screen overlays during edit mode.
         if not self.interactive_enabled or not self.app.recorded_actions:
             return
         try:
@@ -920,13 +1852,12 @@ class VSCodeQueueViewer(tk.Frame):
                     area = act.get("area", [0, 0, 0, 0])
                     ox, oy = int(act.get("ox", 0)), int(act.get("oy", 0))
                     
-                    found_box = self.app.search_color_in_area(area[0], area[1], area[2], area[3], act.get("color", "#FFFFFF"))
+                    found_box = self.app.search_color_in_area(*area, act.get("color", "#FFFFFF"),
+                                                        tolerance=act.get("tolerance", 8))
                     
                     if found_box:
                         x1, y1, x2, y2 = found_box
-                        anchor_x = x2 if ox > 0 else (x1 if ox < 0 else x1 + (x2 - x1) // 2)
-                        anchor_y = y2 if oy > 0 else (y1 if oy < 0 else y1 + (y2 - y1) // 2)
-                        rx, ry = anchor_x + ox, anchor_y + oy
+                        rx, ry = color_click_target(act, found_box)
                         if i == n - 1:
                             area_rect = (area[0], area[1], area[2], area[3], alpha)
                             color_rect = (x1, y1, x2 - x1, y2 - y1, alpha)
@@ -998,6 +1929,9 @@ class VSCodeQueueViewer(tk.Frame):
             return "break"
 
         # 2. Feature 2: Keyboard Scrubber Navigation Shortcuts
+        if self.app._reticle_edit_index is not None and event.keysym in ("Left", "Right", "Up", "Down"):
+            self.app._on_scrub_nav({"Left": "prev", "Right": "next", "Up": "up", "Down": "down"}[event.keysym])
+            return "break"
         if event.keysym == "Left":
             self.app._on_scrub_nav("prev")
             return "break"
@@ -1233,6 +2167,13 @@ class VSCodeQueueViewer(tk.Frame):
         initial_action = type_to_label.get(
             edit_action.get("type"), "Delay") if edit_action else "Delay"
 
+        # The color editor must see the actual desktop, not our live overlays.
+        # Stop only when reopening a color action's properties; users can
+        # restart live preview after saving without losing their offsets.
+        if (edit_action and edit_action.get("type") == "find_color" and
+                getattr(self.app, "_reticle_edit_index", None) is not None):
+            self.app.stop_reticle_edit()
+
         class RECT(ctypes.Structure):
             _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                         ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
@@ -1266,10 +2207,14 @@ class VSCodeQueueViewer(tk.Frame):
         init_y = mon_y + max(0, (mon_h - menu_h) // 2)
 
         self.sub_menu = tk.Toplevel(self.app.root)
-        self.sub_menu.overrideredirect(True)
+        if os.name != 'nt':
+            self.sub_menu.overrideredirect(True)
         self.sub_menu.attributes("-topmost", True)
         self.sub_menu.geometry(f"{menu_w}x{menu_h}+{init_x}+{init_y}")
         self.sub_menu.configure(bg=BG_BORDER)
+        if os.name == 'nt':
+            self.sub_menu.minsize(min(560, menu_w), min(400, menu_h))
+            self._action_editor_native_chrome = install_sequent_chrome(self.sub_menu, resizable=True)
         self.sub_menu.bind("<Escape>", lambda e: self.close_sub_menu())
         self.sub_menu.bind("<Control-f>", lambda e: self._focus_action_search())
 
@@ -1288,11 +2233,16 @@ class VSCodeQueueViewer(tk.Frame):
         card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
         def start_drag(e):
+            if os.name == 'nt' and getattr(self, '_action_editor_native_chrome', None):
+                begin_native_window_motion(self.sub_menu, 2)
+                return
             self._sub_drag_start_x, self._sub_drag_start_y = e.x_root, e.y_root
             self._sub_drag_win_x = self.sub_menu.winfo_x()
             self._sub_drag_win_y = self.sub_menu.winfo_y()
 
         def do_drag(e):
+            if os.name == 'nt' and getattr(self, '_action_editor_native_chrome', None):
+                return
             dx = e.x_root - self._sub_drag_start_x
             dy = e.y_root - self._sub_drag_start_y
             self.sub_menu.geometry(
@@ -1384,6 +2334,9 @@ class VSCodeQueueViewer(tk.Frame):
             font=("Segoe UI", 9), anchor="w", justify="left",
             wraplength=max(200, menu_w - nav_width - 95))
         self._selected_action_desc.pack(fill=tk.X, pady=(5, 0))
+        # Keep text readable while the native window is resized live.
+        detail.bind('<Configure>', lambda e: self._selected_action_desc.config(
+            wraplength=max(170, e.width - 65)), add='+')
         tk.Frame(detail, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=23)
 
         editor_shell = tk.Frame(detail, bg=BG_PANEL)
@@ -1424,6 +2377,33 @@ class VSCodeQueueViewer(tk.Frame):
         self._action_search_var.trace_add("write", lambda *args: self._rebuild_action_picker())
         self.sub_menu.bind("<MouseWheel>", self._on_action_picker_mousewheel)
         self._switch_action_view(initial_action, line_num, edit_idx=edit_idx)
+        if os.name == 'nt' and getattr(self, '_action_editor_native_chrome', None):
+            self._action_editor_grips = add_native_resize_grips(self.sub_menu, BG_BORDER)
+        # The action editor is a separate custom-chrome window. Give it keyboard
+        # focus when opened rather than leaving focus in the main queue.
+        self.sub_menu.after_idle(self.restore_action_editor_focus)
+
+
+    def restore_action_editor_focus(self):
+        """Bring the open action editor in front of Sequent after a picker returns.
+
+        Screen selection temporarily hides the root and action editor. The
+        main-window styling helper remaps the root asynchronously; raising
+        the editor *before* that remap leaves it behind the main window.
+        """
+        editor = self.sub_menu
+        if editor is None:
+            return
+        try:
+            if not editor.winfo_exists():
+                return
+            editor.deiconify()
+            editor.attributes("-topmost", True)
+            editor.lift()
+            editor.focus_force()
+        except tk.TclError:
+            # User may have closed the editor while the deferred callback ran.
+            pass
 
 
     def _focus_action_search(self):
@@ -1980,7 +2960,7 @@ class VSCodeQueueViewer(tk.Frame):
                         target_state["target"] = os.path.abspath(chosen)
                         lbl_file.config(text=os.path.basename(chosen), fg=SYNTAX_GREEN)
 
-                btn_b = tk.Label(f_row, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3)
+                btn_b = tk.Label(f_row, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=8, pady=3)
                 btn_b.pack(side=tk.RIGHT)
                 btn_b.bind("<Button-1>", lambda e: browse_file())
 
@@ -2292,8 +3272,6 @@ class VSCodeQueueViewer(tk.Frame):
             x, y, w, h = area
             area_label.config(text=f"[{x},{y} {w}x{h}]", fg=SYNTAX_BLUE,
                               highlightbackground=BG_BORDER)
-            if self.sub_menu and self.sub_menu.winfo_exists():
-                self.sub_menu.deiconify()
 
         def choose_area():
             if self.sub_menu and self.sub_menu.winfo_exists():
@@ -2302,7 +3280,7 @@ class VSCodeQueueViewer(tk.Frame):
             self.app.start_screen_selection(snip_done)
 
         snip = tk.Label(area_row, text="⛶ Snip", font=("Segoe UI", 8, "bold"),
-                        bg=COLOR_ACCENT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3)
+                        bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=8, pady=3)
         snip.pack(side=tk.RIGHT)
         snip.bind("<Button-1>", lambda event: choose_area())
 
@@ -2406,9 +3384,9 @@ class VSCodeQueueViewer(tk.Frame):
 
         def trigger_snip():
             if self.sub_menu: self.sub_menu.withdraw()
-            self.app.start_screen_selection(lambda a: (on_area_snip_completed(a), self.sub_menu.deiconify() if self.sub_menu else None))
+            self.app.start_screen_selection(on_area_snip_completed)
 
-        btn_snip = tk.Label(area_row, text="⛶ Snip", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3)
+        btn_snip = tk.Label(area_row, text="⛶ Snip", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=8, pady=3)
         btn_snip.pack(side=tk.RIGHT)
         btn_snip.bind("<Button-1>", lambda e: trigger_snip())
 
@@ -2467,91 +3445,204 @@ class VSCodeQueueViewer(tk.Frame):
         ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit_search_area).pack(fill=tk.X)
 
     def _render_find_color_view(self, line_num, edit_idx=None):
+        """Full Find Color editor, including reselectable and numeric search bounds.
+
+        Double-clicking an existing action must not force the user to delete
+        and rebuild it. All controls initialize from the saved action; Save
+        preserves unrelated keys for forward compatibility.
+        """
         body = self.action_content_frame
-        curr = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else {}
+        curr = (self.app.recorded_actions[edit_idx]
+                if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
+                and self.app.recorded_actions[edit_idx].get("type") == "find_color"
+                else {})
 
-        # Area Snip
-        chosen = {"area": curr.get("area")}
+        def text_label(parent, label):
+            return tk.Label(parent, text=label, font=("Segoe UI", 8, "bold"),
+                            bg=BG_PANEL, fg=TEXT_MUTED)
+
+        def entry(parent, value, width=7, fg=TEXT_PRIMARY):
+            widget = tk.Entry(parent, width=width, bg=BG_INPUT, fg=fg,
+                              insertbackground=TEXT_PRIMARY, font=("Consolas", 9),
+                              bd=0, highlightbackground=BG_BORDER,
+                              highlightthickness=1)
+            widget.insert(0, str(value))
+            return widget
+
+        def set_value(widget, value):
+            widget.delete(0, tk.END)
+            widget.insert(0, str(value))
+            widget.config(highlightbackground=BG_BORDER)
+
+        title = "EDIT COLOR DETECTION" if edit_idx is not None else "NEW COLOR DETECTION"
+        text_label(body, title).pack(anchor="w", pady=(0, 5))
+        tk.Label(body, text="Define where Sequent searches. The Ghost Reticle can click anywhere outside this box.",
+                 font=("Segoe UI", 8), bg=BG_PANEL, fg=TEXT_MUTED,
+                 anchor="w", justify="left", wraplength=460).pack(fill=tk.X, pady=(0, 8))
+
+        # Explicit, editable screen search region: users can type exact screen
+        # coordinates or click Reselect to draw a fresh box on any monitor.
+        initial_area = curr.get("area", [0, 0, 0, 0])
+        if not isinstance(initial_area, (list, tuple)) or len(initial_area) != 4:
+            initial_area = [0, 0, 100, 100]
         area_row = tk.Frame(body, bg=BG_PANEL)
-        area_row.pack(fill=tk.X, pady=(0, 9))
-        area_text = f"[{chosen['area'][0]},{chosen['area'][1]} {chosen['area'][2]}x{chosen['area'][3]}]" if chosen["area"] else "Area: Not selected"
-        area_lbl = tk.Label(area_row, text=area_text, font=("Consolas", 8), bg=BG_INPUT, fg=SYNTAX_BLUE if chosen["area"] else TEXT_MUTED, padx=6, pady=3, highlightbackground=BG_BORDER, highlightthickness=1, anchor="w")
-        area_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        area_row.pack(fill=tk.X, pady=(0, 4))
+        area_entries = []
+        for label, value in zip(("X", "Y", "Width", "Height"), initial_area):
+            field = tk.Frame(area_row, bg=BG_PANEL)
+            field.pack(side=tk.LEFT, padx=(0, 9))
+            text_label(field, label).pack(anchor="w")
+            control = entry(field, value, width=7)
+            control.pack(pady=(3, 0))
+            area_entries.append(control)
 
-        def snip_done(a):
-            chosen["area"] = a
-            area_lbl.config(text=f"[{a[0]},{a[1]} {a[2]}x{a[3]}]", fg=SYNTAX_BLUE, highlightbackground=BG_BORDER)
-            if self.sub_menu: self.sub_menu.deiconify()
+        area_message = tk.Label(body, text="Search area is in absolute screen pixels (negative X/Y supported).",
+                                font=("Segoe UI", 8), bg=BG_PANEL, fg=TEXT_MUTED,
+                                anchor="w", wraplength=460)
+        area_message.pack(fill=tk.X, pady=(0, 5))
 
-        snip_btn = tk.Label(area_row, text="⛶ Snip", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3)
-        snip_btn.pack(side=tk.RIGHT)
-        snip_btn.bind("<Button-1>", lambda e: (self.sub_menu.withdraw(), self.app.start_screen_selection(snip_done)))
+        def resample_area_done(area):
+            if not body.winfo_exists():
+                return
+            for control, value in zip(area_entries, area):
+                set_value(control, value)
+            area_message.config(text=f"Selected search box: {area[2]}×{area[3]} at ({area[0]}, {area[1]})",
+                                fg=SYNTAX_GREEN)
 
-        # Color & Inspector
+        def pick_new_area():
+            if self.sub_menu and self.sub_menu.winfo_exists():
+                self.sub_menu.withdraw()
+            try:
+                self.app.start_screen_selection(resample_area_done)
+            except Exception as exc:
+                self.app.restore_after_desktop_picker()
+                error_lbl.config(text=f"Could not open screen selector: {exc}")
+
+        search_box_label = "⛶ Redefine Search Box on Desktop" if curr else "Define Search Box"
+        ModernButton(body, text=search_box_label,
+                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                     command=pick_new_area).pack(fill=tk.X, pady=(0, 12))
+
+        # Sampled hex color is editable, too; using the inspector should never
+        # discard typed region coordinates or existing offsets.
         col_row = tk.Frame(body, bg=BG_PANEL)
-        col_row.pack(fill=tk.X, pady=(0, 6))
-        tk.Label(col_row, text="Target Color:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT)
-        col_entry = tk.Entry(col_row, width=9, bg=BG_INPUT, fg=SYNTAX_GREEN, font=("Consolas", 9, "bold"), bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        col_entry.insert(0, str(curr.get("color", "#FFFFFF")).upper())
-        col_entry.pack(side=tk.LEFT, padx=(6, 10))
+        col_row.pack(fill=tk.X, pady=(0, 8))
+        text_label(col_row, "Target RGB:").pack(side=tk.LEFT)
+        col_entry = entry(col_row, curr.get("color", "#FFFFFF"), width=9, fg=SYNTAX_GREEN)
+        col_entry.pack(side=tk.LEFT, padx=(8, 10))
 
-        def on_color_picked(x, y, hex_color):
-            col_entry.delete(0, "end")
-            col_entry.insert(0, hex_color)
-            if self.sub_menu: self.sub_menu.deiconify()
+        def color_picked(x, y, hex_color):
+            if body.winfo_exists():
+                set_value(col_entry, hex_color)
+                area_message.config(text=f"Sampled {hex_color} at ({x}, {y})", fg=SYNTAX_GREEN)
 
-        insp_btn = tk.Label(col_row, text="⌖ Inspect", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=8, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
-        insp_btn.pack(side=tk.LEFT)
-        insp_btn.bind("<Button-1>", lambda e: (self.sub_menu.withdraw(), self.app.start_pixel_inspection(on_color_picked)))
+        def inspect_color():
+            if self.sub_menu and self.sub_menu.winfo_exists():
+                self.sub_menu.withdraw()
+            try:
+                self.app.start_pixel_inspection(color_picked)
+            except Exception as exc:
+                self.app.restore_after_desktop_picker()
+                error_lbl.config(text=f"Could not open color inspector: {exc}")
 
-        # Offsets
+        ModernButton(col_row, text="⌖ Sample Color", bg_color=COLOR_ACCENT,
+                     hover_color=COLOR_ACCENT_HOV, command=inspect_color).pack(side=tk.LEFT)
+
+        # Target movement is anchored to detected component, not constrained
+        # to the box's x/y or w/h.
         off_row = tk.Frame(body, bg=BG_PANEL)
-        off_row.pack(fill=tk.X, pady=(0, 6))
-        tk.Label(off_row, text="Offset X:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT)
-        ox_entry = tk.Entry(off_row, width=6, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        ox_entry.insert(0, str(curr.get("ox", 0)))
-        ox_entry.pack(side=tk.LEFT, padx=(4, 10))
-        tk.Label(off_row, text="Offset Y:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT)
-        oy_entry = tk.Entry(off_row, width=6, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        oy_entry.insert(0, str(curr.get("oy", 0)))
+        off_row.pack(fill=tk.X, pady=(0, 7))
+        text_label(off_row, "Offset X:").pack(side=tk.LEFT)
+        ox_entry = entry(off_row, curr.get("ox", 0))
+        ox_entry.pack(side=tk.LEFT, padx=(4, 14))
+        text_label(off_row, "Offset Y:").pack(side=tk.LEFT)
+        oy_entry = entry(off_row, curr.get("oy", 0))
         oy_entry.pack(side=tk.LEFT, padx=(4, 0))
 
-        # Action Type Dropdown
+        anchor_row = tk.Frame(body, bg=BG_PANEL)
+        anchor_row.pack(fill=tk.X, pady=(0, 8))
+        text_label(anchor_row, "Anchor:").pack(side=tk.LEFT)
+        anchor_var = tk.StringVar(value=curr.get("anchor", "Center"))
+        anchor_menu = tk.OptionMenu(anchor_row, anchor_var, *COLOR_ANCHORS)
+        anchor_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8),
+                           highlightthickness=1, highlightbackground=BG_BORDER,
+                           bd=0, relief="flat", cursor="hand2")
+        anchor_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        anchor_menu.pack(side=tk.LEFT, padx=(6, 12))
+        text_label(anchor_row, "RGB ±:").pack(side=tk.LEFT)
+        tolerance_entry = entry(anchor_row, curr.get("tolerance", 8), width=5)
+        tolerance_entry.pack(side=tk.LEFT, padx=(4, 0))
+
         act_row = tk.Frame(body, bg=BG_PANEL)
-        act_row.pack(fill=tk.X, pady=(0, 10))
-        tk.Label(act_row, text="Action:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED).pack(side=tk.LEFT)
+        act_row.pack(fill=tk.X, pady=(0, 8))
+        text_label(act_row, "When found:").pack(side=tk.LEFT)
         act_var = tk.StringVar(value=curr.get("action", "Single Click"))
         act_menu = tk.OptionMenu(act_row, act_var, "Move Only", "Single Click", "Double Click")
-        act_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
+        act_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8),
+                        highlightthickness=1, highlightbackground=BG_BORDER,
+                        bd=0, relief="flat", cursor="hand2")
         act_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         act_menu.pack(side=tk.LEFT, padx=(6, 0))
 
         if edit_idx is None:
             pos_var = tk.StringVar(value=f"Before Line {line_num}")
             pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8),
+                            highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
             pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-            pos_menu.pack(fill=tk.X, pady=(0, 10))
+            pos_menu.pack(fill=tk.X, pady=(0, 7))
 
-        def save():
+        error_lbl = tk.Label(body, text="", font=("Segoe UI", 8),
+                             bg=BG_PANEL, fg=COLOR_DANGER, anchor="w", wraplength=450)
+        error_lbl.pack(fill=tk.X, pady=(0, 5))
+
+        def save(start_reticle=False):
             try:
+                area = [int(field.get().strip()) for field in area_entries]
+                if area[2] <= 0 or area[3] <= 0:
+                    raise ValueError("Search Width and Height must be positive.")
+                if area[2] * area[3] > 16_000_000:
+                    raise ValueError("Search region is over 16 million pixels. Select a smaller area.")
                 ox, oy = int(ox_entry.get().strip()), int(oy_entry.get().strip())
+                tolerance = int(tolerance_entry.get().strip())
+                if not 0 <= tolerance <= 255:
+                    raise ValueError("RGB tolerance must be between 0 and 255.")
                 color = col_entry.get().strip().upper()
-                if not re.match(r"^#[0-9A-F]{6}$", color) or not chosen["area"]: raise ValueError
-            except ValueError:
+                if not re.fullmatch(r"#[0-9A-F]{6}", color):
+                    raise ValueError("Target color must be #RRGGBB, such as #35A879.")
+            except ValueError as exc:
+                error_lbl.config(text=str(exc) or "Enter valid integer coordinates and offsets.")
                 return
 
-            action = {"type": "find_color", "area": [int(n) for n in chosen["area"]], "color": color, "ox": ox, "oy": oy, "action": act_var.get()}
+            # Preserve any future action options that we don't expose yet.
+            updated_action = dict(curr)
+            updated_action.update({"type": "find_color", "area": area,
+                                   "color": color, "anchor": anchor_var.get(),
+                                   "tolerance": tolerance, "ox": ox, "oy": oy,
+                                   "action": act_var.get()})
             if edit_idx is not None:
-                self.app.recorded_actions[edit_idx] = action
+                saved_idx = edit_idx
+                self.app.recorded_actions[edit_idx] = updated_action
             else:
-                idx = line_num - 1 if "After" in pos_var.get() else line_num - 2
-                self.app.recorded_actions.insert(max(0, min(idx, len(self.app.recorded_actions))), action)
+                saved_idx = line_num - 1 if "After" in pos_var.get() else line_num - 2
+                saved_idx = max(0, min(saved_idx, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(saved_idx, updated_action)
 
-            self.app.display_actions_in_queue(self.app.recorded_actions)
             self.close_sub_menu()
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.set_active_action_index(saved_idx)
+            self.app.update_status("Find Color settings saved; search box and target offsets updated", COLOR_SUCCESS)
+            if start_reticle:
+                # Start on the next idle turn, after the editor has closed and
+                # the action queue has committed the new selection.
+                self.app.root.after(90, self.app.toggle_reticle_edit)
 
-        ModernButton(body, text="Save Action", bg_color=COLOR_SUCCESS, hover_color="#1d8a4b", command=save).pack(fill=tk.X)
+        ModernButton(body, text="Save Changes" if edit_idx is not None else "Add Find Color Action",
+                     bg_color=COLOR_SUCCESS, hover_color="#1d8a4b",
+                     command=save).pack(fill=tk.X, pady=(0, 5))
+        ModernButton(body, text="Save & Open Live Reticle Editor",
+                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                     command=lambda: save(start_reticle=True)).pack(fill=tk.X)
 
 
     def close_sub_menu(self):
@@ -2663,7 +3754,7 @@ class ModernButton(tk.Frame):
                 self._fade_to(self.hover_color)
             else:
                 self.configure(bg=self.hover_color)
-                self.label.configure(bg=self.hover_color)
+                self.label.configure(bg=self.hover_color, fg=self._get_contrast_fg(self.hover_color))
                 self.current_color = self.hover_color
     
     def on_leave(self, event):
@@ -2672,7 +3763,7 @@ class ModernButton(tk.Frame):
                 self._fade_to(self.bg_color)
             else:
                 self.configure(bg=self.bg_color)
-                self.label.configure(bg=self.bg_color)
+                self.label.configure(bg=self.bg_color, fg=self._get_contrast_fg(self.bg_color))
                 self.current_color = self.bg_color
     
     def _fade_to(self, target_hex, step=1, total_steps=5):
@@ -3110,6 +4201,73 @@ class GhostReticle:
         self.area_canvas = None
         self.color_win = None
         self.color_canvas = None
+        self.edit_active = False
+        self.edit_callback = None
+        self.last_found_box = None
+        self.last_target = None
+        self._drag_xy = None
+        # Live scan workers never call Tk. A queue transfers results back to
+        # the UI loop; each editing session gets a generation token.
+        self._live_generation = 0
+        self._live_app = None
+        self._live_index = None
+        self._live_queue = Queue()
+        self._live_timer = None
+        self._live_worker = None
+        self._live_next_scan = 0.0
+        self._live_interval = 0.35
+        self._live_is_found = False
+        self._area_rendered = None
+        self._color_rendered = None
+
+    def _set_drag_access(self, enabled):
+        if not self.pool:
+            return
+        win, canvas = self.pool[0]
+        set_overlay_input_passthrough(win, not enabled)
+        canvas.configure(cursor="fleur" if enabled else "arrow")
+
+    def enable_drag(self, callback):
+        """Enable mouse editing on only the current reticle, not its bounds."""
+        if self.last_target is None or not self.pool:
+            return False
+        self.edit_active = True
+        self.edit_callback = callback
+        self._set_drag_access(True)
+        canvas = self.pool[0][1]
+        canvas.bind("<ButtonPress-1>", self._drag_start)
+        canvas.bind("<B1-Motion>", self._drag_move)
+        canvas.bind("<ButtonRelease-1>", self._drag_end)
+        if self.hide_timer:
+            self.root.after_cancel(self.hide_timer)
+            self.hide_timer = None
+        return True
+
+    def disable_drag(self):
+        if self.pool:
+            canvas = self.pool[0][1]
+            for binding in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>"):
+                canvas.unbind(binding)
+            self._set_drag_access(False)
+        self.edit_active = False
+        self.edit_callback = None
+        self._drag_xy = None
+
+    def _drag_start(self, event):
+        self._drag_xy = (event.x_root, event.y_root)
+
+    def _drag_move(self, event):
+        if not self.edit_active or self._drag_xy is None:
+            return
+        x, y = event.x_root, event.y_root
+        dx, dy = x - self._drag_xy[0], y - self._drag_xy[1]
+        self._drag_xy = (x, y)
+        if (dx or dy) and self.edit_callback:
+            self.edit_callback(dx, dy)
+
+    def _drag_end(self, event):
+        self._drag_move(event)
+        self._drag_xy = None
 
     def _create_reticle_window(self):
         win = tk.Toplevel(self.root)
@@ -3118,14 +4276,8 @@ class GhostReticle:
         win.configure(bg="#da373c")
 
         win.update_idletasks()
-        try:
-            hwnd = win.winfo_id()
-            WS_EX_NOACTIVATE = 0x08000000
-            WS_EX_TRANSPARENT = 0x00000020
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)
-        except Exception:
-            pass
+        set_overlay_input_passthrough(win, True)
+        exclude_overlay_from_capture(win)
 
         canvas = tk.Canvas(win, width=28, height=28, bg="#1e1f22", highlightthickness=1, highlightbackground="#da373c")
         canvas.pack()
@@ -3141,14 +4293,9 @@ class GhostReticle:
         self.area_canvas = tk.Canvas(self.area_win, bg="black", highlightthickness=0)
         self.area_canvas.pack(fill=tk.BOTH, expand=True)
         
-        try:
-            hwnd = self.area_win.winfo_id()
-            WS_EX_NOACTIVATE = 0x08000000
-            WS_EX_TRANSPARENT = 0x00000020
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)
-        except Exception:
-            pass
+        self.area_win.update_idletasks()
+        set_overlay_input_passthrough(self.area_win, True)
+        exclude_overlay_from_capture(self.area_win)
 
     def _create_color_window(self):
         if self.color_win and self.color_win.winfo_exists():
@@ -3160,14 +4307,9 @@ class GhostReticle:
         self.color_canvas = tk.Canvas(self.color_win, bg="black", highlightthickness=0)
         self.color_canvas.pack(fill=tk.BOTH, expand=True)
         
-        try:
-            hwnd = self.color_win.winfo_id()
-            WS_EX_NOACTIVATE = 0x08000000
-            WS_EX_TRANSPARENT = 0x00000020
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)
-        except Exception:
-            pass
+        self.color_win.update_idletasks()
+        set_overlay_input_passthrough(self.color_win, True)
+        exclude_overlay_from_capture(self.color_win)
 
     def show_multi(self, items, area_rect=None, color_rect=None):
         if self.hide_timer:
@@ -3198,15 +4340,9 @@ class GhostReticle:
 
             win.attributes("-alpha", max(0.15, min(1.0, alpha)))
             wx, wy = int(x - size // 2), int(y - size // 2)
-            win.geometry(f"{size}x{size}")
-            
-            win.update_idletasks()
-            try:
-                ctypes.windll.user32.MoveWindow(win.winfo_id(), wx, wy, size, size, True)
-            except Exception:
-                win.geometry(f"{size}x{size}{wx:+d}{wy:+d}")
-                
-            win.deiconify()
+            if not win.winfo_viewable():
+                win.deiconify()
+            position_toplevel_on_screen(win, wx, wy, size, size)
 
         for i in range(len(items), len(self.pool)):
             self.pool[i][0].withdraw()
@@ -3217,13 +4353,8 @@ class GhostReticle:
             pad = 2
             ww, wh = aw + pad*2, ah + pad*2
             wx, wy = ax - pad, ay - pad
-            self.area_win.geometry(f"{ww}x{wh}")
-            self.area_win.update_idletasks()
-            try:
-                ctypes.windll.user32.MoveWindow(self.area_win.winfo_id(), wx, wy, ww, wh, True)
-            except Exception:
-                self.area_win.geometry(f"{ww}x{wh}{wx:+d}{wy:+d}")
-                
+            self.area_win.deiconify()
+            position_toplevel_on_screen(self.area_win, wx, wy, ww, wh)
             self.area_canvas.delete("all")
             self.area_canvas.create_rectangle(pad, pad, aw + pad, ah + pad, outline=SYNTAX_PURPLE, width=2, dash=(4, 4))
             self.area_win.attributes("-alpha", max(0.15, min(1.0, a_alpha)))
@@ -3238,13 +4369,8 @@ class GhostReticle:
             pad = 2
             ww, wh = cw + pad*2, ch + pad*2
             wx, wy = cx - pad, cy - pad
-            self.color_win.geometry(f"{ww}x{wh}")
-            self.color_win.update_idletasks()
-            try:
-                ctypes.windll.user32.MoveWindow(self.color_win.winfo_id(), wx, wy, ww, wh, True)
-            except Exception:
-                self.color_win.geometry(f"{ww}x{wh}{wx:+d}{wy:+d}")
-                
+            self.color_win.deiconify()
+            position_toplevel_on_screen(self.color_win, wx, wy, ww, wh)
             self.color_canvas.delete("all")
             self.color_canvas.create_rectangle(pad, pad, cw + pad, ch + pad, outline="#35a879", width=2)
             self.color_win.attributes("-alpha", max(0.15, min(1.0, c_alpha)))
@@ -3253,55 +4379,224 @@ class GhostReticle:
             if self.color_win and self.color_win.winfo_exists():
                 self.color_win.withdraw()
 
-        self.hide_timer = self.root.after(3500, self.hide)
+        if self.edit_active and self.pool:
+            # Keep the hit-testable reticle ahead of the transparent outlines.
+            self.pool[0][0].lift()
+        else:
+            self.hide_timer = self.root.after(3500, self.hide)
+
+    def _move_target_only(self, action):
+        """Apply the offset to the existing reticle without touching the boxes.
+
+        This is the sole path for 1px nudges/dragging while editing. No screenshot,
+        no canvas.delete(), no withdraw()/deiconify(), and no alpha animation.
+        """
+        box = self.last_found_box
+        if box is not None:
+            tx, ty = color_click_target(action, box)
+        else:
+            area = action.get("area", [0, 0, 0, 0])
+            tx = int(area[0]) + int(area[2]) // 2 + int(action.get("ox", 0))
+            ty = int(area[1]) + int(area[3]) // 2 + int(action.get("oy", 0))
+        if self.last_target != (tx, ty) and self.pool:
+            win, _ = self.pool[0]
+            move_overlay_without_redraw(win, tx - 14, ty - 14)
+        self.last_target = (tx, ty)
+        return self.last_target
+
+    def _refresh_live_bounds(self, action, box):
+        """Reposition detection outlines only when the live matched box changes."""
+        area = action.get("area", [0, 0, 0, 0])
+        search_rect = tuple(int(v) for v in area)
+        if self._area_rendered != search_rect:
+            self._create_area_window()
+            ax, ay, aw, ah = search_rect
+            pad = 2
+            self.area_canvas.configure(width=aw + 4, height=ah + 4)
+            self.area_canvas.delete("all")
+            self.area_canvas.create_rectangle(pad, pad, aw + pad, ah + pad,
+                                              outline=SYNTAX_PURPLE, width=2,
+                                              dash=(4, 4))
+            position_toplevel_on_screen(self.area_win, ax - pad, ay - pad,
+                                        aw + 4, ah + 4)
+            self.area_win.attributes("-alpha", 0.85)
+            self.area_win.deiconify()
+            self._area_rendered = search_rect
+
+        # Do not fabricate a bounding box if there is no current match.
+        if box is None:
+            if self.color_win is not None and self.color_win.winfo_exists():
+                if self.color_win.winfo_viewable():
+                    self.color_win.withdraw()
+            self._color_rendered = None
+        elif box != self._color_rendered:
+            self._create_color_window()
+            x1, y1, x2, y2 = box
+            w, h = max(1, x2 - x1), max(1, y2 - y1)
+            self.color_canvas.configure(width=w + 4, height=h + 4)
+            self.color_canvas.delete("all")
+            self.color_canvas.create_rectangle(2, 2, w + 2, h + 2,
+                                               outline=COLOR_SUCCESS, width=2)
+            position_toplevel_on_screen(self.color_win, x1 - 2, y1 - 2,
+                                        w + 4, h + 4)
+            self.color_win.attributes("-alpha", 0.90)
+            self.color_win.deiconify()
+            self._color_rendered = box
+
+    def start_live_preview(self, app, index):
+        """Continuously identify the color while keeping the overlays visible.
+
+        Scanning is done on a worker thread so huge screen regions do not block
+        Tk pointer motion. Only the UI thread moves/paints the overlay windows.
+        """
+        self.stop_live_preview()
+        self._live_app = app
+        self._live_index = index
+        self._live_next_scan = 0.0
+        self._live_is_found = self.last_found_box is not None
+        self._live_queue = Queue()
+        self._live_tick(self._live_generation)
+
+    def stop_live_preview(self):
+        self._live_generation += 1
+        self._live_app = None
+        self._live_index = None
+        self._live_next_scan = 0.0
+        if self._live_timer is not None:
+            try: self.root.after_cancel(self._live_timer)
+            except (tk.TclError, ValueError): pass
+            self._live_timer = None
+        # Any in-flight worker is allowed to finish; its result is discarded
+        # because the editing session's generation has changed.
+        self._live_worker = None
+        self._area_rendered = None
+        self._color_rendered = None
+
+    def _live_tick(self, generation):
+        if generation != self._live_generation or self._live_app is None:
+            return
+        app = self._live_app
+        idx = self._live_index
+        if (idx is None or idx >= len(app.recorded_actions) or
+                getattr(app, "_reticle_edit_index", None) != idx or
+                app.recorded_actions[idx].get("type") != "find_color" or
+                app.playing or app.recording or app.chain_running):
+            app.stop_reticle_edit()
+            return
+
+        try:
+            while True:
+                result_generation, box, error = self._live_queue.get_nowait()
+                if result_generation != generation:
+                    continue
+                action = app.recorded_actions[idx]
+                self._live_is_found = box is not None
+                if box is not None:
+                    self.last_found_box = box
+                self._refresh_live_bounds(action, box)
+                tx, ty = self._move_target_only(action)
+                if box is not None:
+                    x1, y1, x2, y2 = box
+                    app._set_color_live_label(
+                        f"● LIVE MATCH ({x1}, {y1}) {x2-x1}×{y2-y1}px"
+                        f"  → Reticle ({tx}, {ty})", COLOR_SUCCESS)
+                elif error:
+                    app._set_color_live_label(f"● Scan error: {error}", COLOR_DANGER)
+                else:
+                    app._set_color_live_label("○ LIVE • No matching color (last anchor held)",
+                                              SYNTAX_ORANGE)
+        except Empty:
+            pass
+
+        now = time.monotonic()
+        if (now >= self._live_next_scan and
+                (self._live_worker is None or not self._live_worker.is_alive())):
+            act = app.recorded_actions[idx]
+            # Capture a snapshot of the action in the UI thread. The worker
+            # must not access Tk or mutable queue state.
+            region = tuple(act.get("area", [0, 0, 0, 0]))
+            color = act.get("color", "#FFFFFF")
+            tolerance = act.get("tolerance", 8)
+            self._live_next_scan = now + self._live_interval
+            results = self._live_queue
+
+            def worker():
+                try:
+                    box = app.search_color_in_area(*region, color, tolerance=tolerance)
+                    results.put((generation, box, None))
+                except Exception as exc:
+                    results.put((generation, None, str(exc)))
+
+            self._live_worker = Thread(target=worker, daemon=True)
+            self._live_worker.start()
+        self._live_timer = self.root.after(60, lambda: self._live_tick(generation))
 
     def update(self, actions, index, app=None):
         if not actions or index < 0 or index >= len(actions):
             self.hide()
             return
-        
+
         act = actions[index]
         area_rect = None
         color_rect = None
-        
+        self.last_target = None
+
         if act.get("type") in ("move", "click", "wait_pixel", "scroll", "find_color", "search_area", "wait_text"):
             if act.get("type") == "find_color":
                 area = act.get("area", [0, 0, 0, 0])
-                ox, oy = int(act.get("ox", 0)), int(act.get("oy", 0))
                 area_rect = (area[0], area[1], area[2], area[3], 0.85)
-                
-                # Perform live search if app context is provided
-                if app:
-                    found_box = app.search_color_in_area(area[0], area[1], area[2], area[3], act.get("color", "#FFFFFF"))
-                    if found_box:
-                        x1, y1, x2, y2 = found_box
-                        anchor_x = x2 if ox > 0 else (x1 if ox < 0 else x1 + (x2 - x1) // 2)
-                        anchor_y = y2 if oy > 0 else (y1 if oy < 0 else y1 + (y2 - y1) // 2)
-                        rx, ry = anchor_x + ox, anchor_y + oy
-                        color_rect = (x1, y1, x2 - x1, y2 - y1, 0.85)
-                    else:
-                        rx = area[0] + (area[2] // 2) + ox
-                        ry = area[1] + (area[3] // 2) + oy
+                # While dragging or nudging keep the existing target anchor
+                # stable; do not repeatedly recapture the changing overlay.
+                if self.edit_active:
+                    found_box = self.last_found_box
+                elif app is not None:
+                    # Don't allow last preview's colored outlines to become
+                    # the next scan's input. They are separate topmost windows.
+                    for overlay in (self.area_win, self.color_win):
+                        if overlay is not None and overlay.winfo_exists():
+                            overlay.withdraw()
+                    for win, _ in self.pool:
+                        if win.winfo_exists():
+                            win.withdraw()
+                    self.root.update_idletasks()
+                    found_box = app.search_color_in_area(
+                        *area, act.get("color", "#FFFFFF"),
+                        tolerance=act.get("tolerance", 8))
                 else:
-                    rx = area[0] + (area[2] // 2) + ox
-                    ry = area[1] + (area[3] // 2) + oy
-                    
+                    found_box = None
+
+                self.last_found_box = found_box
+                if found_box:
+                    x1, y1, x2, y2 = found_box
+                    rx, ry = color_click_target(act, found_box)
+                    color_rect = (x1, y1, x2 - x1, y2 - y1, 0.85)
+                else:
+                    # Before recognition, show a provisional reticle based on
+                    # the selected search area (not a fake detected object).
+                    ax = area[0] + area[2] // 2
+                    ay = area[1] + area[3] // 2
+                    rx, ry = ax + int(act.get("ox", 0)), ay + int(act.get("oy", 0))
+                self.last_target = (rx, ry)
                 is_click = True
             elif act.get("type") in ("search_area", "wait_text"):
                 area = act.get("area", [0, 0, 0, 0])
-                area_rect = (area[0], area[1], area[2], area[3], 0.85)
-                self.show_multi([], area_rect=area_rect)
+                self.show_multi([], area_rect=(area[0], area[1], area[2], area[3], 0.85))
                 return
             else:
-                rx = int(act.get("x", 0))
-                ry = int(act.get("y", 0))
-                is_click = (act.get("type") in ("click", "scroll"))
-                
-            self.show_multi([(rx, ry, is_click, 0.85)], area_rect=area_rect, color_rect=color_rect)
+                self.last_found_box = None
+                rx, ry = int(act.get("x", 0)), int(act.get("y", 0))
+                is_click = act.get("type") in ("click", "scroll")
+
+            self.show_multi([(rx, ry, is_click, 0.85)],
+                            area_rect=area_rect, color_rect=color_rect)
         else:
             self.hide()
 
     def hide(self):
+        self.stop_live_preview()
+        self.disable_drag()
+        self.last_found_box = None
+        self.last_target = None
         if self.hide_timer:
             try: self.root.after_cancel(self.hide_timer)
             except Exception: pass
@@ -3413,7 +4708,7 @@ class SequentWalkthrough:
                                    padx=10, pady=7, cursor="hand2")
         self.btn_exit.pack(side=tk.LEFT)
         self.btn_next = tk.Button(btn_row, text="Next  →", command=self.next,
-                                   bg=COLOR_ACCENT, fg="#ffffff", activebackground=COLOR_ACCENT_HOV,
+                                   bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, activebackground=COLOR_ACCENT_HOV,
                                    activeforeground="#ffffff", relief="flat", bd=0,
                                    padx=12, pady=7, cursor="hand2")
         self.btn_next.pack(side=tk.RIGHT)
@@ -3580,18 +4875,21 @@ class BuiltInMacroApp:
         self.root.configure(bg=BG_APP)
         self.root.attributes('-topmost', True)
 
-        # Sequent's borderless window and custom resize grips are the default.
-        # Native window decorations remain an optional troubleshooting mode:
-        # set SEQUENT_WINDOW_MODE=native before launching.
+        # Use a *managed* Windows window with a custom-painted client area.
+        # The former override-redirect + geometry() resize path remains only
+        # for non-Windows hosts. SEQUENT_WINDOW_MODE=native is a safe fallback.
         self.native_window_resize = (
             os.environ.get('SEQUENT_WINDOW_MODE', 'custom').strip().lower()
             == 'native'
         )
-        if self.native_window_resize:
-            self.root.resizable(True, True)
+        self.native_chrome = None
+        self.root.resizable(True, True)
+        if os.name == 'nt':
+            if not self.native_window_resize:
+                self.native_chrome = install_sequent_chrome(self.root)
+                self.set_app_window()
         else:
             self.root.overrideredirect(True)
-            self.set_app_window()
 
         self.drag_x = 0
         self.drag_y = 0
@@ -3618,7 +4916,11 @@ class BuiltInMacroApp:
         self._playback_ui_pending = False
 
         # Theme & Entertainment Mode State
-        self.light_mode = False
+        self.theme_mode = "Dark"
+        self.light_mode = False  # Kept for backward-compatible settings files.
+        self.accent_color = DEFAULT_ACCENT_COLOR
+        self._effective_theme = "dark"
+        self._system_theme_job = None
         self.entertain_me = True
         BuiltInMacroApp.entertain_mode = True
         self._sparkle_particles = []
@@ -3678,19 +4980,25 @@ class BuiltInMacroApp:
         }
 
         self.load_settings()
+        # Apply persisted colors BEFORE constructing Tk widgets (no launch flash).
+        self._effective_theme = self.resolve_theme_mode()
+        self._update_theme_tokens(self._effective_theme)
+        self.root.configure(bg=BG_APP)
 
         self.setup_ui()
         self.ghost_reticle = GhostReticle(self.root)
+        self._reticle_edit_index = None
         self.refresh_preset_menu()
         self.setup_resizing_handles()
         Thread(target=self.global_hotkey_listener, daemon=True).start()
+        self._schedule_system_theme_poll()
 
     
     def set_app_window(self):
         # This helper is also invoked after the Mini HUD and screen selection.
         # Never switch a natively managed window back to borderless mode.
-        if getattr(self, 'native_window_resize', False):
-            return
+        if getattr(self, 'native_window_resize', False) or getattr(self, 'native_chrome', None):
+            return  # Never withdraw/deiconify a live managed native-chrome HWND.
         hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
         style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
@@ -3711,21 +5019,43 @@ class BuiltInMacroApp:
         self.root.wm_withdraw()
         self.root.after(10, lambda: self.root.wm_deiconify())
 
+    def restore_after_desktop_picker(self):
+        """Restore Sequent and refocus the editor after the root has remapped.
+
+        Restore the editor only *after* set_app_window's delayed deiconify,
+        otherwise the main window can cover the editor on Windows.
+        """
+        self.root.deiconify()
+        self.set_app_window()
+        viewer = getattr(self, "queue_viewer", None)
+        if viewer is not None:
+            self.root.after(75, viewer.restore_action_editor_focus)
+
     def start_drag(self, event):
         if self.native_window_resize:
+            return
+        if self.native_chrome is not None:
+            begin_native_window_motion(self.root, 2)  # HTCAPTION = native snap/move
             return
         self.drag_x = event.x
         self.drag_y = event.y
 
     def drag_window(self, event):
-        if self.native_window_resize:
+        if self.native_window_resize or self.native_chrome is not None:
             return
         x = self.root.winfo_x() + (event.x - self.drag_x)
         y = self.root.winfo_y() + (event.y - self.drag_y)
         self.root.geometry(f"+{x}+{y}")
 
+    def toggle_maximize_window(self):
+        """Native maximize/restore retains the Windows taskbar work-area bounds."""
+        if self.root.state() == "zoomed":
+            self.root.state("normal")
+        else:
+            self.root.state("zoomed")
+
     def minimize_window(self):
-        if self.native_window_resize:
+        if self.native_window_resize or self.native_chrome is not None:
             self.root.iconify()
             return
         self.root.overrideredirect(False)
@@ -3734,7 +5064,7 @@ class BuiltInMacroApp:
 
     def on_restore(self, event=None):
         self.root.unbind("<FocusIn>")
-        if not self.native_window_resize:
+        if not self.native_window_resize and self.native_chrome is None:
             self.root.overrideredirect(True)
 
     def setup_resizing_handles(self):
@@ -3742,7 +5072,12 @@ class BuiltInMacroApp:
         # Tk edge grips and geometry() drag handlers in this mode.
         if self.native_window_resize:
             return
-        # Use minimal 2px invisible frames to allow edge resizing without covering UI elements
+        if self.native_chrome is not None:
+            # Retain the tiny native resize targets as a compatibility fallback
+            # for Tk builds that hit-test the child client HWND first.
+            self._native_grips = add_native_resize_grips(self.root, BG_APP)
+            return
+        # Fallback: Tk geometry-based grips are for non-Windows hosts only.
         self.grip_e = tk.Frame(self.root, bg=BG_APP, cursor="size_we")
         self.grip_e.place(relx=1.0, rely=0, x=-2, y=35, relheight=1.0, width=2)
 
@@ -3811,7 +5146,7 @@ class BuiltInMacroApp:
         btn_stop.pack(side=tk.LEFT, padx=(0, 6))
         btn_stop.bind("<Button-1>", lambda e: self.stop_macro())
 
-        btn_expand = tk.Label(card, text="⤢", font=("Segoe UI", 9, "bold"), bg=COLOR_ACCENT, fg="#ffffff", cursor="hand2", padx=7, pady=2)
+        btn_expand = tk.Label(card, text="⤢", font=("Segoe UI", 9, "bold"), bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=7, pady=2)
         btn_expand.pack(side=tk.RIGHT, padx=6)
         btn_expand.bind("<Button-1>", lambda e: self.toggle_mini_hud())
 
@@ -3941,6 +5276,8 @@ class BuiltInMacroApp:
 
         self.root.bind("<Left>", lambda e: self._on_scrub_nav("prev"))
         self.root.bind("<Right>", lambda e: self._on_scrub_nav("next"))
+        self.root.bind("<Up>", lambda e: self._on_scrub_nav("up"))
+        self.root.bind("<Down>", lambda e: self._on_scrub_nav("down"))
         self.root.bind("<Home>", lambda e: self._on_scrub_nav("home"))
         self.root.bind("<End>", lambda e: self._on_scrub_nav("end"))
         self.root.bind("<space>", lambda e: self._on_scrub_nav("run_step"))
@@ -3972,7 +5309,7 @@ class BuiltInMacroApp:
         title = tk.Label(brand, text="SEQUENT", bg=BG_HEADER, fg=TEXT_PRIMARY,
                          font=("Segoe UI", 12, "bold"))
         title.pack(anchor="w")
-        tk.Label(brand, text="MACRO WORKSPACE", bg=BG_HEADER, fg=SYNTAX_BLUE,
+        tk.Label(brand, text="MACRO WORKSPACE", bg=BG_HEADER, fg=COLOR_ACCENT,
                  font=("Segoe UI", 7, "bold")).pack(anchor="w")
         for widget in (brand, title):
             widget.bind("<Button-1>", self.start_drag)
@@ -4004,6 +5341,15 @@ class BuiltInMacroApp:
         # The native title bar already supplies Windows minimize/close controls.
         if self.native_window_resize:
             win_controls.pack_forget()
+        elif self.native_chrome is not None:
+            btn_max = tk.Label(win_controls, text="□", bg=BG_HEADER,
+                    fg=TEXT_MUTED, font=("Segoe UI", 12), cursor="hand2", padx=15)
+            btn_max.pack(side=tk.RIGHT, fill=tk.Y, before=btn_min)
+            btn_max.bind("<Button-1>", lambda e: self.toggle_maximize_window())
+            btn_max.bind("<Enter>", lambda e: btn_max.config(bg=BG_HOVER))
+            btn_max.bind("<Leave>", lambda e: btn_max.config(bg=BG_HEADER))
+            # Windows handles double-click-to-maximize on the custom caption.
+            top_bar.bind("<Double-Button-1>", lambda e: self.toggle_maximize_window())
 
         self.status_text = tk.Label(top_bar, text="● Ready", bg=BG_HEADER,
                                     fg=COLOR_SUCCESS, font=("Segoe UI", 9, "bold"))
@@ -4022,7 +5368,7 @@ class BuiltInMacroApp:
                                 bd=0, relief="flat", cursor="hand2")
         self.preset_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
                                         activebackground=COLOR_ACCENT,
-                                        activeforeground="#ffffff", bd=0)
+                                        activeforeground=TEXT_ON_ACCENT, bd=0)
         self.preset_menu.pack(side=tk.LEFT, pady=2)
         self.preset_menu.configure(width=17)
         btn_refresh = sequent_toolbar_button(preset_card, "↻", self.refresh_preset_menu)
@@ -4129,6 +5475,12 @@ class BuiltInMacroApp:
         is_busy = self.playing or (self.recording and not self.recording_paused)
         if isinstance(focus, tk.Entry) or is_busy:
             return
+        if self._reticle_edit_index is not None and action in ("prev", "next", "up", "down"):
+            shift = bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+            amt = 5 if shift else 1
+            delta = {"prev": (-amt, 0), "next": (amt, 0),
+                     "up": (0, -amt), "down": (0, amt)}[action]
+            return self.nudge_active_coordinate(*delta)
         if action == "prev": self.step_backward()
         elif action == "next": self.step_forward()
         elif action == "home": self.jump_to_start()
@@ -4172,10 +5524,83 @@ class BuiltInMacroApp:
             fg=SYNTAX_GREEN
         )
 
-        # Pass app=self so GhostReticle can perform live bounding box searches while nudging
-        self.ghost_reticle.update(self.recorded_actions, self.current_action_idx, app=self)
+        # Move the existing HWND only. The detection box remains stable and
+        # scanning continues independently on the live-preview timer.
+        if act.get("type") == "find_color" and self._reticle_edit_index is not None:
+            tx, ty = self.ghost_reticle._move_target_only(act)
+            self._set_color_live_label(
+                f"● LIVE {'MATCH' if self.ghost_reticle._live_is_found else 'SEARCH'}"
+                f"  Reticle ({tx}, {ty})  Offset ({act['ox']:+d}, {act['oy']:+d})",
+                COLOR_SUCCESS if self.ghost_reticle._live_is_found else SYNTAX_ORANGE)
+        else:
+            self.ghost_reticle.update(self.recorded_actions, self.current_action_idx, app=self)
         return "break"
-        
+
+    def _prepare_mouse_execution(self):
+        """Remove interactive/transparent preview windows before sending clicks.
+
+        In particular, the drag-enabled Ghost Reticle is a real topmost window.
+        Leaving it under the pointer can redirect a synthetic click into the
+        reticle instead of the underlying application.
+        """
+        if self._reticle_edit_index is not None:
+            self.stop_reticle_edit()
+        elif hasattr(self, "ghost_reticle"):
+            self.ghost_reticle.hide()
+        self.root.update_idletasks()  # Let Tk/Windows process withdraw requests.
+
+    def _report_color_execution(self, mode, x, y):
+        verb = "moved only (NO CLICK)" if mode == "Move Only" else f"sent {mode.lower()}"
+        self._set_color_live_label(f"Last color action: {verb} at ({x}, {y})", COLOR_SUCCESS)
+        self.update_status(f"Find Color: {verb} at ({x}, {y})", COLOR_SUCCESS)
+
+    def toggle_reticle_edit(self):
+        """Let users drag the real on-screen ghost, including beyond the box."""
+        if self._reticle_edit_index is not None:
+            self.stop_reticle_edit()
+            return
+        if self.recording or self.playing or self.chain_running:
+            self.update_status("Stop playback/recording before editing the reticle", COLOR_DANGER)
+            return
+        idx = self.current_action_idx
+        if not 0 <= idx < len(self.recorded_actions) or self.recorded_actions[idx].get("type") != "find_color":
+            self.update_status("Select a Find Color & Click action first", SYNTAX_ORANGE)
+            return
+        try:
+            self.ghost_reticle.update(self.recorded_actions, idx, app=self)
+        except Exception as exc:
+            self.update_status(f"Could not inspect screen: {exc}", COLOR_DANGER)
+            return
+        if not self.ghost_reticle.enable_drag(self._on_reticle_drag):
+            self.update_status("Couldn't display a reticle for this action", COLOR_DANGER)
+            return
+        self._reticle_edit_index = idx
+        self.btn_edit_reticle.config(text="✓ Finish Reticle Editing")
+        self._set_color_live_label("◌ LIVE PREVIEW • Searching for matching region…", SYNTAX_BLUE)
+        self.ghost_reticle.start_live_preview(self, idx)
+        if self.ghost_reticle.last_found_box is None:
+            self.update_status("Color isn't visible: preview uses search-area center. Show the color for precise alignment.", SYNTAX_ORANGE)
+        else:
+            self.update_status("Drag reticle anywhere, or use Arrows (Shift: 5px); Alt+Arrows also work", COLOR_SUCCESS)
+
+    def _on_reticle_drag(self, dx, dy):
+        if (self._reticle_edit_index is not None and
+                self._reticle_edit_index == self.current_action_idx):
+            self.nudge_active_coordinate(dx, dy)
+
+    def _set_color_live_label(self, message, color=TEXT_MUTED):
+        label = getattr(self, "lbl_color_live_preview", None)
+        if label is not None and label.winfo_exists():
+            label.config(text=message, fg=color)
+
+    def stop_reticle_edit(self):
+        if hasattr(self, "ghost_reticle"):
+            self.ghost_reticle.hide()  # Removes the live bounds when editing ends.
+        self._reticle_edit_index = None
+        if hasattr(self, "btn_edit_reticle"):
+            self.btn_edit_reticle.config(text="⌖ Adjust Ghost Reticle")
+        self._set_color_live_label("Preview off • Adjust Ghost Reticle to inspect", TEXT_MUTED)
+
     def build_sidebar(self):
         nav_head = tk.Frame(self.sidebar_frame, bg=BG_SIDEBAR)
         nav_head.pack(fill=tk.X, padx=14, pady=(20, 18))
@@ -4311,20 +5736,19 @@ class BuiltInMacroApp:
         if (getattr(self, "_theme_rebuilding", False)
                 or event.widget is not getattr(self, "workspace", None)):
             return
-        if getattr(self, "_queue_resize_job", None) is not None:
-            try:
-                self.root.after_cancel(self._queue_resize_job)
-            except tk.TclError:
-                pass
-            self._queue_resize_job = None
         if self._queue_animation_active:
+            return
+        # One frame at a time while Windows continuously sends WM_SIZE.
+        # Cancel-and-reschedule (old 90ms debounce) delayed dock reflow until
+        # the user released the mouse, which looked like a frozen screenshot.
+        if getattr(self, "_queue_resize_job", None) is not None:
             return
         # Capture the workspace and generation. Old jobs must never be able
         # to manipulate freshly rebuilt controls (or destroyed sidebar paths).
         generation = self._ui_generation
         workspace = self.workspace
         self._queue_resize_job = self.root.after(
-            90, lambda: self._settle_queue_resize(workspace, generation)
+            16, lambda: self._settle_queue_resize(workspace, generation)
         )
 
     def _settle_queue_resize(self, workspace=None, generation=None):
@@ -4445,6 +5869,16 @@ class BuiltInMacroApp:
                                           anchor="w", padx=10, pady=10,
                                           wraplength=245, justify="left")
         self.lbl_active_action.pack(fill=tk.X, pady=(6, 0))
+        self.btn_edit_reticle = sequent_toolbar_button(
+            controls, "⌖ Adjust Ghost Reticle", self.toggle_reticle_edit)
+        self.btn_edit_reticle.pack(fill=tk.X, pady=(8, 0))
+        ModernTooltip(self.btn_edit_reticle,
+                      "Select Find Color & Click; drag the ghost or use Alt+Arrows to nudge")
+        self.lbl_color_live_preview = tk.Label(
+            controls, text="Preview off • Adjust Ghost Reticle to inspect",
+            font=("Consolas", 8), bg=BG_PANEL, fg=TEXT_MUTED,
+            justify="left", anchor="w", wraplength=235)
+        self.lbl_color_live_preview.pack(fill=tk.X, pady=(6, 0))
         tk.Frame(controls, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=14)
         tk.Label(controls, text="EXECUTION", bg=BG_PANEL, fg=TEXT_MUTED,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w")
@@ -4674,7 +6108,8 @@ class BuiltInMacroApp:
             # Stage number badge
             num_lbl = tk.Label(
                 row, text=f"Stage #{idx + 1}", font=("Segoe UI", 8, "bold"),
-                bg=COLOR_ACCENT if not is_active else COLOR_SUCCESS, fg="#ffffff", padx=6, pady=2
+                bg=COLOR_ACCENT if not is_active else COLOR_SUCCESS,
+                fg=TEXT_ON_ACCENT if not is_active else "#ffffff", padx=6, pady=2
             )
             num_lbl.pack(side=tk.LEFT, padx=(0, 10))
 
@@ -4782,6 +6217,7 @@ class BuiltInMacroApp:
             self.update_status("Chain has no stages", COLOR_DANGER)
             return
 
+        self._prepare_mouse_execution()
         self.chain_running = True
         self.playing = True
         self.is_paused = False
@@ -5044,6 +6480,10 @@ class BuiltInMacroApp:
     
 
     def update_scrubber_ui(self, show_reticle=True):
+        if getattr(self, "_reticle_edit_index", None) is not None:
+            if (self.current_action_idx != self._reticle_edit_index or
+                self.playing or self.recording or self.chain_running):
+                self.stop_reticle_edit()
         total = len(self.recorded_actions)
         if total == 0:
             self.current_action_idx = 0
@@ -5067,12 +6507,16 @@ class BuiltInMacroApp:
         if hasattr(self, 'ghost_reticle'):
             # Display reticle when idle or explicitly paused
             is_active_running = (self.playing and not self.is_paused) or (self.recording and not self.recording_paused)
-            if not is_active_running and show_reticle:
-                self.ghost_reticle.update(self.recorded_actions, self.current_action_idx)
+            if self._reticle_edit_index is not None and not is_active_running:
+                pass  # Live preview and fast reticle movement own these windows.
+            elif not is_active_running and show_reticle:
+                self.ghost_reticle.update(self.recorded_actions, self.current_action_idx, app=self)
             else:
                 self.ghost_reticle.hide()
 
     def set_active_action_index(self, index):
+        if self._reticle_edit_index is not None and index != self._reticle_edit_index:
+            self.stop_reticle_edit()
         self.current_action_idx = index
         self.update_scrubber_ui()
 
@@ -5130,6 +6574,7 @@ class BuiltInMacroApp:
             self.current_action_idx = 0
 
         action = self.recorded_actions[self.current_action_idx]
+        self._prepare_mouse_execution()
         if action.get("type") == "wait_text":
             index = self.current_action_idx
             self.update_status(f"Checking text at step #{index + 1}...", COLOR_ACCENT)
@@ -5168,8 +6613,9 @@ class BuiltInMacroApp:
         if act_type == "move":
             move_mouse(action.get("x", 0), action.get("y", 0))
         elif act_type == "click":
-            move_mouse(action.get("x", 0), action.get("y", 0))
-            time.sleep(0.02)
+            tx, ty = action.get("x", 0), action.get("y", 0)
+            move_mouse(tx, ty)
+            wait_for_cursor_settled(tx, ty)
             click(action.get("btn", "left"))
         elif act_type == "scroll":
             move_mouse(action.get("x", 0), action.get("y", 0))
@@ -5249,23 +6695,16 @@ class BuiltInMacroApp:
         elif act_type == "find_color":
             area = action.get("area", [0, 0, 100, 100])
             hex_color = action.get("color", "#FFFFFF").upper()
-            ox, oy = action.get("ox", 0), action.get("oy", 0)
-            sub_action = action.get("action", "Single Click")
-            
-            found_pt = self.search_color_in_area(area[0], area[1], area[2], area[3], hex_color)
-            
-            if found_pt:
-                tx, ty = found_pt[0] + ox, found_pt[1] + oy
-                move_mouse(tx, ty)
-                time.sleep(max(0.001, 0.04 / self.playback_speed))
-                
-                if sub_action == "Single Click":
-                    click("left")
-                elif sub_action == "Double Click":
-                    click("left")
-                    time.sleep(0.05)
-                    click("left")
-                    
+            found_box = self.search_color_in_area(*area, hex_color,
+                            tolerance=action.get("tolerance", 8))
+
+            if found_box:
+                mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
+                # Schedule GUI feedback safely when called from a chain worker.
+                self.root.after(0, lambda b=found_box:
+                                self.draw_highlight_box(*b, COLOR_SUCCESS, 800))
+                self.root.after(0, lambda m=mode, x=tx, y=ty:
+                                self._report_color_execution(m, x, y))
                 if self.audio_cues: play_cue("match")
             else:
                 raise MacroExecutionError(f"Color {hex_color} not found in search area")
@@ -5358,37 +6797,37 @@ class BuiltInMacroApp:
         snipper.overrideredirect(True)
         snipper.geometry(f"{vw}x{vh}")
         
-        snipper.update_idletasks()
-        try:
-            ctypes.windll.user32.MoveWindow(snipper.winfo_id(), vx, vy, vw, vh, True)
-        except Exception:
-            snipper.geometry(f"{vw}x{vh}{vx:+d}{vy:+d}")
+        position_toplevel_on_screen(snipper, vx, vy, vw, vh, activate=True)
             
         snipper.config(cursor="crosshair")
 
         def cancel(event=None):
             try: snipper.destroy()
             except Exception: pass
-            self.root.deiconify()
-            self.set_app_window()
-            if hasattr(self, 'queue_viewer') and self.queue_viewer.sub_menu:
-                self.queue_viewer.sub_menu.deiconify()
+            self.restore_after_desktop_picker()
 
         def on_click(event):
             x, y = event.x_root, event.y_root
             snipper.withdraw()
             self.root.update_idletasks()
-            time.sleep(0.04)
+            # Let transparent snipper/other child overlay finish withdrawing.
+            self.root.after(60, lambda: finish_sampling(x, y))
 
-            hex_color = get_pixel_color(x, y)
-            try: snipper.destroy()
-            except Exception: pass
-
-            self.root.deiconify()
-            self.set_app_window()
-            if hasattr(self, 'queue_viewer') and self.queue_viewer.sub_menu:
-                self.queue_viewer.sub_menu.deiconify()
-            callback(x, y, hex_color)
+        def finish_sampling(x, y):
+            hex_color = None
+            error = None
+            try:
+                hex_color = get_pixel_color(x, y)
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                try: snipper.destroy()
+                except Exception: pass
+                self.restore_after_desktop_picker()
+            if error:
+                self.update_status(f"Color sampling failed: {error}", COLOR_DANGER)
+            elif hex_color is not None:
+                callback(x, y, hex_color)
 
         snipper.bind("<Button-1>", on_click)
         snipper.bind("<Button-3>", cancel)
@@ -5423,11 +6862,8 @@ class BuiltInMacroApp:
 
         snipper.update_idletasks()
         
-        # 3. Natively move the window, bypassing the Tkinter negative-coordinate bug
-        try:
-            ctypes.windll.user32.MoveWindow(snipper.winfo_id(), vx, vy, vw, vh, True)
-        except Exception:
-            snipper.geometry(f"{vw}x{vh}{vx:+d}{vy:+d}")
+        # Place Tk's *outer wrapper* on the virtual desktop, not its child HWND.
+        position_toplevel_on_screen(snipper, vx, vy, vw, vh, activate=True)
 
         snipper.config(cursor="cross")
 
@@ -5445,10 +6881,7 @@ class BuiltInMacroApp:
                 state["closed"] = True
                 try: snipper.destroy()
                 except Exception: pass
-                self.root.deiconify()
-                self.set_app_window()
-                if hasattr(self, 'queue_viewer') and self.queue_viewer.sub_menu:
-                    self.queue_viewer.sub_menu.deiconify()
+                self.restore_after_desktop_picker()
 
         cancel_badge = tk.Label(
             snipper, text="  ✕ Cancel (Esc / Right-Click)  ",
@@ -5467,7 +6900,7 @@ class BuiltInMacroApp:
             if state["rect"]: canvas.delete(state["rect"])
             state["rect"] = canvas.create_rectangle(
                 c_x, c_y, c_x, c_y,
-                outline=COLOR_ACCENT, width=2, fill="#5865f2", stipple="gray25"
+                outline=COLOR_ACCENT, width=2, fill=COLOR_ACCENT, stipple="gray25"
             )
 
         def on_mouse_drag(event):
@@ -5489,10 +6922,13 @@ class BuiltInMacroApp:
             state["closed"] = True
             try: snipper.destroy()
             except Exception: pass
-            self.root.deiconify()
-            self.set_app_window()
-
-            if w > 8 and h > 8: callback([x, y, w, h])
+            # Let the action editor return to the foreground once Sequent is
+            # finished remapping its main window, regardless of drag size.
+            self.restore_after_desktop_picker()
+            if w > 8 and h > 8:
+                callback([x, y, w, h])
+            else:
+                self.update_status("Search area unchanged (drag a box at least 9px wide and tall)", SYNTAX_ORANGE)
 
         canvas.bind("<Button-1>", on_mouse_down)
         canvas.bind("<B1-Motion>", on_mouse_drag)
@@ -5580,19 +7016,39 @@ class BuiltInMacroApp:
             gdi32.DeleteDC(h_mem_dc)
             user32.ReleaseDC(0, h_screen_dc)
 
-    def search_color_in_area(self, x, y, w, h, hex_color):
-        """Captures a region to memory and searches for a hex color rapidly. Returns bounding box."""
+    def search_color_in_area(self, x, y, w, h, hex_color, tolerance=8):
+        """Capture screen pixels and locate the largest connected color region.
+
+        Returns screen-space (left, top, right, bottom) with exclusive edges.
+        Does not combine disconnected UI elements into one enclosing box.
+        """
+        x, y, w, h = map(int, (x, y, w, h))
+        if w <= 0 or h <= 0:
+            return None
+        color = str(hex_color).strip().lstrip("#")
+        if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+            raise ValueError(f"Invalid RGB color: {hex_color!r}")
+        rgb = tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
         user32 = ctypes.windll.user32
         gdi32 = ctypes.windll.gdi32
-        
-        hex_color = hex_color.lstrip('#')
-        target_r, target_g, target_b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-
-        h_screen = user32.GetDC(0)
-        h_dc = gdi32.CreateCompatibleDC(h_screen)
-        h_bmp = gdi32.CreateCompatibleBitmap(h_screen, w, h)
-        gdi32.SelectObject(h_dc, h_bmp)
-        gdi32.BitBlt(h_dc, 0, 0, w, h, h_screen, x, y, 0x00CC0020)
+        HANDLE = ctypes.c_void_p
+        # Explicit signatures are necessary: Win32 GDI handles are 64-bit on
+        # 64-bit Python, while ctypes otherwise defaults to a 32-bit int.
+        user32.GetDC.argtypes, user32.GetDC.restype = [HANDLE], HANDLE
+        user32.ReleaseDC.argtypes, user32.ReleaseDC.restype = [HANDLE, HANDLE], ctypes.c_int
+        gdi32.CreateCompatibleDC.argtypes, gdi32.CreateCompatibleDC.restype = [HANDLE], HANDLE
+        gdi32.CreateCompatibleBitmap.argtypes = [HANDLE, ctypes.c_int, ctypes.c_int]
+        gdi32.CreateCompatibleBitmap.restype = HANDLE
+        gdi32.SelectObject.argtypes, gdi32.SelectObject.restype = [HANDLE, HANDLE], HANDLE
+        gdi32.BitBlt.argtypes = [HANDLE, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, HANDLE, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        gdi32.BitBlt.restype = ctypes.c_int
+        gdi32.GetDIBits.argtypes = [HANDLE, HANDLE, ctypes.c_uint, ctypes.c_uint,
+                                  HANDLE, HANDLE, ctypes.c_uint]
+        gdi32.GetDIBits.restype = ctypes.c_int
+        gdi32.DeleteObject.argtypes, gdi32.DeleteObject.restype = [HANDLE], ctypes.c_int
+        gdi32.DeleteDC.argtypes, gdi32.DeleteDC.restype = [HANDLE], ctypes.c_int
 
         class BITMAPINFOHEADER(ctypes.Structure):
             _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
@@ -5602,37 +7058,50 @@ class BuiltInMacroApp:
                         ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32),
                         ("biClrImportant", ctypes.c_uint32)]
 
-        stride = ((w * 24 + 31) // 32) * 4
-        buf = (ctypes.c_char * (stride * h))()
-        bmi = BITMAPINFOHEADER(biSize=ctypes.sizeof(BITMAPINFOHEADER), biWidth=w, biHeight=-h, 
-                               biPlanes=1, biBitCount=24, biCompression=0, biSizeImage=stride * h)
+        stride = ((w * 3 + 3) // 4) * 4
+        buffer = (ctypes.c_ubyte * (stride * h))()
+        bmi = BITMAPINFOHEADER(biSize=ctypes.sizeof(BITMAPINFOHEADER),
+                               biWidth=w, biHeight=-h, biPlanes=1,
+                               biBitCount=24, biCompression=0, biSizeImage=stride * h)
 
-        gdi32.GetDIBits(h_dc, h_bmp, 0, h, buf, ctypes.byref(bmi), 0)
-        user32.ReleaseDC(0, h_screen)
-        gdi32.DeleteDC(h_dc)
-        gdi32.DeleteObject(h_bmp)
+        screen_dc = user32.GetDC(None)
+        if not screen_dc:
+            raise MacroExecutionError("Could not access screen device context")
+        mem_dc = bmp = previous = None
+        try:
+            mem_dc = gdi32.CreateCompatibleDC(screen_dc)
+            if not mem_dc:
+                raise MacroExecutionError("Could not create screen capture context")
+            bmp = gdi32.CreateCompatibleBitmap(screen_dc, w, h)
+            if not bmp:
+                raise MacroExecutionError("Could not allocate screen capture bitmap")
+            previous = gdi32.SelectObject(mem_dc, bmp)
+            if not previous:
+                raise MacroExecutionError("Could not select screen capture bitmap")
+            if not gdi32.BitBlt(mem_dc, 0, 0, w, h, screen_dc, x, y, 0x00CC0020):
+                raise MacroExecutionError("Screen capture failed")
 
-        raw = bytes(buf)
-        
-        min_px, min_py = w, h
-        max_px, max_py = -1, -1
-        found = False
+            # Crucial: GetDIBits requires the bitmap NOT be selected into a DC.
+            gdi32.SelectObject(mem_dc, previous)
+            previous = None
+            scanlines = gdi32.GetDIBits(screen_dc, bmp, 0, h, buffer,
+                                        ctypes.byref(bmi), 0)
+            if scanlines != h:
+                raise MacroExecutionError("Could not read screen capture pixels")
+        finally:
+            if previous and mem_dc:
+                gdi32.SelectObject(mem_dc, previous)
+            if bmp:
+                gdi32.DeleteObject(bmp)
+            if mem_dc:
+                gdi32.DeleteDC(mem_dc)
+            user32.ReleaseDC(None, screen_dc)
 
-        for py in range(h):
-            row_start = py * stride
-            for px in range(w):
-                idx = row_start + (px * 3)
-                if raw[idx] == target_b and raw[idx+1] == target_g and raw[idx+2] == target_r:
-                    if px < min_px: min_px = px
-                    if px > max_px: max_px = px
-                    if py < min_py: min_py = py
-                    if py > max_py: max_py = py
-                    found = True
-
-        if found:
-            # +1 ensures the bounding box encapsulates the full pixel width and height
-            return (x + min_px, y + min_py, x + max_px + 1, y + max_py + 1)
-        return None
+        box = largest_color_component(buffer, w, h, stride, rgb, tolerance)
+        if box is None:
+            return None
+        x1, y1, x2, y2 = box
+        return x + x1, y + y1, x + x2, y + y2
 
     def draw_highlight_box(self, x1, y1, x2, y2, outline_color="#35a879", duration_ms=800):
         """Draws a transparent bounding box overlay on the screen where the color was found."""
@@ -5653,20 +7122,8 @@ class BuiltInMacroApp:
         canvas.pack(fill=tk.BOTH, expand=True)
         canvas.create_rectangle(pad, pad, w + pad, h + pad, outline=outline_color, width=2)
         
-        win.update_idletasks()
-        try:
-            ctypes.windll.user32.MoveWindow(win.winfo_id(), wx, wy, ww, wh, True)
-        except Exception:
-            win.geometry(f"{ww}x{wh}{wx:+d}{wy:+d}")
-
-        try:
-            hwnd = win.winfo_id()
-            WS_EX_NOACTIVATE = 0x08000000
-            WS_EX_TRANSPARENT = 0x00000020
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)
-        except Exception:
-            pass
+        position_toplevel_on_screen(win, wx, wy, ww, wh)
+        set_overlay_input_passthrough(win, True)
 
         self.root.after(duration_ms, lambda: win.destroy() if win.winfo_exists() else None)
 
@@ -5874,7 +7331,15 @@ try {{
             if os.path.exists("settings.json"):
                 with open("settings.json", "r") as f:
                     config = json.load(f)
-                self.light_mode = config.get("light_mode", False)
+                # Upgrade legacy light_mode without losing a user's preference.
+                legacy = "Light" if config.get("light_mode", False) else "Dark"
+                choice = config.get("theme_mode", legacy)
+                self.theme_mode = choice if choice in ("Dark", "Light", "Match System") else legacy
+                self.light_mode = (self.theme_mode == "Light")
+                try:
+                    self.accent_color = normalize_accent_color(config.get("accent_color", DEFAULT_ACCENT_COLOR))
+                except ValueError:
+                    self.accent_color = DEFAULT_ACCENT_COLOR
                 self.entertain_me = config.get("entertain_me", True)
                 BuiltInMacroApp.entertain_mode = self.entertain_me
                 self.playback_speed = config.get("playback_speed", 1.0)
@@ -5898,7 +7363,9 @@ try {{
     def save_settings(self):
         global ACTIVE_SOUND_THEME, CUSTOM_SOUND_PATHS
         config = {
-            "light_mode": self.light_mode,
+            "light_mode": self.theme_mode == "Light",  # Compatibility with older Sequent versions
+            "theme_mode": self.theme_mode,
+            "accent_color": self.accent_color,
             "entertain_me": self.entertain_me,
             "playback_speed": self.playback_speed,
             "action_delay": self.action_delay,
@@ -5964,7 +7431,7 @@ try {{
         f_app = tk.Frame(card_app, bg=BG_PANEL, padx=16, pady=14)
         f_app.pack(fill=tk.X)
 
-        add_setting_toggle(f_app, "Light Mode Theme", self.light_mode, self.set_light_mode)
+        self.build_appearance_settings(f_app)
         self.build_entertain_me_toggle(f_app)
 
         # Guided help can be restarted without reopening Sequent.
@@ -6086,7 +7553,7 @@ try {{
             btn_clear.bind("<Enter>", lambda e: btn_clear.config(fg=COLOR_DANGER))
             btn_clear.bind("<Leave>", lambda e: btn_clear.config(fg=TEXT_MUTED))
             
-            btn_browse = tk.Label(controls, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg="#ffffff", cursor="hand2", padx=10, pady=4)
+            btn_browse = tk.Label(controls, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=10, pady=4)
             btn_browse.pack(side=tk.RIGHT)
             btn_browse.bind("<Button-1>", lambda e: _browse())
 
@@ -6108,7 +7575,7 @@ try {{
         self.folder_display.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         btn_browse_folder = tk.Label(
             folder_controls, text="Browse", font=("Segoe UI", 8, "bold"),
-            bg=COLOR_ACCENT, fg="#ffffff", cursor="hand2", padx=10, pady=4
+            bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=10, pady=4
         )
         btn_browse_folder.pack(side=tk.RIGHT)
         btn_browse_folder.bind("<Button-1>", lambda e: self.choose_presets_folder())
@@ -6151,9 +7618,154 @@ try {{
         return self.entertain_pill
 
 
+    def build_appearance_settings(self, parent):
+        """Persistent, easy-to-read theme selector and shared accent picker."""
+        theme_row = tk.Frame(parent, bg=BG_PANEL)
+        theme_row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(theme_row, text="Application Theme", font=("Segoe UI", 9, "bold"),
+                 bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        self.theme_mode_var = tk.StringVar(value=self.theme_mode)
+        theme_menu = tk.OptionMenu(theme_row, self.theme_mode_var,
+                                   "Dark", "Light", "Match System", command=self.set_theme_mode)
+        theme_menu.configure(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
+                             activeforeground=TEXT_PRIMARY, font=("Segoe UI", 9),
+                             highlightthickness=1, highlightbackground=BG_BORDER,
+                             bd=0, relief="flat", width=16, anchor="w")
+        theme_menu["menu"].configure(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                      activebackground=COLOR_ACCENT,
+                                      activeforeground=TEXT_ON_ACCENT, bd=1, relief="flat")
+        theme_menu.pack(side=tk.LEFT)
+
+        accent_row = tk.Frame(parent, bg=BG_PANEL)
+        accent_row.pack(fill=tk.X, pady=(3, 5))
+        tk.Label(accent_row, text="Accent Color", font=("Segoe UI", 9, "bold"),
+                 bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        self.accent_swatch = tk.Label(accent_row, text="  ", width=3,
+                                       bg=self.accent_color, relief="flat",
+                                       highlightbackground=BG_BORDER, highlightthickness=1)
+        self.accent_swatch.pack(side=tk.LEFT, padx=(0, 7))
+        self.accent_hex_var = tk.StringVar(value=self.accent_color)
+        entry = tk.Entry(accent_row, textvariable=self.accent_hex_var, width=10,
+                         bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                         highlightthickness=1, highlightbackground=BG_BORDER,
+                         font=("Consolas", 10), relief="flat")
+        entry.pack(side=tk.LEFT, padx=(0, 6), ipady=4)
+        entry.bind("<Return>", lambda event: self.apply_accent_hex())
+        sequent_toolbar_button(accent_row, "Apply", self.apply_accent_hex).pack(side=tk.LEFT, padx=(0, 6))
+        sequent_toolbar_button(accent_row, "Customize...", self.choose_accent_color).pack(side=tk.LEFT)
+
+        presets_row = tk.Frame(parent, bg=BG_PANEL)
+        presets_row.pack(fill=tk.X, pady=(0, 9))
+        tk.Label(presets_row, text="Quick Colors", font=("Segoe UI", 9),
+                 bg=BG_PANEL, fg=TEXT_MUTED, width=24, anchor="w").pack(side=tk.LEFT)
+        for name, value in ACCENT_PRESETS:
+            selected = (value.upper() == self.accent_color)
+            swatch = tk.Button(presets_row, text="", width=2, height=1,
+                               bg=value, activebackground=value, relief="flat",
+                               bd=0, cursor="hand2", takefocus=True,
+                               highlightthickness=2 if selected else 1,
+                               highlightbackground=TEXT_PRIMARY if selected else BG_BORDER,
+                               command=lambda chosen=value: self.set_accent_color(chosen))
+            swatch.pack(side=tk.LEFT, padx=(0, 5))
+            ModernTooltip(swatch, name)
+        sequent_toolbar_button(presets_row, "Reset", lambda: self.set_accent_color(DEFAULT_ACCENT_COLOR)).pack(side=tk.LEFT, padx=(7, 0))
+        tk.Label(parent, text="Saved automatically. Match System follows Windows app theme.",
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=("Segoe UI", 8), anchor="w").pack(fill=tk.X, pady=(0, 9))
+
+    def resolve_theme_mode(self):
+        if self.theme_mode == "Light":
+            return "light"
+        if self.theme_mode == "Match System":
+            return read_windows_app_theme()
+        return "dark"
+
+    def _persist_appearance(self):
+        """Save only appearance keys; don't accidentally commit other unsaved preferences."""
+        path = "settings.json"
+        try:
+            config = {}
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if not isinstance(loaded, dict):
+                    raise ValueError("settings.json must contain a JSON object")
+                config.update(loaded)
+            config.update({
+                "theme_mode": self.theme_mode,
+                "light_mode": self.theme_mode == "Light",
+                "accent_color": self.accent_color,
+            })
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=".",
+                                             prefix="sequent_settings_", suffix=".tmp",
+                                             delete=False) as handle:
+                temp_path = handle.name
+                json.dump(config, handle, indent=4)
+            try:
+                os.replace(temp_path, path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+        except (OSError, ValueError, TypeError) as exc:
+            self.update_status(f"Unable to save appearance: {exc}", COLOR_DANGER)
+
+    def set_theme_mode(self, value):
+        if value not in ("Dark", "Light", "Match System"):
+            return
+        self.theme_mode = value
+        self.light_mode = (value == "Light")
+        self._persist_appearance()
+        desired = self.resolve_theme_mode()
+        if desired != self._effective_theme:
+            self.apply_theme(desired)
+        self.update_status(f"Theme: {value}", COLOR_SUCCESS)
+
     def set_light_mode(self, enabled):
-        self.light_mode = bool(enabled)
-        self.apply_theme("light" if self.light_mode else "dark")
+        """Backward-compatible hook; Settings now uses the three-way selector."""
+        self.set_theme_mode("Light" if enabled else "Dark")
+
+    def apply_accent_hex(self):
+        try:
+            self.set_accent_color(self.accent_hex_var.get())
+        except ValueError as exc:
+            self.update_status(str(exc), COLOR_DANGER)
+
+    def choose_accent_color(self):
+        """Open Sequent's own HSV accent editor; apply only on confirmation."""
+        existing = getattr(self, "_accent_color_dialog", None)
+        if existing is not None and existing.window.winfo_exists():
+            existing.window.lift()
+            existing.window.focus_force()
+            return
+        self._accent_color_dialog = SequentAccentColorDialog(self)
+
+    def set_accent_color(self, value):
+        color = normalize_accent_color(value)
+        if self.accent_color == color:
+            if hasattr(self, "accent_hex_var"):
+                self.accent_hex_var.set(color)
+            return
+        self.accent_color = color
+        self._persist_appearance()
+        self.apply_theme(self.resolve_theme_mode())
+        self.update_status(f"Accent color: {color}", COLOR_SUCCESS)
+
+    def _schedule_system_theme_poll(self):
+        # Poll instead of replacing the Win32 window procedure: this is safe
+        # for native and borderless Tk windows and follows changes while open.
+        if self.root.winfo_exists():
+            self._system_theme_job = self.root.after(3000, self._poll_system_theme)
+
+    def _poll_system_theme(self):
+        self._system_theme_job = None
+        try:
+            if self.theme_mode == "Match System":
+                desired = self.resolve_theme_mode()
+                if desired != self._effective_theme and not (
+                    self.playing or self.recording or self.chain_running or self.is_binding
+                ) and getattr(self, "_reticle_edit_index", None) is None:
+                    self.apply_theme(desired)
+        finally:
+            self._schedule_system_theme_poll()
 
     def _cancel_old_ui_jobs(self):
         """Cancel asynchronous jobs and widget animations before UI teardown."""
@@ -6191,16 +7803,10 @@ try {{
                 tip._cancel()
                 tip.hide()
 
-    def apply_theme(self, theme_name):
-        if getattr(self, '_theme_lock', False): return
-        if getattr(self, "_walkthrough", None) is not None:
-            self._walkthrough.close(restore=False)
-        self._theme_lock = True
-        self._theme_rebuilding = True
-
+    def _update_theme_tokens(self, theme_name):
         global BG_APP, BG_SIDEBAR, BG_HEADER, BG_PANEL, BG_INPUT, BG_GUTTER
         global BG_SCROLL_TRACK, BG_BORDER, BG_HOVER, BG_SELECTED, TRACK_INACTIVE, TRACK_HOVER, TRACK_ACTIVE
-        global TEXT_PRIMARY, TEXT_MUTED, TEXT_HEADER, COLOR_ACCENT, COLOR_ACCENT_HOV
+        global TEXT_PRIMARY, TEXT_MUTED, TEXT_HEADER, COLOR_ACCENT, COLOR_ACCENT_HOV, TEXT_ON_ACCENT
         global SYNTAX_BLUE, SYNTAX_GREEN, SYNTAX_PURPLE, SYNTAX_ORANGE, DISABLED
 
         if theme_name == "light":
@@ -6216,7 +7822,7 @@ try {{
             BG_SELECTED = "#c6dcf8"
             TRACK_INACTIVE = "#a8b4c3"
             TRACK_HOVER = "#798da5"
-            TRACK_ACTIVE = "#347bd8"
+            TRACK_ACTIVE = COLOR_ACCENT
             TEXT_PRIMARY = "#17202b"
             TEXT_MUTED = "#506073"
             TEXT_HEADER = "#17202b"
@@ -6238,7 +7844,7 @@ try {{
             BG_SELECTED = "#293b54"
             TRACK_INACTIVE = "#4a5260"
             TRACK_HOVER = "#657185"
-            TRACK_ACTIVE = "#4089eb"
+            TRACK_ACTIVE = COLOR_ACCENT
             TEXT_PRIMARY = "#edf1f6"
             TEXT_MUTED = "#a0aab8"
             TEXT_HEADER = "#ffffff"
@@ -6247,6 +7853,26 @@ try {{
             SYNTAX_PURPLE = "#c4a3ed"
             SYNTAX_ORANGE = "#f3ba65"
             DISABLED = "#363b45"
+
+        # Single source of truth for the entire UI's configurable accent.
+        COLOR_ACCENT = self.accent_color
+        COLOR_ACCENT_HOV = blend_hex(COLOR_ACCENT,
+                                    "#000000" if theme_name == "light" else "#FFFFFF", 0.85)
+        TRACK_ACTIVE = COLOR_ACCENT
+        BG_SELECTED = blend_hex(COLOR_ACCENT, BG_PANEL,
+                                0.18 if theme_name == "light" else 0.27)
+        TEXT_ON_ACCENT = accent_text_color(COLOR_ACCENT)
+
+    def apply_theme(self, theme_name):
+        if getattr(self, '_theme_lock', False): return
+        if getattr(self, "_walkthrough", None) is not None:
+            self._walkthrough.close(restore=False)
+        self._theme_lock = True
+        self._theme_rebuilding = True
+
+        self._update_theme_tokens(theme_name)
+        if getattr(self, 'native_chrome', None) is not None:
+            self.native_chrome.refresh_dwm_frame()
 
         active_tab = getattr(self, 'current_tab_name', 'playback') or 'playback'
         self._cancel_old_ui_jobs()
@@ -6257,6 +7883,9 @@ try {{
             for grip_name in ('grip_e', 'grip_s', 'grip_w', 'grip_se'):
                 grip = getattr(self, grip_name, None)
                 if grip is not None and grip.winfo_exists():
+                    grip.configure(bg=BG_APP)
+            for grip in getattr(self, '_native_grips', ()):
+                if grip.winfo_exists():
                     grip.configure(bg=BG_APP)
 
             # All sidebar, dock, Settings, and overlay children belong to the
@@ -6270,6 +7899,10 @@ try {{
                 old_overlay.destroy()
 
             self.setup_ui(initial_tab=active_tab, animate=False)
+            for grip in getattr(self, '_native_grips', ()):
+                if grip.winfo_exists():
+                    grip.lift()
+            self._effective_theme = theme_name
             if self.recorded_actions:
                 self.display_actions_in_queue(
                     self.recorded_actions, self.current_source_label
@@ -6446,6 +8079,8 @@ try {{
                             cleaned_act["oy"] = int(cleaned_act.get("oy", 0))
                             cleaned_act["color"] = str(cleaned_act.get("color", "#FFFFFF")).upper()
                             cleaned_act["action"] = str(cleaned_act.get("action", "Single Click"))
+                            cleaned_act["anchor"] = str(cleaned_act.get("anchor", "Center"))
+                            cleaned_act["tolerance"] = max(0, min(255, int(cleaned_act.get("tolerance", 8))))
                         if "match_any" in act:
                             cleaned_act["match_any"] = bool(act["match_any"])
                         validated_actions.append(cleaned_act)
@@ -6518,6 +8153,8 @@ try {{
                                 cleaned_act["oy"] = int(cleaned_act.get("oy", 0))
                                 cleaned_act["color"] = str(cleaned_act.get("color", "#FFFFFF")).upper()
                                 cleaned_act["action"] = str(cleaned_act.get("action", "Single Click"))
+                            cleaned_act["anchor"] = str(cleaned_act.get("anchor", "Center"))
+                            cleaned_act["tolerance"] = max(0, min(255, int(cleaned_act.get("tolerance", 8))))
                             if "match_any" in act:
                                 cleaned_act["match_any"] = bool(act["match_any"])
                             validated_actions.append(cleaned_act)
@@ -7672,6 +9309,7 @@ try {{
         if not self.recorded_actions:
             self.update_status("Queue Empty", COLOR_DANGER)
             return
+        self._prepare_mouse_execution()
         self.playing = True
         self.show_tab("playback") 
         self.update_status("Running Script...", COLOR_ACCENT)
@@ -7718,7 +9356,9 @@ try {{
 
         def _show():
             dlg = tk.Toplevel(self.root)
-            dlg.overrideredirect(True)
+            dlg.resizable(False, False)
+            if os.name != 'nt':
+                dlg.overrideredirect(True)
             dlg.attributes('-topmost', True)
             dlg.configure(bg=BG_BORDER)
 
@@ -7762,6 +9402,8 @@ try {{
             rx = mon_x + (mon_w - w) // 2
             ry = mon_y + (mon_h - h) // 2
             dlg.geometry(f"{w}x{h}+{rx}+{ry}")
+            if os.name == 'nt':
+                dlg._seq_native_chrome = install_sequent_chrome(dlg, resizable=False)
 
             card = tk.Frame(dlg, bg=BG_PANEL)
             card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
@@ -7780,12 +9422,17 @@ try {{
             drag_data = {"x": 0, "y": 0, "win_x": 0, "win_y": 0}
 
             def _start_drag(e):
+                if os.name == 'nt' and getattr(dlg, '_seq_native_chrome', None):
+                    begin_native_window_motion(dlg, 2)
+                    return
                 drag_data["x"] = e.x_root
                 drag_data["y"] = e.y_root
                 drag_data["win_x"] = dlg.winfo_x()
                 drag_data["win_y"] = dlg.winfo_y()
 
             def _do_drag(e):
+                if os.name == 'nt' and getattr(dlg, '_seq_native_chrome', None):
+                    return
                 dx = e.x_root - drag_data["x"]
                 dy = e.y_root - drag_data["y"]
                 dlg.geometry(f"+{drag_data['win_x'] + dx}+{drag_data['win_y'] + dy}")
@@ -7842,7 +9489,9 @@ try {{
 
         def _show():
             dlg = tk.Toplevel(self.root)
-            dlg.overrideredirect(True)
+            dlg.resizable(False, False)
+            if os.name != 'nt':
+                dlg.overrideredirect(True)
             dlg.attributes('-topmost', True)
             dlg.configure(bg=BG_BORDER)
 
@@ -7884,6 +9533,8 @@ try {{
             rx = mon_x + (mon_w - w) // 2
             ry = mon_y + (mon_h - h) // 2
             dlg.geometry(f"{w}x{h}+{rx}+{ry}")
+            if os.name == 'nt':
+                dlg._seq_native_chrome = install_sequent_chrome(dlg, resizable=False)
 
             card = tk.Frame(dlg, bg=BG_PANEL)
             card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
@@ -7900,12 +9551,17 @@ try {{
             drag_data = {"x": 0, "y": 0, "win_x": 0, "win_y": 0}
 
             def _start_drag(e):
+                if os.name == 'nt' and getattr(dlg, '_seq_native_chrome', None):
+                    begin_native_window_motion(dlg, 2)
+                    return
                 drag_data["x"] = e.x_root
                 drag_data["y"] = e.y_root
                 drag_data["win_x"] = dlg.winfo_x()
                 drag_data["win_y"] = dlg.winfo_y()
 
             def _do_drag(e):
+                if os.name == 'nt' and getattr(dlg, '_seq_native_chrome', None):
+                    return
                 dx = e.x_root - drag_data["x"]
                 dy = e.y_root - drag_data["y"]
                 dlg.geometry(f"+{drag_data['win_x'] + dx}+{drag_data['win_y'] + dy}")
@@ -8217,32 +9873,15 @@ try {{
                     if act_type == "find_color":
                         area = action.get("area", [0, 0, 100, 100])
                         hex_color = action.get("color", "#FFFFFF").upper()
-                        ox, oy = action.get("ox", 0), action.get("oy", 0)
-                        sub_action = action.get("action", "Single Click")
-                        
-                        found_box = self.search_color_in_area(area[0], area[1], area[2], area[3], hex_color)
-                        
+                        found_box = self.search_color_in_area(*area, hex_color,
+                                    tolerance=action.get("tolerance", 8))
+
                         if found_box:
-                            x1, y1, x2, y2 = found_box
-                            
-                            # Draw visual bounding box overlay
-                            self.root.after(0, lambda bx1=x1, by1=y1, bx2=x2, by2=y2: self.draw_highlight_box(bx1, by1, bx2, by2, COLOR_SUCCESS, 800))
-                            
-                            # Calculate dynamic click target based on bounding box edges
-                            anchor_x = x2 if ox > 0 else (x1 if ox < 0 else x1 + (x2 - x1) // 2)
-                            anchor_y = y2 if oy > 0 else (y1 if oy < 0 else y1 + (y2 - y1) // 2)
-                            
-                            tx, ty = anchor_x + ox, anchor_y + oy
-                            move_mouse(tx, ty)
-                            time.sleep(max(0.001, 0.04 / self.playback_speed))
-                            
-                            if sub_action == "Single Click":
-                                click("left")
-                            elif sub_action == "Double Click":
-                                click("left")
-                                time.sleep(0.05)
-                                click("left")
-                                
+                            mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
+                            self.root.after(0, lambda b=found_box:
+                                            self.draw_highlight_box(*b, COLOR_SUCCESS, 800))
+                            self.root.after(0, lambda m=mode, x=tx, y=ty:
+                                            self._report_color_execution(m, x, y))
                             if self.audio_cues: play_cue("match")
                         else:
                             raise MacroExecutionError(f"Color {hex_color} not found in search area")
@@ -8342,7 +9981,7 @@ try {{
                         else:
                             move_mouse(tx, ty)
 
-                        time.sleep(max(0.001, 0.04 / self.playback_speed))
+                        wait_for_cursor_settled(tx, ty)
                         click(action.get("btn", "left"))
 
                     elif act_type == "key":
@@ -8430,5 +10069,17 @@ try {{
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = BuiltInMacroApp(root)
-    root.mainloop()
+    try:
+        app = BuiltInMacroApp(root)
+        root.mainloop()
+    except KeyboardInterrupt:
+        # Ctrl+C from the terminal is a normal shutdown request, not an
+        # application error. Avoid Tkinter's unhandled-interrupt traceback.
+        print("\nSequent stopped from terminal (Ctrl+C).")
+    finally:
+        # Tk may already have been destroyed by Sequent's Close button.
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
