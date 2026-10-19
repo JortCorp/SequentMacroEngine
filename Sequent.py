@@ -121,18 +121,27 @@ def client_to_screen_pos(hwnd, rel_x, rel_y):
     return pt.x, pt.y
 
 def find_window_by_title_substr(query):
-    if not query: return None
+    """Locate a visible desktop window with pointer-safe Win64 signatures."""
+    if not query:
+        return None
+    user32 = ctypes.windll.user32
+    WindowCallback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_ssize_t)
+    user32.EnumWindows.argtypes = [WindowCallback, ctypes.c_ssize_t]
+    user32.EnumWindows.restype = ctypes.c_int
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.IsWindowVisible.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
     target_hwnd = [None]
-    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-    def callback(hwnd, extra):
-        if ctypes.windll.user32.IsWindowVisible(hwnd):
+    needle = str(query).casefold()
+    def callback(hwnd, _extra):
+        if user32.IsWindowVisible(hwnd):
             buf = ctypes.create_unicode_buffer(512)
-            ctypes.windll.user32.GetWindowTextW(hwnd, buf, 512)
-            if query.lower() in buf.value.lower():
+            if user32.GetWindowTextW(hwnd, buf, len(buf)) and needle in buf.value.casefold():
                 target_hwnd[0] = hwnd
                 return False
         return True
-    ctypes.windll.user32.EnumWindows(EnumWindowsProc(callback), 0)
+    user32.EnumWindows(WindowCallback(callback), 0)
     return target_hwnd[0]
 
 # --- Humanized Bézier Curve Calculator ---
@@ -222,6 +231,55 @@ def color_click_target(action, box):
     """Unconstrained target: reticle may be anywhere, even beyond the bbox."""
     ax, ay = color_anchor_position(box, action.get("anchor", "Center"))
     return ax + int(action.get("ox", 0)), ay + int(action.get("oy", 0))
+
+
+def find_ocr_word_match(words, target_text, match_any=False):
+    """Find a text/phrase using WinRT OCR word boxes, not nonexistent line boxes.
+
+    Return the tight union of matching word rectangles in *capture pixels*,
+    or None. A phrase may span adjacent words on one OCR line. Comparing
+    casefolded alphanumeric text tolerates OCR-inserted spaces/punctuation.
+    """
+    def compact(text):
+        return "".join(ch for ch in str(text).casefold() if ch.isalnum())
+
+    target = compact(target_text)
+    if not target and not match_any:
+        return None
+
+    by_line = {}
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        try:
+            rect = (float(word["X"]), float(word["Y"]),
+                    float(word["Width"]), float(word["Height"]))
+        except (KeyError, ValueError, TypeError, OverflowError):
+            continue
+        if not all(math.isfinite(v) for v in rect) or rect[2] <= 0 or rect[3] <= 0:
+            continue
+        content = compact(word.get("Text", ""))
+        if content:
+            by_line.setdefault(word.get("Line", 0), []).append((content, rect))
+
+    for line_words in by_line.values():
+        joined = ""
+        segments = []
+        for content, rect in line_words:
+            start = len(joined)
+            joined += content
+            segments.append((start, len(joined), rect))
+        start = 0 if match_any else joined.find(target)
+        if start < 0:
+            continue
+        end = start + (1 if match_any else len(target))
+        boxes = [rect for first, last, rect in segments
+                 if first < end and last > start]
+        if boxes:
+            return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                    max(b[0] + b[2] for b in boxes),
+                    max(b[1] + b[3] for b in boxes))
+    return None
 
 
 def largest_color_component(raw, width, height, stride, rgb, tolerance=8):
@@ -1646,6 +1704,973 @@ class ModernScrollBar(tk.Canvas):
             self.command("moveto", f"{new_first:.6f}")
 
             
+# New actions are stored as plain dictionaries alongside legacy recorded actions.
+# Editor field: (key, label, kind, initial[, choice options]).
+DYNAMIC_ACTION_SPECS = {
+ 'Smart UI Element & Click':('ui_element',[
+   ('window','Target window title contains (blank = desktop)','text',''),
+   ('name','Accessible element name contains','text',''),
+   ('automation_id','Automation ID (optional)','text',''),
+   ('control_type','Control type e.g. ButtonControl (optional)','text',''),
+   ('action','Mouse action','choice','Single Click',['Move Only','Single Click','Double Click']),
+   ('ox','Horizontal offset (pixels)','int',0),('oy','Vertical offset (pixels)','int',0)]),
+ 'Smart Wait & Retry':('smart_wait',[
+   ('kind','Watch for','choice','text',['text','window','color','image','ui_element','clipboard','file','variable']),
+   ('match','Text / color / filename / window name / image path','text','Ready'),
+   ('area','Screen area: x,y,width,height','area',[0,0,1200,800]),
+   ('name','UI element name or variable identifier','text',''),
+   ('window','UI target window (optional)','text',''),
+   ('control_type','UI control type (optional)','text',''),
+   ('automation_id','UI Automation ID (optional)','text',''),
+   ('mode','Wait until','choice','appears',['appears','disappears']),
+   ('timeout','Timeout seconds','float',15.0),
+   ('interval','Polling interval seconds','float',0.5),
+   ('on_error','When timed out','choice','stop',['stop','skip','goto']),
+   ('fallback_label','Fallback label if goto','text','')]),
+ 'OCR → Variable':('ocr_extract',[
+   ('area','OCR screen region: x,y,width,height','area',[0,0,1200,800]),
+   ('var_name','Save output to variable','text','ocr_value'),
+   ('mode','Extraction mode','choice','full',['full','regex']),
+   ('pattern','Regex pattern (regex mode only)','text','Order\\s*#(\\d+)'),
+   ('group','Regex capture group (0 = whole match)','int',1)]),
+ 'IF (Dynamic Condition)':('if_dynamic',[
+   ('logic','Combine conditions','choice','ALL',['ALL','ANY']),
+   ('conditions','Conditions JSON list','json',[{'kind':'variable','name':'status','op':'contains','value':'ready'}])]),
+ 'ELSE':('else_dynamic',[]),
+ 'END IF':('end_if',[]),
+ 'LOOP Start':('loop_start',[
+   ('mode','Loop mode','choice','count',['count','while','until','for_each']),
+   ('count','Repeat N times','int',3),
+   ('max_iterations','Maximum iterations (safety)','int',1000),
+   ('table','Table name (for_each)','text','rows'),
+   ('logic','Combine conditions','choice','ALL',['ALL','ANY']),
+   ('conditions','While/Until conditions','json',[{'kind':'variable','name':'status','op':'!=','value':'done'}])]),
+ 'LOOP End':('loop_end',[]),
+ 'Find Image & Click':('find_image',[
+   ('path','Template image (PNG/JPG)','path',''),
+   ('area','Screen area: x,y,width,height','area',[0,0,1200,800]),
+   ('confidence','Match confidence (0–1)','float',0.85),
+   ('action','Mouse action','choice','Single Click',['Move Only','Single Click','Double Click']),
+   ('ox','Horizontal offset (pixels)','int',0),('oy','Vertical offset (pixels)','int',0)]),
+ 'Recovery Policy':('recovery',[
+   ('on_error','When an action fails','choice','stop',['stop','skip','goto']),
+   ('retry_count','Retries before failure (0–20)','int',2),
+   ('retry_delay','Delay between retries (seconds)','float',0.5),
+   ('fallback_label','Fallback label for goto','text','recovery'),
+   ('screenshot','Save screenshot on final failure','bool',True)]),
+ 'Load CSV / Excel':('data_load',[
+   ('path','Input CSV or XLSX file','path',''),
+   ('table','Table identifier','text','rows'),
+   ('sheet','Excel sheet name (blank = first)','text','')]),
+ 'Update Table Cell':('data_set',[
+   ('table','Loaded table name','text','rows'),
+   ('column','Column to update/create','text','result'),
+   ('value','Value (supports ${row.Column} variables)','text','${_last_value}')]),
+ 'Export CSV / Excel':('data_save',[
+   ('table','Loaded table name','text','rows'),
+   ('path','Output CSV or XLSX file','path','results.csv')]),
+ 'Auto-start Trigger':('trigger_start',[
+   ('kind','Trigger when a new event occurs','choice','file',['file','window','clipboard','webhook']),
+   ('value','File path/glob, window title, clipboard text, or /webhook path','text',''),
+   ('port','Local webhook port (webhook mode only)','int',8765),
+   ('enabled','Enable background auto-start while idle','bool',True)])
+}
+
+
+# --- Sequent Dynamic Automation Engine (shared by playback, chains and debugger) ---
+# Zero third-party packages: ctypes/Win32/GDI+, Windows UI Automation through
+# Windows PowerShell/.NET built into Windows, and standard-library XML/ZIP/CSV.
+import csv
+import glob
+import pathlib
+import fnmatch
+import hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# --- Dependency-free Windows UI Automation, screen capture and Excel helpers ---
+# Python standard library + Windows components shipped with the OS only.
+import ctypes.wintypes as _seq_wt
+import posixpath as _seq_posixpath
+import zipfile as _seq_zipfile
+import xml.etree.ElementTree as _seq_et
+import zlib as _seq_zlib
+
+
+def sequent_native_uia(query):
+    """Use Microsoft's inbox .NET UIAutomation client, via Windows PowerShell 5.1.
+
+    This is NOT the third-party 'uiautomation' Python package. Sequent's
+    existing OCR implementation already uses Windows PowerShell for WinRT.
+    JSON is sent in an environment variable, not interpolated into PS source.
+    """
+    if os.name != 'nt':
+        raise MacroExecutionError('UI Automation requires Windows')
+    ps = r'''
+$ErrorActionPreference = 'Stop'
+try {
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+    Add-Type -AssemblyName WindowsBase
+    $q = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:SEQUENT_UIA_QUERY)) | ConvertFrom-Json
+    function Selector([System.Windows.Automation.AutomationElement]$element) {
+        if ($null -eq $element) { return $null }
+        try {
+            $c = $element.Current
+            $rect = $c.BoundingRectangle
+            if ($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0) { return $null }
+            return @{name=[string]$c.Name; automation_id=[string]$c.AutomationId;
+                control_type=[string]$c.ControlType.ProgrammaticName;
+                bounds=@([int][Math]::Round($rect.Left),[int][Math]::Round($rect.Top),
+                    [int][Math]::Round($rect.Right),[int][Math]::Round($rect.Bottom))}
+        } catch { return $null }
+    }
+    $found = $null
+    if ($q.mode -eq 'point') {
+        $point = New-Object System.Windows.Point ([double]$q.x),([double]$q.y)
+        $found = Selector ([System.Windows.Automation.AutomationElement]::FromPoint($point))
+    } else {
+        if ([long]$q.hwnd -ne 0) {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]([long]$q.hwnd))
+        } else {
+            $root = [System.Windows.Automation.AutomationElement]::RootElement
+        }
+        if ($null -ne $root) {
+            $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+            $stack = New-Object 'System.Collections.Generic.Stack[object]'
+            $stack.Push(@($root, 0))
+            $visited = 0
+            while ($stack.Count -gt 0 -and $visited -lt 3500) {
+                $item = $stack.Pop()
+                $element = [System.Windows.Automation.AutomationElement]$item[0]
+                $depth = [int]$item[1]
+                $visited++
+                try {
+                    $c = $element.Current
+                    $n = [string]$c.Name
+                    $aid = [string]$c.AutomationId
+                    $type = ([string]$c.ControlType.ProgrammaticName).Replace('ControlType.','').Replace('Control','')
+                    $wantedType = ([string]$q.control_type).Replace('ControlType.','').Replace('Control','')
+                    if ((-not $q.name -or $n.IndexOf([string]$q.name,[StringComparison]::OrdinalIgnoreCase) -ge 0) -and
+                        (-not $q.automation_id -or $aid.Equals([string]$q.automation_id,[StringComparison]::OrdinalIgnoreCase)) -and
+                        (-not $wantedType -or $type.Equals($wantedType,[StringComparison]::OrdinalIgnoreCase))) {
+                        $found = Selector $element
+                        if ($null -ne $found) { break }
+                    }
+                    if ($depth -lt 14) {
+                        # Reverse siblings for stable visual discovery order.
+                        $children = New-Object 'System.Collections.Generic.List[object]'
+                        $child = $walker.GetFirstChild($element)
+                        while ($null -ne $child -and $children.Count -lt 1000) {
+                            $children.Add($child)
+                            $child = $walker.GetNextSibling($child)
+                        }
+                        for ($k=$children.Count-1; $k -ge 0; $k--) {
+                            $stack.Push(@($children[$k], $depth+1))
+                        }
+                    }
+                } catch { continue }
+            }
+        }
+    }
+    if ($null -eq $found) { Write-Output 'null' }
+    else { ConvertTo-Json -InputObject $found -Depth 4 -Compress }
+} catch {
+    Write-Output (ConvertTo-Json -InputObject @{error=$_.Exception.Message} -Compress)
+}
+'''
+    payload = dict(query)
+    env = os.environ.copy()
+    env['SEQUENT_UIA_QUERY'] = base64.b64encode(json.dumps(payload).encode('utf-8')).decode('ascii')
+    script = base64.b64encode(ps.encode('utf-16le')).decode('ascii')
+    try:
+        completed = subprocess.run(
+            ['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', script],
+            capture_output=True, text=True, timeout=14, env=env,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise MacroExecutionError(f'Windows UI Automation failed: {exc}') from exc
+    stdout = completed.stdout.strip()
+    if completed.returncode or not stdout:
+        raise MacroExecutionError('Windows UI Automation failed: ' +
+                                  (completed.stderr.strip() or 'no response')[:350])
+    try:
+        response = json.loads(stdout)
+    except ValueError as exc:
+        raise MacroExecutionError(f'Unexpected Windows UI Automation response: {stdout[:200]}') from exc
+    if response and response.get('error'):
+        raise MacroExecutionError('Windows UI Automation: ' + response['error'])
+    return response
+
+
+def sequent_capture_bgra(x, y, width, height):
+    """Capture a physical-desktop rectangle in top-down BGRA (Win32 GDI)."""
+    if os.name != 'nt':
+        raise MacroExecutionError('Native screen capture requires Windows')
+    x, y, width, height = map(int, (x, y, width, height))
+    if width <= 0 or height <= 0 or width*height > 16000000:
+        raise MacroExecutionError('Invalid native capture rectangle')
+    user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+    H = ctypes.c_void_p
+    user32.GetDC.argtypes = [H]; user32.GetDC.restype = H
+    user32.ReleaseDC.argtypes = [H, H]; user32.ReleaseDC.restype = ctypes.c_int
+    gdi32.CreateCompatibleDC.argtypes = [H]; gdi32.CreateCompatibleDC.restype = H
+    gdi32.CreateCompatibleBitmap.argtypes = [H, ctypes.c_int, ctypes.c_int]
+    gdi32.CreateCompatibleBitmap.restype = H
+    gdi32.SelectObject.argtypes = [H, H]; gdi32.SelectObject.restype = H
+    gdi32.DeleteObject.argtypes = [H]; gdi32.DeleteObject.restype = ctypes.c_int
+    gdi32.DeleteDC.argtypes = [H]; gdi32.DeleteDC.restype = ctypes.c_int
+    gdi32.BitBlt.argtypes = [H, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, H, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    gdi32.BitBlt.restype = ctypes.c_int
+    gdi32.GetDIBits.argtypes = [H,H,ctypes.c_uint,ctypes.c_uint,
+                                H,H,ctypes.c_uint]
+    gdi32.GetDIBits.restype = ctypes.c_int
+    class BMI(ctypes.Structure):
+        _fields_ = [('biSize',ctypes.c_uint32),('biWidth',ctypes.c_int32),
+                    ('biHeight',ctypes.c_int32),('biPlanes',ctypes.c_uint16),
+                    ('biBitCount',ctypes.c_uint16),('biCompression',ctypes.c_uint32),
+                    ('biSizeImage',ctypes.c_uint32),('biXPelsPerMeter',ctypes.c_int32),
+                    ('biYPelsPerMeter',ctypes.c_int32),('biClrUsed',ctypes.c_uint32),
+                    ('biClrImportant',ctypes.c_uint32)]
+    screen_dc = memory_dc = bitmap = old = None
+    try:
+        screen_dc = user32.GetDC(None)
+        if not screen_dc: raise MacroExecutionError('GetDC failed during screenshot')
+        memory_dc = gdi32.CreateCompatibleDC(screen_dc)
+        if not memory_dc: raise MacroExecutionError('CreateCompatibleDC failed')
+        bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+        if not bitmap: raise MacroExecutionError('CreateCompatibleBitmap failed')
+        old = gdi32.SelectObject(memory_dc, bitmap)
+        if not old: raise MacroExecutionError('SelectObject failed')
+        if not gdi32.BitBlt(memory_dc, 0, 0, width, height,
+                            screen_dc, x, y, 0x40CC0020):  # SRCCOPY | CAPTUREBLT
+            raise MacroExecutionError('BitBlt could not capture screen')
+        gdi32.SelectObject(memory_dc, old); old = None  # REQUIRED before GetDIBits
+        header = BMI()
+        header.biSize = ctypes.sizeof(header)
+        header.biWidth, header.biHeight = width, -height
+        header.biPlanes, header.biBitCount = 1, 32
+        header.biSizeImage = width * height * 4
+        buf = ctypes.create_string_buffer(width * height * 4)
+        if gdi32.GetDIBits(memory_dc, bitmap, 0, height,
+                           ctypes.cast(buf, H), ctypes.cast(ctypes.byref(header), H), 0) != height:
+            raise MacroExecutionError('GetDIBits failed')
+        return bytes(buf)
+    finally:
+        if old and memory_dc: gdi32.SelectObject(memory_dc, old)
+        if bitmap: gdi32.DeleteObject(bitmap)
+        if memory_dc: gdi32.DeleteDC(memory_dc)
+        if screen_dc: user32.ReleaseDC(None, screen_dc)
+
+
+def sequent_save_bmp(filename, pixels, width, height):
+    """Write uncompressed 32-bit BMP with top-down scanlines, using struct only."""
+    size = width*height*4
+    if len(pixels) != size:
+        raise ValueError('Expected width * height * 4 bytes of BGRA pixel data')
+    with open(filename, 'wb') as f:
+        f.write(struct.pack('<2sIHHI', b'BM', 54+size, 0, 0, 54))
+        f.write(struct.pack('<IiiHHIIiiII', 40, width, -height, 1, 32,
+                            0, size, 2835, 2835, 0, 0))
+        f.write(pixels)
+
+
+def sequent_load_image_bgra(filename):
+    """Read PNG/JPEG/BMP using inbox Windows GDI+ without Pillow."""
+    if os.name != 'nt':
+        # BMP (32-bit top-down) is supported on non-Windows for offline tests.
+        with open(filename,'rb') as f: data=f.read()
+        if len(data)<54 or data[:2]!=b'BM':
+            raise MacroExecutionError('Template decoding requires Windows GDI+ (PNG/JPG/BMP)')
+        offset=struct.unpack_from('<I',data,10)[0]
+        w,h,planes,bpp,compression=struct.unpack_from('<iiHHI',data,18)
+        if w<=0 or not h or abs(h)*w>1000000 or planes!=1 or bpp!=32 or compression!=0:
+            raise MacroExecutionError('Unsupported BMP format')
+        stride=w*4
+        raw=data[offset:offset+stride*abs(h)]
+        if len(raw)!=stride*abs(h): raise MacroExecutionError('Truncated BMP')
+        if h>0: raw=b''.join(raw[i:i+stride] for i in range((h-1)*stride,-1,-stride))
+        return (w,abs(h),raw)
+    gdip = ctypes.windll.gdiplus
+    H = ctypes.c_void_p
+    class GdiStartup(ctypes.Structure):
+        _fields_=[('GdiplusVersion',ctypes.c_uint32),('DebugEventCallback',H),
+                  ('SuppressBackgroundThread',ctypes.c_int32),('SuppressExternalCodecs',ctypes.c_int32)]
+    class GdiRect(ctypes.Structure):
+        _fields_=[('X',ctypes.c_int32),('Y',ctypes.c_int32),
+                  ('Width',ctypes.c_int32),('Height',ctypes.c_int32)]
+    class BitmapData(ctypes.Structure):
+        _fields_=[('Width',ctypes.c_uint32),('Height',ctypes.c_uint32),
+                  ('Stride',ctypes.c_int32),('PixelFormat',ctypes.c_int32),
+                  ('Scan0',H),('Reserved',ctypes.c_size_t)]
+    gdip.GdiplusStartup.argtypes=[ctypes.POINTER(ctypes.c_size_t),ctypes.POINTER(GdiStartup),H]
+    gdip.GdiplusStartup.restype=ctypes.c_int
+    gdip.GdiplusShutdown.argtypes=[ctypes.c_size_t]
+    gdip.GdipCreateBitmapFromFile.argtypes=[ctypes.c_wchar_p,ctypes.POINTER(H)]
+    gdip.GdipCreateBitmapFromFile.restype=ctypes.c_int
+    gdip.GdipDisposeImage.argtypes=[H]
+    gdip.GdipGetImageWidth.argtypes=[H,ctypes.POINTER(ctypes.c_uint32)]
+    gdip.GdipGetImageHeight.argtypes=[H,ctypes.POINTER(ctypes.c_uint32)]
+    gdip.GdipBitmapLockBits.argtypes=[H,ctypes.POINTER(GdiRect),ctypes.c_uint32,
+                                      ctypes.c_int32,ctypes.POINTER(BitmapData)]
+    gdip.GdipBitmapLockBits.restype=ctypes.c_int
+    gdip.GdipBitmapUnlockBits.argtypes=[H,ctypes.POINTER(BitmapData)]
+    gdip.GdipBitmapUnlockBits.restype=ctypes.c_int
+    token=ctypes.c_size_t()
+    options=GdiStartup(1,None,0,0)
+    if gdip.GdiplusStartup(ctypes.byref(token),ctypes.byref(options),None):
+        raise MacroExecutionError('GDI+ initialization failed')
+    bitmap=H()
+    locked=False
+    try:
+        if gdip.GdipCreateBitmapFromFile(os.path.abspath(filename),ctypes.byref(bitmap)):
+            raise MacroExecutionError(f'Cannot open template image: {filename}')
+        width,height=ctypes.c_uint32(),ctypes.c_uint32()
+        if gdip.GdipGetImageWidth(bitmap,ctypes.byref(width)) or gdip.GdipGetImageHeight(bitmap,ctypes.byref(height)):
+            raise MacroExecutionError('Could not get template image dimensions')
+        w,h=width.value,height.value
+        if not w or not h or w*h>1000000:
+            raise MacroExecutionError('Template image must contain 1 to 1,000,000 pixels')
+        data=BitmapData()
+        rect=GdiRect(0,0,w,h)
+        if gdip.GdipBitmapLockBits(bitmap,ctypes.byref(rect),1,0x26200A,ctypes.byref(data)):
+            raise MacroExecutionError('Could not read template pixels')
+        locked=True
+        # GDI+ 32bpp ARGB is stored in memory as BGRA.
+        rows=[ctypes.string_at(data.Scan0+row*data.Stride,w*4) for row in range(h)]
+        return (w,h,b''.join(rows))
+    finally:
+        if locked: gdip.GdipBitmapUnlockBits(bitmap,ctypes.byref(data))
+        if bitmap: gdip.GdipDisposeImage(bitmap)
+        gdip.GdiplusShutdown(token)
+
+
+def sequent_resize_bgra(pixels,width,height,scaled_width,scaled_height):
+    """Nearest-neighbour scaling, including alpha, entirely in stdlib Python."""
+    if (width,height)==(scaled_width,scaled_height): return pixels
+    out=bytearray(scaled_width*scaled_height*4)
+    for y in range(scaled_height):
+        sy=(y*height//scaled_height)*width*4
+        start=y*scaled_width*4
+        for x in range(scaled_width):
+            src=sy+(x*width//scaled_width)*4
+            dst=start+x*4
+            out[dst:dst+4]=pixels[src:src+4]
+    return bytes(out)
+
+
+def sequent_match_bgra(screen, sw, sh, template, tw, th, confidence=0.85):
+    """RGB template match with a fast sampled pass and exact-position verification.
+
+    All candidate pixel coordinates are checked. Using a coarse 3- or 5-pixel
+    grid can miss small or detailed templates when their position is offset.
+    Confidence = 1 - mean_absolute_rgb_difference/255, not OpenCV NCC.
+    """
+    import heapq
+    if tw > sw or th > sh or tw < 2 or th < 2: return None
+    if len(screen) != sw * sh * 4 or len(template) != tw * th * 4:
+        raise ValueError('Malformed BGRA image buffer')
+    pts=[]
+    for gy in range(10):
+        for gx in range(10):
+            tx=min(tw-1,(2*gx+1)*tw//20)
+            ty=min(th-1,(2*gy+1)*th//20)
+            ti=(ty*tw+tx)*4
+            if template[ti+3]>=100:
+                pts.append((tx,ty,template[ti],template[ti+1],template[ti+2]))
+    if not pts: return None
+    avg=[sum(pt[i] for pt in pts)/len(pts) for i in (2,3,4)]
+    distinctive=sorted(pts,key=lambda p:sum(abs(p[i]-avg[i-2]) for i in (2,3,4)),reverse=True)
+    landmarks=distinctive[:10]
+    if len(landmarks)<3: return None
+    # First anchor may be atypical; permit a generous per-pixel difference.
+    anchor_x,anchor_y,ab,ag,ar=landmarks[0]
+    anchor_row_offset=anchor_y*sw*4+anchor_x*4
+    offsets=[(p[1]*sw+p[0])*4 for p in landmarks[1:]]
+    colors=[p[2:] for p in landmarks[1:]]
+    difference_limit=(1.0-confidence)*255
+    coarse_cutoff=max(42,difference_limit*1.65)
+    anchor_cutoff=max(90,difference_limit*3)
+    candidate_heap=[]  # keep the 32 best coarse matches (max-heap via -error)
+    count=len(landmarks)
+    for y in range(sh-th+1):
+        row_offset=y*sw*4
+        for x in range(sw-tw+1):
+            base=row_offset+x*4
+            anchor=base+anchor_row_offset
+            rdiff=abs(screen[anchor]-ab)+abs(screen[anchor+1]-ag)+abs(screen[anchor+2]-ar)
+            if rdiff>anchor_cutoff*3:continue
+            total=rdiff
+            for offset,(b,g,r) in zip(offsets,colors):
+                i=base+offset
+                total+=abs(screen[i]-b)+abs(screen[i+1]-g)+abs(screen[i+2]-r)
+            score=total/(3*count)
+            if score>=coarse_cutoff:continue
+            if len(candidate_heap)<32:
+                heapq.heappush(candidate_heap,(-score,x,y))
+            elif score < -candidate_heap[0][0]:
+                heapq.heapreplace(candidate_heap,(-score,x,y))
+    if not candidate_heap:return None
+    best=None
+    for negative_score,x,y in sorted(candidate_heap,reverse=True):
+        base=(y*sw+x)*4
+        diff=0
+        for tx,ty,b,g,r in pts:
+            i=base+(ty*sw+tx)*4
+            diff+=abs(screen[i]-b)+abs(screen[i+1]-g)+abs(screen[i+2]-r)
+        score=diff/(3*len(pts))
+        if best is None or score<best[0]:best=(score,x,y)
+        if score==0:break
+    if best is None or best[0]>difference_limit:return None
+    return (1.0-best[0]/255.0,(best[1],best[2],best[1]+tw,best[2]+th))
+
+
+_SEQ_NS_XLSX = {'s':'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+                'r':'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
+
+
+def sequent_xlsx_read(path,sheet_name=''):
+    """Read cell values (including sparse and shared-string cells) from XLSX."""
+    try:
+        with _seq_zipfile.ZipFile(path,'r') as book:
+            workbook=_seq_et.fromstring(book.read('xl/workbook.xml'))
+            relroot=_seq_et.fromstring(book.read('xl/_rels/workbook.xml.rels'))
+            rels={e.get('Id'):e.get('Target') for e in relroot}
+            sheets=workbook.find('s:sheets',_SEQ_NS_XLSX)
+            if sheets is None or not list(sheets): raise MacroExecutionError('Excel workbook has no worksheets')
+            chosen=next((s for s in sheets if s.get('name')==sheet_name),None) if sheet_name else list(sheets)[0]
+            if chosen is None:raise MacroExecutionError(f'Excel sheet {sheet_name!r} not found')
+            rid=chosen.get('{'+_SEQ_NS_XLSX['r']+'}id')
+            target=rels.get(rid)
+            if not target:raise MacroExecutionError('Excel worksheet relationship is missing')
+            location=_seq_posixpath.normpath(target.lstrip('/') if target.startswith('/') else _seq_posixpath.join('xl',target))
+            if not location.startswith('xl/') or location not in book.namelist():
+                raise MacroExecutionError('Excel worksheet target is invalid')
+            shared=[]
+            if 'xl/sharedStrings.xml' in book.namelist():
+                strings=_seq_et.fromstring(book.read('xl/sharedStrings.xml'))
+                for si in strings.findall('s:si',_SEQ_NS_XLSX):
+                    shared.append(''.join((e.text or '') for e in si.iter('{'+_SEQ_NS_XLSX['s']+'}t')))
+            sheet=_seq_et.fromstring(book.read(location))
+            sheetdata=sheet.find('s:sheetData',_SEQ_NS_XLSX)
+            if sheetdata is None:return [],[]
+            values=[]
+            for row in sheetdata.findall('s:row',_SEQ_NS_XLSX):
+                if len(values)>100000:raise MacroExecutionError('Excel table exceeds 100,000 row limit')
+                data={}
+                next_col=0
+                for cell in row.findall('s:c',_SEQ_NS_XLSX):
+                    ref=cell.get('r','')
+                    letters=re.match(r'^[A-Z]+',ref.upper())
+                    if letters:
+                        idx=0
+                        for letter in letters.group():idx=idx*26+ord(letter)-64
+                        next_col=idx-1
+                    value=cell.find('s:v',_SEQ_NS_XLSX)
+                    typ=cell.get('t','')
+                    if typ=='inlineStr':
+                        inline=cell.find('s:is',_SEQ_NS_XLSX)
+                        v=''.join((e.text or '') for e in inline.iter('{'+_SEQ_NS_XLSX['s']+'}t')) if inline is not None else ''
+                    elif value is None:v=''
+                    elif typ=='s':
+                        try:v=shared[int(value.text)]
+                        except (ValueError,IndexError,TypeError):v=''
+                    elif typ=='b':v='TRUE' if value.text=='1' else 'FALSE'
+                    else:v=value.text or ''
+                    data[next_col]=v
+                    next_col+=1
+                values.append(data)
+            if not values:return [],[]
+            headers=[str(values[0].get(i,'')) for i in range(max(values[0],default=-1)+1)]
+            rows=[{name:row.get(i,'') for i,name in enumerate(headers)} for row in values[1:]]
+            return headers,rows
+    except (_seq_zipfile.BadZipFile,KeyError,_seq_et.ParseError) as exc:
+        raise MacroExecutionError(f'Cannot read XLSX workbook: {exc}') from exc
+
+
+def sequent_xlsx_write(path,columns,rows):
+    """Write a minimal Office Open XML workbook with strings as inlineStr."""
+    def tag_text(parent,text):
+        child=_seq_et.SubElement(parent,'{'+_SEQ_NS_XLSX['s']+'}t')
+        child.set('{http://www.w3.org/XML/1998/namespace}space','preserve')
+        child.text=str(text if text is not None else '')
+    def col_id(index):
+        result=''
+        while index:
+            index,rem=divmod(index-1,26)
+            result=chr(65+rem)+result
+        return result
+    ns=_SEQ_NS_XLSX['s']
+    _seq_et.register_namespace('',ns)
+    ws=_seq_et.Element('{'+ns+'}worksheet')
+    sheet_data=_seq_et.SubElement(ws,'{'+ns+'}sheetData')
+    for row_index,values in enumerate([columns]+[[row.get(c,'') for c in columns] for row in rows],1):
+        element=_seq_et.SubElement(sheet_data,'{'+ns+'}row',{'r':str(row_index)})
+        for col_index,value in enumerate(values,1):
+            cell=_seq_et.SubElement(element,'{'+ns+'}c',{'r':col_id(col_index)+str(row_index),'t':'inlineStr'})
+            inline=_seq_et.SubElement(cell,'{'+ns+'}is')
+            tag_text(inline,value)
+    workbook=('<workbook xmlns="'+ns+'" xmlns:r="'+_SEQ_NS_XLSX['r']+'">'
+              '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>')
+    relationships=('<?xml version="1.0" encoding="UTF-8"?>'
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+                   '</Relationships>')
+    root_rels=('<?xml version="1.0" encoding="UTF-8"?>'
+               '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+               '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+               '</Relationships>')
+    types=('<?xml version="1.0" encoding="UTF-8"?>'
+           '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+           '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+           '<Default Extension="xml" ContentType="application/xml"/>'
+           '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+           '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+           '</Types>')
+    with _seq_zipfile.ZipFile(path,'w',compression=_seq_zipfile.ZIP_DEFLATED) as book:
+        book.writestr('[Content_Types].xml',types)
+        book.writestr('_rels/.rels',root_rels)
+        book.writestr('xl/workbook.xml',workbook)
+        book.writestr('xl/_rels/workbook.xml.rels',relationships)
+        book.writestr('xl/worksheets/sheet1.xml',_seq_et.tostring(ws,encoding='utf-8',xml_declaration=True))
+
+DYNAMIC_ACTION_TYPES = frozenset({
+    'ui_element', 'smart_wait', 'ocr_extract', 'if_dynamic', 'else_dynamic',
+    'end_if', 'loop_start', 'loop_end', 'find_image', 'recovery',
+    'data_load', 'data_save', 'data_set', 'trigger_start'
+})
+DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end'})
+
+
+def dynamic_area(value, default=(0, 0, 1200, 800)):
+    if value is None or value == '':
+        value = default
+    if isinstance(value, str):
+        value = [x.strip() for x in value.split(',')]
+    if not isinstance(value, (tuple, list)) or len(value) != 4:
+        raise MacroExecutionError('Screen area must contain x,y,width,height')
+    try:
+        x, y, w, h = (int(float(v)) for v in value)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise MacroExecutionError('Invalid screen coordinates') from exc
+    if w <= 0 or h <= 0 or w * h > 16000000:
+        raise MacroExecutionError('Area must be positive and under 16 million pixels')
+    return (x, y, w, h)
+
+
+def dynamic_resolve_path(path):
+    """Explicit user-selected local path; relative paths resolve beside Sequent."""
+    value = os.path.expandvars(os.path.expanduser(str(path or '')))
+    if not value:
+        raise MacroExecutionError('A file path is required')
+    if not os.path.isabs(value):
+        value = os.path.join(os.path.dirname(os.path.abspath(__file__)), value)
+    return os.path.abspath(value)
+
+
+def dynamic_compare(actual, op, expected):
+    left, right = str(actual or '').casefold(), str(expected or '').casefold()
+    if op in ('==', 'equals'): return left == right
+    if op in ('!=', 'not equals'): return left != right
+    if op == 'contains': return right in left
+    if op == 'not contains': return right not in left
+    if op in ('not empty', 'exists'): return bool(left.strip())
+    if op in ('empty', 'missing'): return not bool(left.strip())
+    if op == 'startswith': return left.startswith(right)
+    if op == 'endswith': return left.endswith(right)
+    if op in ('>', '>=', '<', '<='):
+        try:
+            a,b = float(actual),float(expected)
+            return {'>':lambda:a>b,'>=':lambda:a>=b,'<':lambda:a<b,'<=':lambda:a<=b}[op]()
+        except (TypeError, ValueError): return False
+    if op == 'regex':
+        try: return re.search(str(expected), str(actual or ''), re.I) is not None
+        except re.error as exc: raise MacroExecutionError(f'Invalid regex: {exc}') from exc
+    raise MacroExecutionError(f'Unsupported comparison operator: {op}')
+
+
+def dynamic_matching_block(actions, start, opening, closing, middle=None):
+    """Locate same-level ELSE/END even with nested blocks."""
+    depth = 0
+    branch = None
+    for index in range(start + 1, len(actions)):
+        typ = actions[index].get('type')
+        if typ == opening: depth += 1
+        elif typ == closing:
+            if depth == 0: return branch, index
+            depth -= 1
+        elif middle and typ == middle and depth == 0:
+            if branch is not None:
+                raise MacroExecutionError(f'Multiple {middle} branches in one block')
+            branch = index
+    raise MacroExecutionError(f'Unclosed {opening} block at step {start + 1}')
+
+
+class SequentDynamicEngine:
+    """Structured action execution and conditions; no independent Tk GUI state."""
+    def __init__(self, app):
+        self.app = app
+        self.tables = {}
+        self.policy = {'on_error':'stop', 'retry_count':0, 'retry_delay':0.4,
+                       'fallback_label':'', 'screenshot':False}
+        self.last_result = {}
+
+    def interpolate(self, value):
+        if not isinstance(value, str): return value
+        return re.sub(r'\$\{([A-Za-z_][\w.]*)\}',
+                      lambda m: str(self.app.variables.get(m.group(1), '')), value)
+
+    def _pause(self, seconds, idle=False):
+        end = time.monotonic() + max(0, float(seconds))
+        while time.monotonic() < end:
+            if not idle and not self.app.playing:
+                raise MacroExecutionError('Execution stopped')
+            if self.app.is_paused and not idle:
+                frozen_at = time.monotonic()
+                while self.app.is_paused and self.app.playing:
+                    time.sleep(0.04)
+                end += time.monotonic() - frozen_at
+            time.sleep(min(0.04, max(0, end - time.monotonic())))
+
+    def find_ui_element(self, action):
+        """Detect a Windows UI Automation control without Python packages."""
+        window = self.interpolate(action.get('window','')).strip()
+        name = self.interpolate(action.get('name','')).strip()
+        automation_id = self.interpolate(action.get('automation_id','')).strip()
+        control_type = self.interpolate(action.get('control_type','')).strip()
+        if not (name or automation_id or control_type):
+            raise MacroExecutionError('Smart UI Element needs a name, Automation ID or control type')
+        hwnd = find_window_by_title_substr(window) if window else None
+        if window and not hwnd: return None
+        found = sequent_native_uia({'mode':'find','hwnd':int(hwnd or 0),
+                                    'name':name,'automation_id':automation_id,
+                                    'control_type':control_type})
+        return tuple(found['bounds']) if found else None
+
+    def find_image(self, action):
+        """Native GDI+ template read + GDI screenshot + stdlib image matching."""
+        path = dynamic_resolve_path(self.interpolate(action.get('path','')))
+        try:
+            tw,th,template = sequent_load_image_bgra(path)
+        except (OSError,ValueError) as exc:
+            raise MacroExecutionError(f'Cannot read image template: {exc}') from exc
+        x,y,w,h = dynamic_area(action.get('area'))
+        threshold = float(action.get('confidence',0.85))
+        if not 0 <= threshold <= 1:
+            raise MacroExecutionError('Image confidence must be between 0 and 1')
+        screen = sequent_capture_bgra(x,y,w,h)
+        best=None
+        for scale in (1.0,0.9,1.1,0.75,1.25):
+            sw,sh=max(1,round(tw*scale)),max(1,round(th*scale))
+            if sw>w or sh>h or min(sw,sh)<2:continue
+            scaled=sequent_resize_bgra(template,tw,th,sw,sh)
+            match=sequent_match_bgra(screen,w,h,scaled,sw,sh,threshold)
+            if match is not None and (best is None or match[0]>best[0]):
+                best=match
+                if match[0]>=0.999:break
+        if best is None:return None
+        box=best[1]
+        return (x+box[0],y+box[1],x+box[2],y+box[3])
+
+    def observe(self, condition):
+        kind = condition.get('kind','variable')
+        value = self.interpolate(condition.get('value',''))
+        area = condition.get('area',[0,0,1200,800])
+        box = None
+        if kind == 'variable': return str(self.app.variables.get(condition.get('name',''),'')), None
+        if kind == 'text': return self.app.ocr_screen_area(*dynamic_area(area)), None
+        if kind == 'color':
+            box = self.app.search_color_in_area(*dynamic_area(area), value,
+                                                 tolerance=int(condition.get('tolerance',8)))
+            return ('found' if box else ''),box
+        if kind == 'image':
+            box = self.find_image(dict(condition, path=value))
+            return ('found' if box else ''),box
+        if kind == 'ui_element':
+            box = self.find_ui_element(condition)
+            return ('found' if box else ''),box
+        if kind == 'window': return ('found' if find_window_by_title_substr(value) else ''),None
+        if kind == 'file': return ('found' if glob.glob(dynamic_resolve_path(value)) else ''),None
+        if kind == 'clipboard': return get_clipboard_text(),None
+        raise MacroExecutionError(f'Unknown condition source: {kind}')
+
+    def evaluate(self, action):
+        conditions = action.get('conditions') or []
+        if isinstance(conditions, str):
+            try: conditions = json.loads(conditions)
+            except json.JSONDecodeError as exc:
+                raise MacroExecutionError(f'Invalid conditions JSON: {exc}') from exc
+        if not isinstance(conditions, list) or not conditions:
+            raise MacroExecutionError('IF/Loop requires at least one condition')
+        results = []
+        for condition in conditions:
+            observed, _ = self.observe(condition)
+            if str(observed).startswith('ERR:'):
+                raise MacroExecutionError(f'OCR condition failed: {observed}')
+            expected = self.interpolate(condition.get('value',''))
+            op = condition.get('op','contains')
+            if condition.get('kind') in ('window','color','image','ui_element','file'):
+                op = 'not empty' if op not in ('empty','missing') else 'empty'
+            results.append(dynamic_compare(observed, op, expected))
+            logic = action.get('logic','ALL').upper()
+            if logic == 'ALL' and not results[-1]: return False
+            if logic == 'ANY' and results[-1]: return True
+        return all(results) if action.get('logic','ALL').upper() == 'ALL' else any(results)
+
+    def _save_error_screenshot(self):
+        """Save a full virtual-desktop BMP via GDI without Pillow."""
+        try:
+            u32=ctypes.windll.user32
+            left=u32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+            top=u32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+            width=u32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+            height=u32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+            folder=os.path.join(os.path.dirname(os.path.abspath(__file__)),'sequent_logs')
+            os.makedirs(folder,exist_ok=True)
+            filename=os.path.join(folder,f'failure_{time.strftime("%Y%m%d_%H%M%S")}.bmp')
+            sequent_save_bmp(filename,sequent_capture_bgra(left,top,width,height),width,height)
+        except Exception:
+            pass  # The action's original exception is the important error.
+
+    def _data_load(self, action):
+        path=dynamic_resolve_path(self.interpolate(action.get('path','')))
+        name=action.get('table','rows').strip() or 'rows'
+        if path.lower().endswith('.xlsx'):
+            _columns,rows=sequent_xlsx_read(path,action.get('sheet',''))
+        else:
+            with open(path,'r',encoding='utf-8-sig',newline='') as f:
+                rows=list(csv.DictReader(f))
+        if len(rows)>100000:raise MacroExecutionError('Table exceeds the 100,000 row safety limit')
+        self.tables[name]=rows
+        self.app.variables[name+'_count']=str(len(rows))
+        return {'count':len(rows),'table':name}
+
+    def _data_save(self, action):
+        name=action.get('table','rows').strip() or 'rows'
+        if name not in self.tables:
+            raise MacroExecutionError(f'Table {name!r} has not been loaded')
+        path=dynamic_resolve_path(self.interpolate(action.get('path','')))
+        rows=self.tables[name]
+        columns=list(dict.fromkeys(k for row in rows for k in row))
+        if not columns:raise MacroExecutionError('Table has no columns to write')
+        if path.lower().endswith('.xlsx'):
+            sequent_xlsx_write(path,columns,rows)
+        else:
+            with open(path,'w',encoding='utf-8-sig',newline='') as f:
+                writer=csv.DictWriter(f,fieldnames=columns)
+                writer.writeheader()
+                writer.writerows(rows)
+        return {'path':path,'count':len(rows)}
+
+    def _click_box(self, action, box):
+        if not box: raise MacroExecutionError('Target was not found')
+        result = perform_color_target_action(action,box,self.app.playback_speed)
+        if hasattr(self.app,'root'):
+            try:self.app.root.after(0,lambda b=box:self.app.draw_highlight_box(*b,COLOR_SUCCESS,800))
+            except (AttributeError,tk.TclError): pass
+        if self.app.audio_cues: play_cue('match')
+        return {'bounds':list(box),'mode':result[0],'x':result[1],'y':result[2]}
+
+    def execute(self, action, *, idle=False):
+        """Unified executor for all new queue actions."""
+        typ = action.get('type')
+        result = {}
+        if typ == 'ui_element':
+            result = self._click_box(action,self.find_ui_element(action))
+        elif typ == 'find_image':
+            result = self._click_box(action,self.find_image(action))
+        elif typ == 'ocr_extract':
+            raw = self.app.ocr_screen_area(*dynamic_area(action.get('area')))
+            if raw.startswith('ERR:'): raise MacroExecutionError(raw)
+            mode = action.get('mode','full')
+            if mode == 'regex':
+                try: match = re.search(self.interpolate(action.get('pattern','')),raw,re.I|re.M)
+                except re.error as exc: raise MacroExecutionError(f'Invalid regex: {exc}') from exc
+                if not match: raise MacroExecutionError('OCR extraction pattern not found')
+                index = int(action.get('group',0))
+                try: extracted = match.group(index)
+                except IndexError as exc: raise MacroExecutionError('OCR regex group does not exist') from exc
+            else: extracted = raw.strip()
+            name = action.get('var_name','ocr_value')
+            self.app.variables[name] = extracted
+            result = {'value':extracted,'variable':name}
+        elif typ == 'smart_wait':
+            timeout = max(0,float(action.get('timeout',15)))
+            interval = max(0.1,float(action.get('interval',0.5)))
+            deadline = time.monotonic()+timeout
+            desired = action.get('mode','appears')
+            probe = {'kind':action.get('kind','text'), 'value':action.get('match',''),
+                     'area':action.get('area',[0,0,1200,800]),
+                     'name':action.get('name',''),'window':action.get('window',''),
+                     'control_type':action.get('control_type',''),
+                     'automation_id':action.get('automation_id','')}
+            while True:
+                seen,bounds = self.observe(probe)
+                if str(seen).startswith('ERR:'): raise MacroExecutionError(seen)
+                if probe['kind'] in ('text','clipboard','variable'):
+                    present = self.interpolate(probe['value']).casefold() in str(seen).casefold()
+                    if not probe['value']: present = bool(str(seen).strip())
+                else: present = bool(seen)
+                if (present and desired=='appears') or (not present and desired=='disappears'):
+                    result = {'found':present,'bounds':bounds}
+                    break
+                if time.monotonic() >= deadline:
+                    raise MacroExecutionError('Smart Wait timed out')
+                self._pause(min(interval,max(0,deadline-time.monotonic())),idle=idle)
+        elif typ == 'recovery':
+            for key in ('on_error','retry_count','retry_delay','fallback_label','screenshot'):
+                if key in action: self.policy[key] = action[key]
+        elif typ == 'data_load': result = self._data_load(action)
+        elif typ == 'data_save': result = self._data_save(action)
+        elif typ == 'data_set':
+            name = action.get('table','rows')
+            index = int(self.app.variables.get(name+'_index','0'))
+            table = self.tables.get(name)
+            if table is None or not 0 <= index < len(table):
+                raise MacroExecutionError(f'No active row for {name!r}')
+            col = str(action.get('column','')).strip()
+            if not col: raise MacroExecutionError('A column name is required')
+            table[index][col] = self.interpolate(action.get('value',''))
+            result = {'table':name,'row':index,'column':col}
+        elif typ in ('trigger_start','if_dynamic','else_dynamic','end_if','loop_start','loop_end'):
+            pass # Control-flow actions are interpreted by run_program.
+        else:
+            raise MacroExecutionError(f'Unsupported dynamic action: {typ}')
+        self.last_result = {'type':typ,'success':True,**result}
+        self.app.variables['_last_action'] = typ
+        self.app.variables['_last_success'] = 'true'
+        if 'value' in result: self.app.variables['_last_value'] = str(result['value'])
+        if 'bounds' in result and result['bounds']:
+            self.app.variables['_last_bounds'] = json.dumps(result['bounds'])
+        return self.last_result
+
+    def run_action_with_recovery(self, action, *, idle=False):
+        mode = action.get('on_error',self.policy['on_error'])
+        retries = max(0,min(20,int(action.get('retry_count',self.policy['retry_count']))))
+        retry_delay = float(action.get('retry_delay',self.policy['retry_delay']))
+        for attempt in range(retries+1):
+            try:
+                if action.get('type') in DYNAMIC_ACTION_TYPES:
+                    return self.execute(action,idle=idle)
+                self.app.execute_single_action(action)
+                return {'success':True}
+            except Exception as exc:
+                self.app.variables['_last_success'] = 'false'
+                self.app.variables['_last_error'] = str(exc)
+                if attempt < retries:
+                    self._pause(retry_delay,idle=idle)
+                    continue
+                if action.get('screenshot',self.policy['screenshot']):
+                    self._save_error_screenshot()
+                if mode in ('skip','goto'):
+                    return {'success':False,'error':str(exc),
+                            'goto':action.get('fallback_label',self.policy['fallback_label']) if mode=='goto' else None}
+                raise
+
+    def run_program(self, actions, start=0, *, on_step=None, idle=False,
+                    max_actions=None, frames=None):
+        """Execute a complete workflow or exactly one debugger step with saved loop frames."""
+        frames = [] if frames is None else frames
+        index = start
+        executed = 0
+        max_steps = 50000
+        while index < len(actions):
+            if max_actions is not None and executed >= max_actions:
+                return {'partial':True,'next_index':index,'frames':frames}
+            if not idle and not self.app.playing: return {'cancelled':True}
+            while not idle and self.app.is_paused and self.app.playing:
+                time.sleep(0.04)
+            action = actions[index]
+            typ = action.get('type')
+            executed += 1
+            if executed > max_steps: raise MacroExecutionError('Workflow exceeded 50,000 steps')
+            if on_step: on_step(index, action)
+            if typ == 'if_dynamic':
+                branch,end = dynamic_matching_block(actions,index,'if_dynamic','end_if','else_dynamic')
+                if self.evaluate(action): index += 1
+                else: index = branch+1 if branch is not None else end+1
+                continue
+            if typ == 'else_dynamic':
+                depth = 0
+                for target in range(index+1,len(actions)):
+                    tag = actions[target].get('type')
+                    if tag=='if_dynamic':depth+=1
+                    elif tag=='end_if':
+                        if depth==0: index=target+1;break
+                        depth-=1
+                else:raise MacroExecutionError('ELSE without END IF')
+                continue
+            if typ == 'end_if':index+=1;continue
+            if typ == 'loop_start':
+                _,end = dynamic_matching_block(actions,index,'loop_start','loop_end')
+                frame = frames[-1] if frames and frames[-1]['start']==index else None
+                if frame is None:
+                    frame={'start':index,'end':end,'iteration':0}
+                    frames.append(frame)
+                mode=action.get('mode','count')
+                max_iterations=max(0,min(100000,int(action.get('max_iterations',1000))))
+                if mode=='count': run = frame['iteration']<min(int(action.get('count',1)),max_iterations)
+                elif mode in ('while','until'):
+                    match=self.evaluate(action)
+                    run = (match if mode=='while' else not match) and frame['iteration']<max_iterations
+                elif mode=='for_each':
+                    table=action.get('table','rows')
+                    rows=self.tables.get(table)
+                    if rows is None:raise MacroExecutionError(f'Load table {table!r} before For Each')
+                    run = frame['iteration']<min(len(rows),max_iterations)
+                    if run:
+                        pos=frame['iteration']
+                        self.app.variables[table+'_index']=str(pos)
+                        for col,value in rows[pos].items():
+                            self.app.variables['row.'+str(col)]=str(value)
+                else: raise MacroExecutionError(f'Unknown loop mode: {mode}')
+                if not run:
+                    frames.pop()
+                    index=end+1
+                else:
+                    frame['iteration']+=1
+                    index+=1
+                continue
+            if typ=='loop_end':
+                if not frames or frames[-1]['end']!=index:
+                    raise MacroExecutionError('Loop End without matching Loop Start')
+                index=frames[-1]['start'];continue
+            if typ=='label': index+=1;continue
+            if typ=='goto':
+                label = action.get('target','')
+                target=next((i for i,a in enumerate(actions) if a.get('type')=='label' and a.get('name')==label),None)
+                if target is None:raise MacroExecutionError(f'Unknown label: {label}')
+                frames.clear();index=target+1;continue
+            if typ=='if_var':
+                actual=str(self.app.variables.get(action.get('var_name',''),''))
+                if dynamic_compare(actual,action.get('op','=='),self.interpolate(action.get('val',''))):
+                    target_type=action.get('target_type','label')
+                    if target_type=='label':
+                        target=next((i for i,a in enumerate(actions) if a.get('type')=='label' and a.get('name')==action.get('target')),None)
+                        if target is None:raise MacroExecutionError('IF Variable label not found')
+                        frames.clear();index=target+1;continue
+                    return {'switch':target_type,'target':action.get('target','')}
+                index+=1;continue
+            if typ=='search_area':
+                target=action.get('text','').strip()
+                raw=self.app.ocr_screen_area(*dynamic_area(action.get('area')))
+                if raw.startswith('ERR:'):raise MacroExecutionError(raw)
+                if ((action.get('match_any') and bool(raw.strip())) or
+                    (target and target.casefold() in raw.casefold())):
+                    return {'switch':'preset','target':action.get('preset','')}
+                index+=1;continue
+            if typ=='trigger_start':index+=1;continue
+            result=self.run_action_with_recovery(action,idle=idle)
+            if result.get('goto'):
+                target=next((i for i,a in enumerate(actions) if a.get('type')=='label' and a.get('name')==result['goto']),None)
+                if target is None:raise MacroExecutionError('Recovery label not found')
+                frames.clear();index=target+1;continue
+            index+=1
+            if not idle:
+                self._pause(max(0.01,self.app.action_delay/max(0.1,self.app.playback_speed)),idle=False)
+        if frames:raise MacroExecutionError('Unclosed loop in workflow')
+        return {'completed':True,'next_index':len(actions),'steps':executed}
+
 # --- VS Code-Style Playback Queue Viewer ---
 class VSCodeQueueViewer(tk.Frame):
     # Categorized action catalog. Existing action type names are unchanged,
@@ -1670,6 +2695,26 @@ class VSCodeQueueViewer(tk.Frame):
             ("If Variable Condition", "Branch based on a variable comparison.", "IF"),
             ("Label Marker", "Create a named location in the queue.", "LB"),
             ("Jump to Label", "Continue execution at a named label.", "GO"),
+        )),
+        ("Dynamic Screen & UI", (
+            ("Smart UI Element & Click", "Click accessible buttons and controls.", "UI"),
+            ("Smart Wait & Retry", "Wait on changes with timeout and fallback.", "SW"),
+            ("OCR → Variable", "Extract screen text into named variables.", "OV"),
+            ("Find Image & Click", "Find image templates by similarity.", "IM"),
+        )),
+        ("Logic & Recovery", (
+            ("IF (Dynamic Condition)", "Combine multiple live checks (ALL/ANY).", "IF"),
+            ("ELSE", "Alternative branch for the prior IF.", "EL"),
+            ("END IF", "Close an IF / ELSE block.", "EI"),
+            ("LOOP Start", "Repeat N times, while, until or each row.", "LP"),
+            ("LOOP End", "Close the current loop.", "LE"),
+            ("Recovery Policy", "Choose retry, skip, fallback and logging.", "ER"),
+        )),
+        ("Files & Event Automation", (
+            ("Load CSV / Excel", "Read a file's rows as variables.", "DL"),
+            ("Update Table Cell", "Store processed results back to a row.", "DS"),
+            ("Export CSV / Excel", "Save the processed output table.", "EX"),
+            ("Auto-start Trigger", "Run when a file/window/clipboard changes.", "TR"),
         )),
         ("User Interaction", (
             ("Disclaimer / Warning", "Display a message before continuing.", "!"),
@@ -2155,6 +3200,8 @@ class VSCodeQueueViewer(tk.Frame):
             "wait_text": "Wait for Text",
             "find_color": "Find Color & Click",
             "find_text": "Find Text & Click",
+            "click": "Smart UI Element & Click",  # Edit any recorded click to make it adaptive.
+            **{spec[0]: label for label,spec in DYNAMIC_ACTION_SPECS.items()},
             "label": "Label Marker",
             "goto": "Jump to Label",
         }
@@ -2526,7 +3573,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Label Marker": self._render_label_view,
             "Jump to Label": self._render_goto_view,
         }
-        renderers[action_type](line_num, edit_idx=edit_idx)
+        renderers.get(action_type, self._render_dynamic_action_view)(line_num, edit_idx=edit_idx)
         self._action_editor_canvas.yview_moveto(0)
 
 
@@ -3156,6 +4203,159 @@ class VSCodeQueueViewer(tk.Frame):
         ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
     
+    def _render_dynamic_action_view(self, line_num, edit_idx=None):
+        """Consistent JSON-backed property editor for dynamic automation actions."""
+        body = self.action_content_frame
+        spec = DYNAMIC_ACTION_SPECS[self._selected_action_name]
+        type_name, fields = spec
+        old = (self.app.recorded_actions[edit_idx] if edit_idx is not None
+               and 0 <= edit_idx < len(self.app.recorded_actions) else {})
+        if old.get('type') != type_name: old = {}  # Clicking a recorded click opens conversion to UI Element.
+        vars_ = {}
+
+        def entry_field(key, label, kind, default, options=None):
+            tk.Label(body, text=label, font=('Segoe UI',8,'bold'),
+                     bg=BG_PANEL,fg=TEXT_MUTED,anchor='w').pack(fill=tk.X,pady=(7,2))
+            if kind=='choice':
+                val = tk.StringVar(value=str(old.get(key,default)))
+                menu = tk.OptionMenu(body,val,*(options or []))
+                menu.config(bg=BG_INPUT,fg=TEXT_PRIMARY,font=('Consolas',9),
+                            highlightbackground=BG_BORDER, highlightthickness=1,bd=0)
+                menu['menu'].config(bg=BG_INPUT,fg=TEXT_PRIMARY,activebackground=COLOR_ACCENT)
+                menu.pack(fill=tk.X)
+                vars_[key]=(kind,val)
+            elif kind=='bool':
+                val=tk.BooleanVar(value=bool(old.get(key,default)))
+                tk.Checkbutton(body,variable=val,bg=BG_PANEL,fg=TEXT_PRIMARY,
+                               selectcolor=BG_INPUT,activebackground=BG_PANEL).pack(anchor='w')
+                vars_[key]=(kind,val)
+            elif kind=='json':
+                field=tk.Text(body,height=5,bg=BG_INPUT,fg=SYNTAX_GREEN,
+                              font=('Consolas',9),insertbackground=TEXT_PRIMARY,
+                              wrap='word',bd=0,highlightbackground=BG_BORDER,highlightthickness=1)
+                raw=old.get(key,default)
+                field.insert('1.0',json.dumps(raw,indent=2) if not isinstance(raw,str) else raw)
+                field.pack(fill=tk.X)
+                vars_[key]=(kind,field)
+            else:
+                widget=tk.Entry(body,bg=BG_INPUT,fg=TEXT_PRIMARY,
+                                font=('Consolas',9),insertbackground=TEXT_PRIMARY,bd=0,
+                                highlightbackground=BG_BORDER,highlightthickness=1)
+                value=old.get(key,default)
+                if kind=='area' and isinstance(value,(tuple,list)):
+                    value=', '.join(str(v) for v in value)
+                widget.insert(0,str(value))
+                widget.pack(fill=tk.X,ipady=4)
+                vars_[key]=(kind,widget)
+                if kind=='path':
+                    def browse_path(w=widget):
+                        path=filedialog.askopenfilename(parent=self.sub_menu)
+                        if path:w.delete(0,tk.END);w.insert(0,path)
+                    ModernButton(body,text='Browse File...',bg_color=BG_BORDER,
+                                 hover_color=BG_HOVER,command=browse_path).pack(fill=tk.X,pady=(3,0))
+
+        def capture_last_click():
+            if type_name!='ui_element':return
+            selected=(self.app.recorded_actions[edit_idx] if edit_idx is not None else None)
+            clicks=[a for a in self.app.recorded_actions if a.get('type')=='click']
+            if selected and selected.get('type')=='click':old_click=selected
+            elif clicks:old_click=clicks[-1]
+            else:
+                error.config(text='Record a mouse click first, then capture its element.')
+                return
+            try:
+                info=sequent_native_uia({'mode':'point','x':int(old_click.get('x',0)),
+                                          'y':int(old_click.get('y',0))})
+                if not info:
+                    raise MacroExecutionError('No accessible UI element at the recorded point')
+                for key in ('name','automation_id','control_type'):
+                    widget=vars_[key][1]
+                    widget.delete(0,tk.END)
+                    value=info.get(key,'')
+                    if key=='control_type':
+                        value=value.replace('ControlType.','')+'Control'
+                    widget.insert(0,str(value))
+                error.config(text='Captured native Windows accessibility selector.',fg=COLOR_SUCCESS)
+            except Exception as exc:
+                error.config(text=f'UI element capture failed: {exc}')
+
+        if type_name in ('if_dynamic','loop_start'):
+            tk.Label(body,text='Conditions: JSON list of checks. Use ALL or ANY logic.\n'
+                         'Sources: variable, text, color, image, ui_element, window, file, clipboard.\n'
+                         'Example: [{"kind":"variable","name":"status","op":"contains","value":"ready"}]',
+                     bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',8),wraplength=470,
+                     justify='left').pack(fill=tk.X,pady=4)
+        if type_name in ('else_dynamic','end_if','loop_end'):
+            tk.Label(body,text='Block marker: it pairs with the nearest preceding open block.\n'
+                         'Use the queue to order your IF / ELSE / END IF and LOOP / END LOOP actions.',
+                     bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',9),wraplength=450,
+                     justify='left').pack(fill=tk.X,pady=(4,8))
+        if type_name=='trigger_start':
+            tk.Label(body,text='Place this as the FIRST action in the sequence to arm auto-start. '
+                         'Sequent checks for a new window, changed clipboard, or a new/modified file '
+                         'while idle. F9 also runs the macro manually.',
+                     bg=BG_PANEL,fg=TEXT_MUTED,wraplength=460,justify='left',
+                     font=('Segoe UI',8)).pack(fill=tk.X,pady=4)
+        if type_name in ('smart_wait','ui_element','find_image'):
+            tk.Label(body,text='Search actions can have an error policy: stop, skip, or jump to a label. '
+                         'Set a preceding Recovery Policy action to configure retries for the workflow.',
+                     bg=BG_PANEL,fg=TEXT_MUTED,wraplength=460,justify='left',
+                     font=('Segoe UI',8)).pack(fill=tk.X,pady=4)
+        for field in fields:
+            entry_field(*field)
+        if type_name=='ui_element':
+            ModernButton(body,text='⌖ Capture Selector from Recorded Click',
+                         bg_color=COLOR_ACCENT,hover_color=COLOR_ACCENT_HOV,
+                         command=capture_last_click).pack(fill=tk.X,pady=(10,2))
+        error=tk.Label(body,text='',bg=BG_PANEL,fg=COLOR_DANGER,
+                       font=('Segoe UI',8),wraplength=470,justify='left')
+        error.pack(fill=tk.X,pady=6)
+        if edit_idx is None:
+            pos_var=tk.StringVar(value=f'Before Line {line_num}')
+            menu=tk.OptionMenu(body,pos_var,f'Before Line {line_num}',f'After Line {line_num}')
+            menu.config(bg=BG_INPUT,fg=TEXT_PRIMARY,highlightthickness=1,
+                        highlightbackground=BG_BORDER,bd=0)
+            menu['menu'].config(bg=BG_INPUT,fg=TEXT_PRIMARY,activebackground=COLOR_ACCENT)
+            menu.pack(fill=tk.X,pady=5)
+        def submit():
+            try:
+                action=dict(old,type=type_name)
+                for key,(kind,var) in vars_.items():
+                    val=var.get('1.0','end').strip() if kind=='json' else var.get()
+                    if kind=='int':val=int(val)
+                    elif kind=='float':val=float(val)
+                    elif kind=='area':val=list(dynamic_area(val))
+                    elif kind=='json':
+                        val=json.loads(val)
+                        if not isinstance(val,list):raise ValueError(f'{key}: expected a JSON list')
+                    action[key]=val
+                if type_name=='if_dynamic' and not action.get('conditions'):
+                    raise ValueError('IF requires at least one condition')
+                if type_name=='loop_start' and action.get('mode') in ('while','until') and not action.get('conditions'):
+                    raise ValueError('While/Until loops need conditions')
+                if type_name=='trigger_start' and edit_idx is None:
+                    # Automatic triggers should be simple to discover and reason about.
+                    first_insert=0
+                    self.app.recorded_actions.insert(first_insert,action)
+                    idx=first_insert
+                elif edit_idx is not None:
+                    idx=edit_idx
+                    self.app.recorded_actions[idx]=action
+                else:
+                    idx=line_num-1 if 'After' in pos_var.get() else line_num-2
+                    idx=max(0,min(idx,len(self.app.recorded_actions)))
+                    self.app.recorded_actions.insert(idx,action)
+                self.close_sub_menu()
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(idx)
+                self.app.update_status(f'Configured {self._selected_action_name}',COLOR_SUCCESS)
+            except (ValueError,TypeError,json.JSONDecodeError,MacroExecutionError) as exc:
+                error.config(text=str(exc),fg=COLOR_DANGER)
+        ModernButton(body,text='Save Changes' if edit_idx is not None else 'Add Action',
+                     bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT,
+                     hover_color=COLOR_ACCENT_HOV,command=submit).pack(fill=tk.X,pady=(6,12))
+
+
     def _render_delay_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
         curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
@@ -4701,10 +5901,11 @@ class GhostReticle:
         color_rect = None
         self.last_target = None
 
-        if act.get("type") in ("move", "click", "wait_pixel", "scroll", "find_color", "search_area", "wait_text", "find_text"):
-            if act.get("type") in ("find_color", "find_text"):
+        if act.get("type") in ("move", "click", "wait_pixel", "scroll", "find_color", "search_area", "wait_text", "find_text", "ui_element", "find_image"):
+            if act.get("type") in ("find_color", "find_text", "ui_element", "find_image"):
                 area = act.get("area", [0, 0, 0, 0])
-                area_rect = (area[0], area[1], area[2], area[3], 0.85)
+                if act.get('type') != 'ui_element':
+                    area_rect = (area[0], area[1], area[2], area[3], 0.85)
                 if self.edit_active:
                     found_box = self.last_found_box
                 elif app is not None:
@@ -4716,10 +5917,18 @@ class GhostReticle:
                             win.withdraw()
                     self.root.update_idletasks()
                     
-                    if act.get("type") == "find_color":
-                        found_box = app.search_color_in_area(*area, act.get("color", "#FFFFFF"), tolerance=act.get("tolerance", 8))
-                    else:
-                        found_box = app.find_text_rect(*area, act.get("text", ""))
+                    try:
+                        if act.get("type") == "find_color":
+                            found_box = app.search_color_in_area(*area, act.get("color", "#FFFFFF"), tolerance=act.get("tolerance", 8))
+                        elif act.get('type') == 'find_text':
+                            found_box = app.find_text_rect(*area, act.get("text", ""))
+                        elif act.get('type') == 'find_image':
+                            found_box = app.dynamic_engine.find_image(act)
+                        else:
+                            found_box = app.dynamic_engine.find_ui_element(act)
+                    except (MacroExecutionError, ValueError, OSError) as exc:
+                        found_box = None
+                        app.update_status(f"Dynamic target preview: {exc}", COLOR_DANGER)
                 else:
                     found_box = None
 
@@ -4729,6 +5938,9 @@ class GhostReticle:
                     rx, ry = color_click_target(act, found_box)
                     color_rect = (x1, y1, x2 - x1, y2 - y1, 0.85)
                 else:
+                    if act.get('type') == 'ui_element':
+                        self.show_multi([])
+                        return
                     ax = area[0] + area[2] // 2
                     ay = area[1] + area[3] // 2
                     rx, ry = ax + int(act.get("ox", 0)), ay + int(act.get("oy", 0))
@@ -5136,6 +6348,12 @@ class BuiltInMacroApp:
         }
 
         self.load_settings()
+        self.dynamic_engine = SequentDynamicEngine(self)
+        self._auto_trigger_key = None
+        self._auto_trigger_state = None
+        self._webhook_server = None
+        self._webhook_config = None
+        self._webhook_events = Queue()
         # Apply persisted colors BEFORE constructing Tk widgets (no launch flash).
         self._effective_theme = self.resolve_theme_mode()
         self._update_theme_tokens(self._effective_theme)
@@ -5148,6 +6366,7 @@ class BuiltInMacroApp:
         self.setup_resizing_handles()
         Thread(target=self.global_hotkey_listener, daemon=True).start()
         self._schedule_system_theme_poll()
+        self.root.after(1200, self._watch_dynamic_trigger)
 
     
     def set_app_window(self):
@@ -5707,6 +6926,11 @@ class BuiltInMacroApp:
         verb = "moved only (NO CLICK)" if mode == "Move Only" else f"sent {mode.lower()}"
         self._set_color_live_label(f"Last color action: {verb} at ({x}, {y})", COLOR_SUCCESS)
         self.update_status(f"Find Color: {verb} at ({x}, {y})", COLOR_SUCCESS)
+
+    def _report_text_execution(self, mode, x, y):
+        verb = "moved only (NO CLICK)" if mode == "Move Only" else f"sent {mode.lower()}"
+        self._set_color_live_label(f"Last text action: {verb} at ({x}, {y})", COLOR_SUCCESS)
+        self.update_status(f"Find Text: {verb} at ({x}, {y})", COLOR_SUCCESS)
 
     def toggle_reticle_edit(self):
         """Let users drag the real on-screen ghost, including beyond the box."""
@@ -6372,6 +7596,7 @@ class BuiltInMacroApp:
             return
 
         self._prepare_mouse_execution()
+        self.dynamic_engine = SequentDynamicEngine(self)
         self.chain_running = True
         self.playing = True
         self.is_paused = False
@@ -6427,7 +7652,19 @@ class BuiltInMacroApp:
             # Run Preset for designated loop repetitions
             for l_num in range(loops):
                 if not self.chain_running: break
-                
+                if any(a.get('type') in DYNAMIC_ACTION_TYPES for a in actions):
+                    try:
+                        result = self.dynamic_engine.run_program(actions)
+                        if result.get('switch'):
+                            raise MacroExecutionError('Preset switching inside a chain stage is not supported')
+                    except Exception as error:
+                        reason = str(error) if isinstance(error, MacroExecutionError) else type(error).__name__
+                        self.chain_running = False
+                        self.playing = False
+                        self.root.after(0, lambda msg=reason: self._finish_chain_failed(msg))
+                        return
+                    continue
+
                 # Execute individual preset sequence
                 for act in actions:
                     if not self.chain_running: break
@@ -6550,6 +7787,15 @@ class BuiltInMacroApp:
     def get_action_summary(self, action):
         if not action: return "// No action"
         act_type = action.get("type", "")
+        if act_type in DYNAMIC_ACTION_TYPES:
+            kind = next((name for name,spec in DYNAMIC_ACTION_SPECS.items() if spec[0]==act_type),act_type)
+            if act_type == 'if_dynamic': return f"◆ IF [{action.get('logic','ALL')}] {len(action.get('conditions',[]))} conditions"
+            if act_type == 'else_dynamic': return "◇ ELSE"
+            if act_type == 'end_if': return "◇ END IF"
+            if act_type == 'loop_start': return f"↻ LOOP {action.get('mode','count')} ({action.get('count', '')})"
+            if act_type == 'loop_end': return "↻ END LOOP"
+            detail = action.get('name') or action.get('match') or action.get('path') or action.get('var_name') or action.get('kind') or ''
+            return f"⚙ {kind}({str(detail)[:34]})"
         if act_type == "label": 
             return f"🏷️ flow.label('{action.get('name', '')}')"
         elif act_type == "goto": 
@@ -6610,7 +7856,8 @@ class BuiltInMacroApp:
             verb = "move" if sub_action == "Move Only" else ("double_click" if sub_action == "Double Click" else "click")
             return f"🎯 ocr.find_color('{action.get('color', '')}', offset=({action.get('ox', 0)},{action.get('oy', 0)}), do='{verb}')"
         elif act_type == "find_text":
-            verb = "click" if action.get("action") == "Single Click" else "move"
+            sub_action = action.get("action", "Single Click")
+            verb = "move" if sub_action == "Move Only" else ("double_click" if sub_action == "Double Click" else "click")
             return f"🎯 ocr.find_text('{action.get('text', '')}', offset=({action.get('ox', 0)},{action.get('oy', 0)}), do='{verb}')"
         elif act_type == "enter": 
             return "↵ keyboard.press('Enter')"
@@ -6628,6 +7875,7 @@ class BuiltInMacroApp:
     def get_action_color(self, action):
         act_type = action.get("type", "") if action else ""
         if act_type in ("label", "goto", "if_var", "read_clipboard", "type_variable", "prompt_input"): return SYNTAX_PURPLE
+        if act_type in DYNAMIC_ACTION_TYPES: return SYNTAX_GREEN if act_type not in DYNAMIC_FLOW_TYPES else SYNTAX_PURPLE
         if act_type == "disclaimer": return SYNTAX_ORANGE
         if act_type in ("wait_pixel", "wait_text", "find_color", "find_text"): return COLOR_SUCCESS
         if act_type in ("move", "click", "drag", "scroll"): return SYNTAX_BLUE
@@ -6732,6 +7980,32 @@ class BuiltInMacroApp:
 
         action = self.recorded_actions[self.current_action_idx]
         self._prepare_mouse_execution()
+        if any(a.get('type') in DYNAMIC_ACTION_TYPES for a in self.recorded_actions):
+            try:
+                state=getattr(self,'_dynamic_debug_state',None)
+                if not state or state.get('next_index')!=self.current_action_idx:
+                    state={'frames':[],'next_index':self.current_action_idx}
+                result=self.dynamic_engine.run_program(
+                    self.recorded_actions, self.current_action_idx,
+                    idle=True, max_actions=1, frames=state['frames'])
+                if result.get('switch'):
+                    self.update_status('Debugger: preset switch requires regular playback',SYNTAX_ORANGE)
+                    return
+                next_idx=result['next_index']
+                self._dynamic_debug_state={'frames':result.get('frames',[]),
+                                           'next_index':next_idx}
+                if next_idx < len(self.recorded_actions):
+                    self.current_action_idx=next_idx
+                    self.update_scrubber_ui()
+                    self.update_status(f'Stepped to action #{next_idx+1}',COLOR_SUCCESS)
+                else:
+                    self.update_status('End of dynamic workflow',COLOR_SUCCESS)
+                    self._dynamic_debug_state=None
+                return
+            except Exception as exc:
+                self._dynamic_debug_state=None
+                self.update_status(f'Step Error: {exc}',COLOR_DANGER)
+                return
         if action.get("type") == "wait_text":
             index = self.current_action_idx
             self.update_status(f"Checking text at step #{index + 1}...", COLOR_ACCENT)
@@ -6767,15 +8041,38 @@ class BuiltInMacroApp:
         
     def execute_single_action(self, action):
         act_type = action.get("type")
+        def report(message,color):
+            self.root.after(0,lambda m=message,c=color:self.update_status(m,c))
+        if act_type in DYNAMIC_ACTION_TYPES:
+            return self.dynamic_engine.execute(action, idle=not self.playing)
         if act_type == "move":
-            move_mouse(action.get("x", 0), action.get("y", 0))
+            tx,ty=action.get('x',0),action.get('y',0)
+            if action.get('win_title'):
+                hwnd=find_window_by_title_substr(action['win_title'])
+                if hwnd:tx,ty=client_to_screen_pos(hwnd,action.get('rel_x',tx),action.get('rel_y',ty))
+            if self.human_bezier:
+                for x,y in calculate_bezier_trajectory(get_mouse_pos(),(tx,ty),18):
+                    move_mouse(x,y)
+                    time.sleep(max(0.001,0.008/self.playback_speed))
+            else:move_mouse(tx,ty)
         elif act_type == "click":
             tx, ty = action.get("x", 0), action.get("y", 0)
-            move_mouse(tx, ty)
+            if action.get('win_title'):
+                hwnd=find_window_by_title_substr(action['win_title'])
+                if hwnd:tx,ty=client_to_screen_pos(hwnd,action.get('rel_x',tx),action.get('rel_y',ty))
+            if self.human_bezier:
+                for x,y in calculate_bezier_trajectory(get_mouse_pos(),(tx,ty),14):
+                    move_mouse(x,y)
+                    time.sleep(max(0.001,0.006/self.playback_speed))
+            else:move_mouse(tx, ty)
             wait_for_cursor_settled(tx, ty)
             click(action.get("btn", "left"))
         elif act_type == "scroll":
-            move_mouse(action.get("x", 0), action.get("y", 0))
+            tx,ty=action.get('x',0),action.get('y',0)
+            if action.get('win_title'):
+                hwnd=find_window_by_title_substr(action['win_title'])
+                if hwnd:tx,ty=client_to_screen_pos(hwnd,action.get('rel_x',tx),action.get('rel_y',ty))
+            move_mouse(tx,ty)
             time.sleep(0.02)
             delta = int(action.get("delta", 120))
             ctypes.windll.user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, ctypes.c_uint32(delta & 0xFFFFFFFF).value, 0)
@@ -6792,9 +8089,9 @@ class BuiltInMacroApp:
             d_msg = action.get("message", "Proceed with execution?")
             proceed = self.show_disclaimer_modal(d_title, d_msg)
             if not proceed:
-                self.update_status("Disclaimer cancelled", COLOR_DANGER)
+                report("Disclaimer cancelled", COLOR_DANGER)
             else:
-                self.update_status("Disclaimer accepted", COLOR_SUCCESS)
+                report("Disclaimer accepted", COLOR_SUCCESS)
         elif act_type == "prompt_input":
             prompt_txt = action.get("prompt", "Enter input:")
             default_val = action.get("default", "")
@@ -6803,7 +8100,7 @@ class BuiltInMacroApp:
             if entered_val is not None:
                 self.variables[var_name] = str(entered_val)
                 if self.audio_cues: play_cue("match")
-                self.update_status(f"Var '{var_name}' = '{entered_val}'", COLOR_SUCCESS)
+                report(f"Var '{var_name}' = '{entered_val}'", COLOR_SUCCESS)
         elif act_type == "read_clipboard":
             clip_content = get_clipboard_text().lower()
             keywords = [k.lower() for k in action.get("keywords", [])]
@@ -6813,17 +8110,17 @@ class BuiltInMacroApp:
                 val = action.get("value", "")
                 self.variables[var_name] = val
                 if self.audio_cues: play_cue("match")
-                self.update_status(f"Var '{var_name}' = '{val}'", COLOR_SUCCESS)
+                report(f"Var '{var_name}' = '{val}'", COLOR_SUCCESS)
             else:
-                self.update_status(f"Var '{var_name}': No match in clipboard", SYNTAX_ORANGE)
+                report(f"Var '{var_name}': No match in clipboard", SYNTAX_ORANGE)
         elif act_type == "type_variable":
             var_name = action.get("var_name", "status")
             val = str(self.variables.get(var_name, ""))
             if val:
                 type_string(val, self.playback_speed)
-                self.update_status(f"Typed '{val}'", COLOR_SUCCESS)
+                report(f"Typed '{val}'", COLOR_SUCCESS)
             else:
-                self.update_status(f"Var '{var_name}' is empty", SYNTAX_ORANGE)
+                report(f"Var '{var_name}' is empty", SYNTAX_ORANGE)
         elif act_type == "key":
             type_string(str(action.get("key", "")), self.playback_speed)
         elif act_type == "press":
@@ -6844,11 +8141,18 @@ class BuiltInMacroApp:
             if not self.wait_for_screen_text(action):
                 raise MacroExecutionError("Wait Text timed out")
         elif act_type == "wait_pixel":
-            cur = get_pixel_color(action.get("x", 0), action.get("y", 0))
-            expected = action.get("color", "#FFFFFF").upper()
-            match = (cur == expected)
-            if match and self.audio_cues: play_cue("match")
-            self.update_status(f"Pixel: {cur} (Match: {match})", COLOR_SUCCESS if match else COLOR_DANGER)
+            tx,ty=action.get('x',0),action.get('y',0)
+            if action.get('win_title'):
+                hwnd=find_window_by_title_substr(action['win_title'])
+                if hwnd:tx,ty=client_to_screen_pos(hwnd,action.get('rel_x',tx),action.get('rel_y',ty))
+            expected=action.get('color','#FFFFFF').upper()
+            deadline=time.monotonic()+max(0,float(action.get('timeout',15)))
+            while True:
+                if get_pixel_color(tx,ty)==expected:break
+                if time.monotonic()>=deadline:
+                    raise MacroExecutionError(f'Pixel {expected} timed out at ({tx},{ty})')
+                self.dynamic_engine._pause(0.05,idle=not self.playing)
+            if self.audio_cues:play_cue('match')
         elif act_type == "find_color":
             area = action.get("area", [0, 0, 100, 100])
             hex_color = action.get("color", "#FFFFFF").upper()
@@ -6872,7 +8176,7 @@ class BuiltInMacroApp:
             if found_box:
                 mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
                 self.root.after(0, lambda b=found_box: self.draw_highlight_box(*b, COLOR_SUCCESS, 800))
-                self.root.after(0, lambda m=mode, x=tx, y=ty: self._report_color_execution(m, x, y))
+                self.root.after(0, lambda m=mode, x=tx, y=ty: self._report_text_execution(m, x, y))
                 if self.audio_cues: play_cue("match")
             else:
                 raise MacroExecutionError(f"Text '{target_text}' not found in search area")
@@ -7117,164 +8421,204 @@ class BuiltInMacroApp:
         snipper.after(40, poll_hardware_escape)
 
     def capture_screen_area_to_bmp(self, x, y, w, h, filepath):
-        user32 = ctypes.windll.user32
-        gdi32 = ctypes.windll.gdi32
+        """Capture the selected screen rectangle as a BMP for WinRT OCR.
 
-        # Fix: Change minimum scale from 4 to 1 so large windows aren't upscaled into massive 8K images.
-        scale = max(1, int(160 / max(1, h)))
-        scale = min(scale, 6)
-        tw = w * scale
-        th = h * scale
+        Typed GDI signatures are required for x64 Python. GetDIBits must be
+        called after deselecting the bitmap from its memory device context.
+        """
+        x, y, w, h = map(int, (x, y, w, h))
+        if w <= 0 or h <= 0:
+            raise MacroExecutionError("OCR capture area must have positive width and height")
+        scale = min(6, max(1, int(160 / h)))
+        tw, th = w * scale, h * scale
+        if tw * th > 32_000_000:
+            raise MacroExecutionError("OCR capture region is too large")
 
-        h_screen_dc = user32.GetDC(0)
-        h_mem_dc = gdi32.CreateCompatibleDC(h_screen_dc)
-        h_bitmap = gdi32.CreateCompatibleBitmap(h_screen_dc, tw, th)
-        h_old = gdi32.SelectObject(h_mem_dc, h_bitmap)
+        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        HANDLE = ctypes.c_void_p
+        user32.GetDC.argtypes, user32.GetDC.restype = [HANDLE], HANDLE
+        user32.ReleaseDC.argtypes, user32.ReleaseDC.restype = [HANDLE, HANDLE], ctypes.c_int
+        gdi32.CreateCompatibleDC.argtypes, gdi32.CreateCompatibleDC.restype = [HANDLE], HANDLE
+        gdi32.CreateCompatibleBitmap.argtypes = [HANDLE, ctypes.c_int, ctypes.c_int]
+        gdi32.CreateCompatibleBitmap.restype = HANDLE
+        gdi32.SelectObject.argtypes, gdi32.SelectObject.restype = [HANDLE, HANDLE], HANDLE
+        gdi32.SetStretchBltMode.argtypes = [HANDLE, ctypes.c_int]
+        gdi32.SetStretchBltMode.restype = ctypes.c_int
+        gdi32.StretchBlt.argtypes = [HANDLE, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, HANDLE, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        gdi32.StretchBlt.restype = ctypes.c_int
+        gdi32.GetDIBits.argtypes = [HANDLE, HANDLE, ctypes.c_uint, ctypes.c_uint,
+                                  HANDLE, HANDLE, ctypes.c_uint]
+        gdi32.GetDIBits.restype = ctypes.c_int
+        gdi32.DeleteObject.argtypes, gdi32.DeleteObject.restype = [HANDLE], ctypes.c_int
+        gdi32.DeleteDC.argtypes, gdi32.DeleteDC.restype = [HANDLE], ctypes.c_int
 
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+                        ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+                        ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                        ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_int32),
+                        ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32),
+                        ("biClrImportant", ctypes.c_uint32)]
+
+        stride = ((tw * 3 + 3) // 4) * 4
+        image_size = stride * th
+        pixels = (ctypes.c_ubyte * image_size)()
+        bmi = BITMAPINFOHEADER(biSize=ctypes.sizeof(BITMAPINFOHEADER),
+                               biWidth=tw, biHeight=th, biPlanes=1,
+                               biBitCount=24, biCompression=0, biSizeImage=image_size)
+        screen_dc = user32.GetDC(None)
+        if not screen_dc:
+            raise MacroExecutionError("OCR screenshot: GetDC failed")
+        mem_dc = bitmap = selected = None
         try:
-            gdi32.SetStretchBltMode(h_mem_dc, 4)
-            pt = POINT()
-            gdi32.SetBrushOrgEx(h_mem_dc, 0, 0, ctypes.byref(pt))
-
-            gdi32.StretchBlt(
-                h_mem_dc, 0, 0, tw, th,
-                h_screen_dc, x, y, w, h,
-                0x00CC0020 | 0x40000000
-            )
-
-            class BITMAPINFOHEADER(ctypes.Structure):
-                _fields_ = [
-                    ("biSize", ctypes.c_uint32),
-                    ("biWidth", ctypes.c_int32),
-                    ("biHeight", ctypes.c_int32),
-                    ("biPlanes", ctypes.c_uint16),
-                    ("biBitCount", ctypes.c_uint16),
-                    ("biCompression", ctypes.c_uint32),
-                    ("biSizeImage", ctypes.c_uint32),
-                    ("biXPelsPerMeter", ctypes.c_int32),
-                    ("biYPelsPerMeter", ctypes.c_int32),
-                    ("biClrUsed", ctypes.c_uint32),
-                    ("biClrImportant", ctypes.c_uint32),
-                ]
-
-            row_size = ((tw * 24 + 31) // 32) * 4
-            image_size = row_size * th
-            buf = (ctypes.c_char * image_size)()
-
-            bmi = BITMAPINFOHEADER()
-            bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-            bmi.biWidth = tw
-            bmi.biHeight = th
-            bmi.biPlanes = 1
-            bmi.biBitCount = 24
-            bmi.biCompression = 0
-            bmi.biSizeImage = image_size
-
-            gdi32.GetDIBits(h_mem_dc, h_bitmap, 0, th, buf, ctypes.byref(bmi), 0)
-
+            mem_dc = gdi32.CreateCompatibleDC(screen_dc)
+            if not mem_dc:
+                raise MacroExecutionError("OCR screenshot: CreateCompatibleDC failed")
+            bitmap = gdi32.CreateCompatibleBitmap(screen_dc, tw, th)
+            if not bitmap:
+                raise MacroExecutionError("OCR screenshot: CreateCompatibleBitmap failed")
+            selected = gdi32.SelectObject(mem_dc, bitmap)
+            if not selected or selected == ctypes.c_void_p(-1).value:
+                selected = None
+                raise MacroExecutionError("OCR screenshot: SelectObject failed")
+            gdi32.SetStretchBltMode(mem_dc, 4)  # HALFTONE
+            if not gdi32.StretchBlt(mem_dc, 0, 0, tw, th, screen_dc,
+                                    x, y, w, h, 0x00CC0020 | 0x40000000):
+                raise MacroExecutionError("OCR screenshot: StretchBlt failed")
+            # GDI explicitly requires the bitmap to be deselected before GetDIBits.
+            gdi32.SelectObject(mem_dc, selected)
+            selected = None
+            if gdi32.GetDIBits(screen_dc, bitmap, 0, th, pixels,
+                              ctypes.byref(bmi), 0) != th:
+                raise MacroExecutionError("OCR screenshot: GetDIBits failed")
             file_header = struct.pack('<2sIHHI', b'BM', 54 + image_size, 0, 0, 54)
-            dib_header = struct.pack('<IiiHHIIiiII', 40, tw, th, 1, 24, 0, image_size, 2835, 2835, 0, 0)
-
+            dib_header = struct.pack('<IiiHHIIiiII', 40, tw, th, 1, 24, 0,
+                                     image_size, 2835, 2835, 0, 0)
             with open(filepath, 'wb') as f:
                 f.write(file_header)
                 f.write(dib_header)
-                f.write(buf)
+                f.write(pixels)
         finally:
-            gdi32.SelectObject(h_mem_dc, h_old)
-            gdi32.DeleteObject(h_bitmap)
-            gdi32.DeleteDC(h_mem_dc)
-            user32.ReleaseDC(0, h_screen_dc)
-
+            if selected and mem_dc:
+                gdi32.SelectObject(mem_dc, selected)
+            if bitmap:
+                gdi32.DeleteObject(bitmap)
+            if mem_dc:
+                gdi32.DeleteDC(mem_dc)
+            user32.ReleaseDC(None, screen_dc)
 
     def find_text_rect(self, x, y, w, h, target_text, match_any=False):
-        x, y, w, h = int(x), int(y), max(1, int(w)), max(1, int(h))
+        """Return the exact matched text's screen bbox (exclusive right/bottom)."""
+        x, y, w, h = map(int, (x, y, w, h))
+        if w <= 0 or h <= 0:
+            raise MacroExecutionError("Find Text requires a positive search area")
+        if not str(target_text).strip() and not match_any:
+            raise MacroExecutionError("Find Text requires nonempty target text")
+        scale = min(6, max(1, int(160 / h)))
         temp_fd, temp_bmp = tempfile.mkstemp(suffix=".bmp")
         os.close(temp_fd)
-
-        # Match the scaling factor used by capture_screen_area_to_bmp 
-        # to accurately map OCR pixel coordinates back to the unscaled screen.
-        scale = max(1, int(160 / max(1, h)))
-        scale = min(scale, 6)
-
         try:
             self.capture_screen_area_to_bmp(x, y, w, h, temp_bmp)
-        except Exception:
-            try: os.remove(temp_bmp)
-            except Exception: pass
-            return None
-
-        abs_bmp_path = os.path.abspath(temp_bmp).replace("'", "''")
-
-        ps_script = f"""
+            abs_bmp_path = os.path.abspath(temp_bmp).replace("'", "''")
+            ps_script = f"""
 $ErrorActionPreference = 'Stop'
+$stream = $null
 try {{
     Add-Type -AssemblyName System.Runtime.WindowsRuntime
     [void][Windows.Globalization.Language, Windows.Globalization, ContentType=WindowsRuntime]
     [void][Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime]
+    [void][Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType=WindowsRuntime]
     [void][Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType=WindowsRuntime]
+    [void][Windows.Media.Ocr.OcrResult, Windows.Media.Ocr, ContentType=WindowsRuntime]
     [void][Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]
+    [void][Windows.Storage.Streams.IRandomAccessStreamWithContentType, Windows.Storage.Streams, ContentType=WindowsRuntime]
 
-    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 }})[0]
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+        $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    }})[0]
+    if (-not $asTaskGeneric) {{ throw 'WinRT AsTask method unavailable' }}
     function Await-Op($asyncOp, $type) {{
         $task = $asTaskGeneric.MakeGenericMethod($type).Invoke($null, @($asyncOp))
-        $task.Wait(9000) | Out-Null
+        if (-not $task.Wait(9000)) {{ throw 'OCR async operation timed out' }}
         return $task.Result
     }}
-
     $file = Await-Op ([Windows.Storage.StorageFile]::GetFileFromPathAsync('{abs_bmp_path}')) ([Windows.Storage.StorageFile])
     $stream = Await-Op ($file.OpenReadAsync()) ([Windows.Storage.Streams.IRandomAccessStreamWithContentType])
     $decoder = Await-Op ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-    $sBmp = Await-Op ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-
+    $bitmap = Await-Op ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
     $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-    if (-not $engine) {{ $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('en-US')) }}
-    
-    $ocrResult = Await-Op ($engine.RecognizeAsync($sBmp)) ([Windows.Media.Ocr.OcrResult])
-    $results = @()
-    if ($ocrResult -and $ocrResult.Lines) {{
-        foreach ($line in $ocrResult.Lines) {{
-            $rect = $line.BoundingRect
-            $results += [PSCustomObject]@{{ Text = $line.Text; X = $rect.X; Y = $rect.Y; Width = $rect.Width; Height = $rect.Height }}
+    if (-not $engine) {{
+        $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('en-US'))
+    }}
+    if (-not $engine) {{
+        $available = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages
+        if ($available -and $available.Count -gt 0) {{
+            $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($available[0])
         }}
     }}
-    Write-Output ($results | ConvertTo-Json -Compress)
+    if (-not $engine) {{ throw 'No OCR language available on this computer' }}
+    $recognized = Await-Op ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+    $results = @()
+    $lineIndex = 0
+    if ($recognized -and $recognized.Lines) {{
+        foreach ($line in $recognized.Lines) {{
+            foreach ($word in $line.Words) {{
+                $r = $word.BoundingRect
+                $results += [PSCustomObject]@{{ Line = $lineIndex; Text = $word.Text;
+                    X = $r.X; Y = $r.Y; Width = $r.Width; Height = $r.Height }}
+            }}
+            $lineIndex++
+        }}
+    }}
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    ConvertTo-Json -InputObject $results -Compress -Depth 4
+}} catch {{
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    Write-Output ('ERR:' + $_.Exception.Message)
+}} finally {{
     if ($stream) {{ $stream.Dispose() }}
-}} catch {{}}
+}}
 """
-        try:
             encoded_cmd = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
-            proc = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded_cmd],
-                stdout=subprocess.PIPE, text=True, creationflags=0x08000000, timeout=12
-            )
-            out = proc.stdout.strip()
-            if not out: return None
-            
-            lines_data = json.loads(out)
-            if not isinstance(lines_data, list): lines_data = [lines_data]
-            
-            target_lower = target_text.casefold()
-            target_clean = target_lower.replace(" ", "")
-            
-            for line in lines_data:
-                text_lower = line.get("Text", "").casefold()
-                text_clean = text_lower.replace(" ", "")
-                # Flexible matching: allows for standard substring match OR a space-stripped match
-                # (e.g. if OCR misreads "Find" as "F i n d" or "F ind")
-                if match_any or target_lower in text_lower or target_clean in text_clean:
-                    rx = x + int(line["X"] / scale)
-                    ry = y + int(line["Y"] / scale)
-                    rw = int(line["Width"] / scale)
-                    rh = int(line["Height"] / scale)
-                    return (rx, ry, rx + rw, ry + rh)
-            return None
-        except Exception:
-            return None
+            try:
+                proc = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+                     "Bypass", "-EncodedCommand", encoded_cmd],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace",
+                    creationflags=0x08000000, timeout=12
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise MacroExecutionError(f"Find Text OCR process failed: {exc}") from exc
+            out = proc.stdout.strip().lstrip("\ufeff")
+            if out.startswith("ERR:"):
+                raise MacroExecutionError(f"Find Text OCR: {out[4:]}")
+            if proc.returncode != 0 or not out:
+                detail = proc.stderr.strip() or "No OCR response"
+                raise MacroExecutionError(f"Find Text OCR failed: {detail[:300]}")
+            try:
+                words = json.loads(out)
+            except json.JSONDecodeError as exc:
+                raise MacroExecutionError(f"Find Text OCR returned invalid data: {out[:160]}") from exc
+            if not isinstance(words, list):
+                words = [words] if words else []
+            rect = find_ocr_word_match(words, target_text, match_any)
+            if rect is None:
+                return None
+            x1, y1, x2, y2 = rect
+            return (x + math.floor(x1 / scale), y + math.floor(y1 / scale),
+                    x + max(math.floor(x1 / scale) + 1, math.ceil(x2 / scale)),
+                    y + max(math.floor(y1 / scale) + 1, math.ceil(y2 / scale)))
         finally:
-            try: os.remove(temp_bmp)
-            except Exception: pass
+            try:
+                os.remove(temp_bmp)
+            except OSError:
+                pass
 
-            
+
     def search_color_in_area(self, x, y, w, h, hex_color, tolerance=8):
         """Capture screen pixels and locate the largest connected color region.
 
@@ -8478,9 +9822,8 @@ try {{
         """Capture the *visible* Settings panel as one Tk PhotoImage.
 
         Windows uses native GDI and Python's built-in Tk PhotoImage; no extra
-        packages are needed. On non-Windows development machines, Pillow is
-        an optional preview/test fallback. If capture fails, callers skip the
-        animation rather than animate an unrelated grey rectangle.
+        packages are needed. If capture fails, skip the animation instead of
+        animating an unrelated grey rectangle.
         """
         form = self.frame_settings
         if not form.winfo_ismapped():
@@ -8492,13 +9835,7 @@ try {{
         sx, sy = form.winfo_rootx(), form.winfo_rooty()
 
         if os.name != "nt":
-            try:
-                from PIL import ImageGrab, ImageTk
-                return ImageTk.PhotoImage(
-                    ImageGrab.grab(bbox=(sx, sy, sx + width, sy + height))
-                )
-            except (ImportError, OSError, RuntimeError):
-                return None
+            return None  # Settings animation snapshots require native Windows GDI.
 
         import ctypes.wintypes as wt
         user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
@@ -9569,6 +10906,7 @@ try {{
             self.update_status("Queue Empty", COLOR_DANGER)
             return
         self._prepare_mouse_execution()
+        self.dynamic_engine = SequentDynamicEngine(self)
         self.playing = True
         self.show_tab("playback") 
         self.update_status("Running Script...", COLOR_ACCENT)
@@ -9870,7 +11208,171 @@ try {{
 
         return proceed[0]
 
+    def _run_structured_macro(self):
+        """Regular playback using the same interpreter as macro chains."""
+        total = len(self.recorded_actions)
+        self.playback_run_id = time.time()
+        self._playback_ui_pending = False
+        run_id = self.playback_run_id
+        reason = ''
+        if self.audio_cues:play_cue('start')
+        try:
+            loops = 1000000 if self.loop_mode == '∞ Loop' else int(self.loop_mode.replace('x',''))
+            for rep in range(loops):
+                if not self.playing:break
+                start = self.current_action_idx if rep==0 and 0 <= self.current_action_idx < total else 0
+                def on_step(index,action):
+                    if index in self.breakpoints:
+                        self.is_paused = True
+                        self.root.after(0,lambda i=index:self.update_status(f'Breakpoint at step {i+1}',COLOR_DANGER))
+                        self.root.after(0,lambda:self.pause_btn.set_state('normal',text='Resume (F9)',bg=COLOR_SUCCESS,hover=COLOR_SUCCESS))
+                        while self.is_paused and self.playing:time.sleep(.04)
+                    self.root.after(0,lambda i=index,r=run_id:self._on_playback_step(i,r))
+                result = self.dynamic_engine.run_program(self.recorded_actions,start,on_step=on_step)
+                if result.get('switch'):
+                    self.switching_preset=True
+                    self.playing=False
+                    target=result.get('target','')
+                    if result['switch']=='preset':
+                        self.root.after(150,lambda t=target:self.switch_to_preset_and_start(t))
+                    elif result['switch']=='file':
+                        self.root.after(150,lambda t=target:self.switch_to_file_and_start(t))
+                    return
+                if result.get('cancelled'):break
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc,MacroExecutionError) else f'Unexpected {type(exc).__name__}: {exc}'
+            self.playing=False
+            if self.audio_cues:play_cue('error')
+        finally:
+            if not self.switching_preset:
+                state = 'failed' if reason else 'cancelled' if not self.playing else 'completed'
+                self.root.after(0,self.finish_macro,state,reason)
+
+    def _stop_webhook_listener(self):
+        server=self._webhook_server
+        self._webhook_server=None
+        self._webhook_config=None
+        if server is not None:
+            # Do not wait for HTTP shutdown inside the Tk event loop.
+            Thread(target=lambda: (server.shutdown(),server.server_close()),daemon=True).start()
+
+    def _ensure_webhook_listener(self, trigger):
+        """Bound to loopback and authenticated; never exposes an unauthenticated desktop macro."""
+        token=os.environ.get('SEQUENT_WEBHOOK_TOKEN','').strip()
+        if not token or len(token)<12:
+            self._stop_webhook_listener()
+            return 'Set SEQUENT_WEBHOOK_TOKEN to a secret of at least 12 characters'
+        try:
+            port=int(trigger.get('port',8765))
+            if not 1024<=port<=65535:raise ValueError
+        except (TypeError,ValueError):
+            return 'Webhook port must be between 1024 and 65535'
+        route=str(trigger.get('value','/sequent')).strip() or '/sequent'
+        if not route.startswith('/') or '?' in route or '#' in route:
+            return 'Webhook route must start with / and omit query strings'
+        config=(port,route,token)
+        if self._webhook_server and self._webhook_config==config:
+            return None
+        self._stop_webhook_listener()
+        events=self._webhook_events
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                provided=self.headers.get('X-Sequent-Token','')
+                if self.path!=route:
+                    self.send_error(404);return
+                if not hmac.compare_digest(provided,token):
+                    self.send_error(401);return
+                # Discard body: macro arguments are not accepted over HTTP.
+                size=int(self.headers.get('Content-Length','0') or '0')
+                if size>4096 or size<0:
+                    self.send_error(413);return
+                if size:self.rfile.read(size)
+                events.put(time.monotonic())
+                self.send_response(202)
+                self.send_header('Content-Length','0')
+                self.end_headers()
+            def log_message(self,*args):
+                pass  # Never log authentication data or user requests.
+        try:
+            server=ThreadingHTTPServer(('127.0.0.1',port),Handler)
+            server.daemon_threads=True
+            server.timeout=0.5
+        except OSError as exc:
+            return f'Webhook port cannot be opened: {exc}'
+        self._webhook_server=server
+        self._webhook_config=config
+        Thread(target=server.serve_forever,daemon=True).start()
+        return None
+
+    def _watch_dynamic_trigger(self):
+        """Monitor first-action triggers while Sequent is open; autostart on edges."""
+        try:
+            actions=self.recorded_actions
+            trigger=actions[0] if actions and actions[0].get('type')=='trigger_start' else None
+            if not trigger or not trigger.get('enabled',True):
+                self._auto_trigger_key=None
+                self._auto_trigger_state=None
+                self._stop_webhook_listener()
+            else:
+                key=json.dumps(trigger,sort_keys=True)
+                kind=trigger.get('kind','file')
+                target=str(trigger.get('value','')).strip()
+                busy=self.playing or self.recording or self.chain_running
+                if kind=='webhook':
+                    error=self._ensure_webhook_listener(trigger)
+                    if error:
+                        if self._auto_trigger_state!=error:
+                            self.update_status(error,COLOR_DANGER)
+                            self._auto_trigger_state=error
+                    else:
+                        triggered=False
+                        while True:
+                            try:self._webhook_events.get_nowait();triggered=True
+                            except Empty:break
+                        if triggered and not busy:
+                            self.update_status('Webhook received: launching macro',COLOR_SUCCESS)
+                            self.current_action_idx=0
+                            self.root.after(0,self.start_macro)
+                    self._auto_trigger_key=key
+                else:
+                    self._stop_webhook_listener()
+                    state=None
+                    if target:
+                        if kind=='file':
+                            matched=glob.glob(dynamic_resolve_path(target))
+                            state=tuple(sorted((path,os.path.getmtime(path))
+                                               for path in matched if os.path.isfile(path)))
+                        elif kind=='window':
+                            state=bool(find_window_by_title_substr(target))
+                        elif kind=='clipboard':
+                            state=get_clipboard_text()
+                    if self._auto_trigger_key!=key:
+                        self._auto_trigger_key=key
+                        self._auto_trigger_state=state  # Arm without firing on existing data.
+                    else:
+                        previous=self._auto_trigger_state
+                        self._auto_trigger_state=state  # Update during playback too.
+                        active=not busy and bool(state) and state!=previous
+                        if kind=='window':active=not busy and bool(state and not previous)
+                        if kind=='clipboard':
+                            active=(not busy and state!=previous and
+                                    target.casefold() in str(state).casefold())
+                        if active:
+                            self.update_status(f'Auto-start triggered by {kind}',COLOR_SUCCESS)
+                            self.current_action_idx=0
+                            self.root.after(0,self.start_macro)
+        except (OSError,ValueError,tk.TclError) as exc:
+            try:self.update_status(f'Trigger watch error: {exc}',COLOR_DANGER)
+            except tk.TclError:pass
+        finally:
+            try:self.root.after(1200,self._watch_dynamic_trigger)
+            except tk.TclError:pass
+
     def run_sequence(self):
+        # Structured workflows run through the shared dynamic action interpreter.
+        # Legacy-only recordings retain their existing high-fidelity playback path.
+        if any(a.get('type') in DYNAMIC_ACTION_TYPES for a in self.recorded_actions):
+            return self._run_structured_macro()
         total_actions = len(self.recorded_actions)
         if total_actions == 0:
             self.root.after(0, self.finish_macro)
@@ -10145,6 +11647,31 @@ try {{
                         else:
                             raise MacroExecutionError(f"Color {hex_color} not found in search area")
                             
+                        step_ptr += 1
+                        continue
+
+                    # --- Find Text & Click (WinRT OCR word-box target) ---
+                    if act_type == "find_text":
+                        area = action.get("area", [0, 0, 100, 100])
+                        target_text = action.get("text", "")
+                        found_box = self.find_text_rect(*area, target_text)
+                        if not self.playing:
+                            break  # OCR may finish after a user cancels playback.
+                        if not found_box:
+                            raise MacroExecutionError(f"Text '{target_text}' not found in search area")
+                        mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
+                        self.root.after(0, lambda b=found_box:
+                                        self.draw_highlight_box(*b, COLOR_SUCCESS, 800))
+                        self.root.after(0, lambda m=mode, x=tx, y=ty:
+                                        self._report_text_execution(m, x, y))
+                        if self.audio_cues:
+                            play_cue("match")
+                        step_ptr += 1
+                        continue
+
+                    # --- Dynamic automation action (shared with chain / debugger) ---
+                    if act_type in DYNAMIC_ACTION_TYPES:
+                        self.dynamic_engine.run_action_with_recovery(action)
                         step_ptr += 1
                         continue
 
