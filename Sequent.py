@@ -1287,7 +1287,7 @@ class SequentAccentColorDialog:
         self.after_swatch.pack(fill=tk.X, pady=(4, 7))
         self.after_code = self._label(right, self.selected, size=9, color=TEXT_MUTED)
         self.after_code.pack(anchor="w")
-        self.brand_preview = tk.Label(right, text="MACRO WORKSPACE", bg=BG_INPUT,
+        self.brand_preview = tk.Label(right, text=" MACRO ENGINE", bg=BG_INPUT,
                                       fg=self.selected, font=("Segoe UI", 9, "bold"),
                                       pady=10, padx=5)
         self.brand_preview.pack(fill=tk.X, pady=(16, 0))
@@ -6684,7 +6684,7 @@ class BuiltInMacroApp:
         title = tk.Label(brand, text="SEQUENT", bg=BG_HEADER, fg=TEXT_PRIMARY,
                          font=("Segoe UI", 12, "bold"))
         title.pack(anchor="w")
-        tk.Label(brand, text="MACRO WORKSPACE", bg=BG_HEADER, fg=COLOR_ACCENT,
+        tk.Label(brand, text=" MACRO ENGINE", bg=BG_HEADER, fg=COLOR_ACCENT,
                  font=("Segoe UI", 7, "bold")).pack(anchor="w")
         for widget in (brand, title):
             widget.bind("<Button-1>", self.start_drag)
