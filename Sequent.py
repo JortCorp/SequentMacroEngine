@@ -3035,6 +3035,30 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.delete("1.0", "end")
         self.gutter.configure(width=5)
 
+    def search_queue(self, query):
+        """Highlights and scrolls to matching text in the action queue."""
+        self.code_text.tag_remove("search_highlight", "1.0", "end")
+        if not query:
+            return
+            
+        self.code_text.tag_configure("search_highlight", background=COLOR_ACCENT, foreground=TEXT_ON_ACCENT)
+        
+        start_pos = "1.0"
+        first_match = None
+        while True:
+            # nocase=True makes the search case-insensitive
+            start_pos = self.code_text.search(query, start_pos, stopindex="end", nocase=True)
+            if not start_pos:
+                break
+            if not first_match:
+                first_match = start_pos
+            end_pos = f"{start_pos}+{len(query)}c"
+            self.code_text.tag_add("search_highlight", start_pos, end_pos)
+            start_pos = end_pos
+            
+        if first_match:
+            self.code_text.see(first_match)
+
     def append_line(self, text, color=TEXT_PRIMARY, auto_scroll=True):
         self.line_count += 1
         needed_width = max(5, len(str(self.line_count)) + 2)
@@ -3835,7 +3859,7 @@ class VSCodeQueueViewer(tk.Frame):
 
         btn_txt = "Save Changes" if edit_idx is not None else "Add Gate Check"
         ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
-        
+
     def _render_label_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
         curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
@@ -4248,7 +4272,7 @@ class VSCodeQueueViewer(tk.Frame):
         v_mid.pack(side=tk.LEFT, padx=2)
         tk.Label(v_mid, text="Condition:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         op_var = tk.StringVar(value=curr_act.get("op", "==") if (curr_act and curr_act.get("type") == "if_var") else "==")
-        op_menu = tk.OptionMenu(v_mid, op_var, "==", "!=", "contains", "not empty")
+        op_menu = tk.OptionMenu(v_mid, op_var, "==", "!=", "contains", "startswith", "endswith", "regex", "not empty")
         op_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
         op_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
         op_menu.pack(fill=tk.X)
@@ -7628,12 +7652,29 @@ class BuiltInMacroApp:
         self.import_macro_button = sequent_toolbar_button(filebar, "↥  Import", self.load_macro_from_file)
         self.import_macro_button.pack(side=tk.LEFT, padx=(0, 5))
         sequent_toolbar_button(filebar, "↧  Export", self.save_macro_to_file).pack(side=tk.LEFT)
+        
         # The lengthy instruction consumed more width than the queue could
         # supply at its default size. Keep the help accessible via a tooltip.
         help_label = tk.Label(filebar, text="?", bg=BG_PANEL, fg=TEXT_MUTED,
                               font=("Segoe UI", 9, "bold"), padx=7)
         help_label.pack(side=tk.RIGHT)
         ModernTooltip(help_label, "Double-click to edit • Right-click for options")
+
+        # --- NEW SEARCH BAR UI ---
+        search_frame = tk.Frame(filebar, bg=BG_INPUT, highlightbackground=BG_BORDER, highlightthickness=1)
+        search_frame.pack(side=tk.RIGHT, padx=(0, 12))
+        tk.Label(search_frame, text="⌕", bg=BG_INPUT, fg=TEXT_MUTED, font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(6, 2))
+        
+        self.queue_search_var = tk.StringVar()
+        queue_search_entry = tk.Entry(
+            search_frame, textvariable=self.queue_search_var, bg=BG_INPUT, 
+            fg=TEXT_PRIMARY, bd=0, insertbackground=TEXT_PRIMARY, 
+            width=18, font=("Segoe UI", 8)
+        )
+        queue_search_entry.pack(side=tk.LEFT, ipady=3, padx=(0, 6))
+        
+        # Trigger the search dynamically as the user types
+        self.queue_search_var.trace_add("write", lambda *args: self.queue_viewer.search_queue(self.queue_search_var.get()))
         self.queue_viewer = VSCodeQueueViewer(queue_dock, app_instance=self)
         self.queue_viewer.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self.queue_viewer.append_line("// Awaiting input...", SYNTAX_GREEN)
