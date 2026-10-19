@@ -2251,7 +2251,7 @@ DYNAMIC_ACTION_TYPES = frozenset({
     'ui_element', 'smart_wait', 'ocr_extract', 'if_dynamic', 'else_dynamic',
     'end_if', 'loop_start', 'loop_end', 'find_image', 'recovery',
     'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action',
-    'search_area', 'if_var', 'label', 'goto', 'clip_fallback'
+    'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end'})
 
@@ -2714,13 +2714,26 @@ class SequentDynamicEngine:
             if typ == 'clip_fallback':
                 cb_text = get_clipboard_text().casefold()
                 keywords = [k.strip().casefold() for k in action.get('keywords', []) if k.strip()]
-                
-                # Check if ANY of the keywords exist in the clipboard text
                 match_found = any(kw in cb_text for kw in keywords)
-                
-                # If NONE of them are found, abort and run the preset
                 if not match_found:
                     return {'switch': 'preset', 'target': action.get('preset', '')}
+                index += 1; continue
+
+            
+            if typ == 'gate_check':
+                var_val = str(self.app.variables.get(action.get('var_name', ''), '')).strip()
+                state = action.get('state', 'unassigned')
+                
+                # Verify condition met
+                is_met = (state == 'unassigned' and not var_val) or (state == 'assigned' and bool(var_val))
+                
+                if is_met:
+                    gate_act = action.get('action', 'Stop Execution')
+                    if gate_act == 'Stop Execution':
+                        return {'cancelled': True}
+                    elif gate_act == 'Switch Preset':
+                        return {'switch': 'preset', 'target': action.get('preset', '')}
+                    # If 'Continue', just fall through and increment the index
                 
                 index += 1; continue
 
@@ -2757,30 +2770,31 @@ class VSCodeQueueViewer(tk.Frame):
             ("Find Text & Click", "Find text in an area and click it.", "FT"),
         )),
         ("Variables & Inputs", (
-            ("Read Clipboard", "Capture and inspect clipboard contents.", "CB"),
-            ("Clipboard Branch / Fallback", "If keywords are missing, run a preset.", "🔀"),
+            ("Read Clipboard", "Capture and inspect clipboard contents.", "RC"),
+            ("Clipboard Branch / Fallback", "If keywords are missing, run a preset.", "CB"),
             ("Request Input", "Ask the user for a value at runtime.", "IN"),
-            ("Type Variable", "Type the value of a saved variable.", "VAR"),
-            ("Advanced Key", "Press, hold, or release a specific key.", "⌨️"),
+            ("Type Variable", "Type the value of a saved variable.", "VR"),
+            ("Advanced Key", "Press, hold, or release a specific key.", "AK"),
         )),
         ("Logic & Flow", (
             ("If Variable Condition", "Branch based on a variable comparison.", "IF"),
-            ("Label Marker", "Create a named location in the queue.", "LB"),
-            ("Jump to Label", "Continue execution at a named label.", "GO"),
+            ("Gate Check", "Stop, switch, or continue based on variable status.", "GC"),
+            ("Label Marker", "Create a named location in the queue.", "LM"),
+            ("Jump to Label", "Continue execution at a named label.", "JL"),
         )),
         ("Dynamic Screen & UI", (
-            ("Smart UI Element & Click", "Click accessible buttons and controls.", "UI"),
+            ("Smart UI Element & Click", "Click accessible buttons and controls.", "SC"),
             ("Smart Wait & Retry", "Wait on changes with timeout and fallback.", "SW"),
             ("OCR → Variable", "Extract screen text into named variables.", "OV"),
-            ("Find Image & Click", "Find image templates by similarity.", "IM"),
+            ("Find Image & Click", "Find image templates by similarity.", "IC"),
         )),
         ("Logic & Recovery", (
             ("IF (Dynamic Condition)", "Combine multiple live checks (ALL/ANY).", "IF"),
             ("ELSE", "Alternative branch for the prior IF.", "EL"),
             ("END IF", "Close an IF / ELSE block.", "EI"),
-            ("LOOP Start", "Repeat N times, while, until or each row.", "LP"),
+            ("LOOP Start", "Repeat N times, while, until or each row.", "LS"),
             ("LOOP End", "Close the current loop.", "LE"),
-            ("Recovery Policy", "Choose retry, skip, fallback and logging.", "ER"),
+            ("Recovery Policy", "Choose retry, skip, fallback and logging.", "RP"),
         )),
         ("Files & Event Automation", (
             ("Load CSV / Excel", "Read a file's rows as variables.", "DL"),
@@ -2873,10 +2887,20 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.bind("<Double-Button-1>", self._on_double_click)
 
         self.code_text.bind("<<Selection>>", self._on_text_selection_changed)
-        self.code_text.bind("<ButtonRelease-1>", self._on_text_selection_changed)
+        self.code_text.bind("<B1-Motion>", self._on_dnd_motion)
+        self.code_text.bind("<ButtonRelease-1>", self._on_code_release)
 
         self.code_text.tag_configure("active_line", background="#36394a")
         self.code_text.tag_lower("active_line")
+        self.gutter.tag_configure("active_line", background=COLOR_ACCENT, foreground=TEXT_ON_ACCENT)
+        self.gutter.tag_raise("active_line")
+        self.code_text.tag_configure("active_line", background="#36394a")
+        self.code_text.tag_lower("active_line")
+        
+        # Add visual indicator for Drag and Drop targets
+        self.code_text.tag_configure("dnd_target", background=BG_HOVER, underline=True)
+        self.code_text.tag_raise("dnd_target")
+        
         self.gutter.tag_configure("active_line", background=COLOR_ACCENT, foreground=TEXT_ON_ACCENT)
         self.gutter.tag_raise("active_line")
 
@@ -3221,6 +3245,9 @@ class VSCodeQueueViewer(tk.Frame):
         if self.sub_menu and self.sub_menu.winfo_exists():
             self.close_sub_menu()
 
+        self._dnd_start_idx = None
+        self._dnd_active = False
+
         # Synchronize playhead & reticle to the clicked queue line
         try:
             clicked_pos = self.code_text.index(f"@{event.x},{event.y}")
@@ -3229,8 +3256,79 @@ class VSCodeQueueViewer(tk.Frame):
                 act_idx = line_num - 2
                 if 0 <= act_idx < len(self.app.recorded_actions):
                     self.app.set_active_action_index(act_idx)
+                    # Prime the drag-and-drop state
+                    self._dnd_start_idx = act_idx
+                    self._dnd_start_y = event.y
         except Exception:
             pass
+
+    def _on_dnd_motion(self, event):
+        if not self.interactive_enabled or not self.app.recorded_actions:
+            return
+        start_idx = getattr(self, "_dnd_start_idx", None)
+        if start_idx is None:
+            return
+        
+        # Only activate drag mode if the mouse moves vertically by a few pixels
+        if not getattr(self, "_dnd_active", False):
+            if abs(event.y - getattr(self, "_dnd_start_y", event.y)) > 5:
+                self._dnd_active = True
+                self.code_text.tag_remove("sel", "1.0", "end") # Clear text selection
+            else:
+                return
+
+        try:
+            hover_pos = self.code_text.index(f"@{event.x},{event.y}")
+            line_num = int(hover_pos.split(".")[0])
+            hover_idx = line_num - 2
+            
+            # Cap the index to valid bounds so it can be dragged to the very bottom
+            max_idx = len(self.app.recorded_actions)
+            hover_idx = max(0, min(hover_idx, max_idx))
+            
+            self._dnd_hover_idx = hover_idx
+            self.code_text.tag_remove("dnd_target", "1.0", "end")
+            
+            target_line = hover_idx + 2
+            if target_line <= self.line_count + 1:
+                # Add a visual underline to the slot it will drop into
+                self.code_text.tag_add("dnd_target", f"{target_line}.0", f"{target_line}.end+1c")
+        except Exception:
+            pass
+
+        return "break" # Overrides standard text highlighting while dragging
+
+    def _on_code_release(self, event):
+        self.code_text.tag_remove("dnd_target", "1.0", "end")
+        
+        if getattr(self, "_dnd_active", False):
+            start = getattr(self, "_dnd_start_idx", None)
+            end = getattr(self, "_dnd_hover_idx", None)
+            
+            if start is not None and end is not None and start != end:
+                # Perform the list reorder
+                act = self.app.recorded_actions.pop(start)
+                self.app.recorded_actions.insert(end, act)
+                
+                # Update the playhead index if it was affected by the shift
+                if self.app.current_action_idx == start:
+                    self.app.current_action_idx = end
+                elif start < self.app.current_action_idx <= end:
+                    self.app.current_action_idx -= 1
+                elif end <= self.app.current_action_idx < start:
+                    self.app.current_action_idx += 1
+                    
+                # Redraw the queue and re-sync the playhead
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(self.app.current_action_idx)
+        
+        # Reset drag state
+        self._dnd_active = False
+        self._dnd_start_idx = None
+        self._dnd_hover_idx = None
+        
+        # Call the selection handler to resume ghost-reticle multi-select trails
+        self._on_text_selection_changed()
     
     def _on_double_click(self, event):
         if not self.interactive_enabled or not self.app.recorded_actions:
@@ -3266,6 +3364,7 @@ class VSCodeQueueViewer(tk.Frame):
             "if_var": "If Variable Condition",
             "read_clipboard": "Read Clipboard",
             "clip_fallback": "Clipboard Branch / Fallback",
+            "gate_check": "Gate Check",
             "prompt_input": "Request Input",
             "type_variable": "Type Variable",
             "search_area": "Search selected area",
@@ -3645,13 +3744,98 @@ class VSCodeQueueViewer(tk.Frame):
             "Find Text & Click": self._render_find_text_view,
             "Wait for Text": self._render_wait_text_view,
             "Wait Pixel": self._render_wait_pixel_view,
+            "Gate Check": self._render_gate_check_view,
             "Label Marker": self._render_label_view,
             "Jump to Label": self._render_goto_view,
         }
         renderers.get(action_type, self._render_dynamic_action_view)(line_num, edit_idx=edit_idx)
         self._action_editor_canvas.yview_moveto(0)
 
+    def _render_gate_check_view(self, line_num, edit_idx=None):
+        body = self.action_content_frame
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
 
+        tk.Label(body, text="Variable Name:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
+        var_entry = tk.Entry(body, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        var_entry.pack(fill=tk.X, ipady=3, pady=(0, 6))
+        var_entry.insert(0, curr_act.get("var_name", "target_var") if curr_act else "target_var")
+
+        tk.Label(body, text="If Variable is:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
+        state_var = tk.StringVar(value=curr_act.get("state", "unassigned") if curr_act else "unassigned")
+        state_menu = tk.OptionMenu(body, state_var, "unassigned", "assigned")
+        state_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, cursor="hand2")
+        state_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        state_menu.pack(fill=tk.X, pady=(0, 6))
+
+        tk.Label(body, text="Then Take Action:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
+        action_var = tk.StringVar(value=curr_act.get("action", "Stop Execution") if curr_act else "Stop Execution")
+        
+        target_container = tk.Frame(body, bg=BG_PANEL)
+        target_container.preset_var = None
+        
+        def on_action_change(*args):
+            for child in target_container.winfo_children():
+                child.destroy()
+            if action_var.get() == "Switch Preset":
+                presets = self.app.get_preset_names()
+                init_preset = curr_act.get("preset", "") if curr_act else ""
+                chosen = init_preset if init_preset in presets else (presets[0] if presets else "-- No Presets Found --")
+                preset_var = tk.StringVar(value=chosen)
+                pm = tk.OptionMenu(target_container, preset_var, *(presets if presets else ["-- No Presets Found --"]))
+                pm.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, cursor="hand2")
+                pm["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+                pm.pack(fill=tk.X)
+                target_container.preset_var = preset_var
+            else:
+                target_container.preset_var = None
+
+        act_menu = tk.OptionMenu(body, action_var, "Stop Execution", "Switch Preset", "Continue", command=on_action_change)
+        act_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, cursor="hand2")
+        act_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        act_menu.pack(fill=tk.X, pady=(0, 6))
+        
+        target_container.pack(fill=tk.X, pady=(0, 6))
+        on_action_change()
+
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(0, 10))
+
+        def submit():
+            v_name = var_entry.get().strip()
+            if not v_name: return
+            
+            act_val = action_var.get()
+            preset_val = target_container.preset_var.get() if target_container.preset_var else ""
+            
+            new_act = {
+                "type": "gate_check",
+                "var_name": v_name,
+                "state": state_var.get(),
+                "action": act_val,
+                "preset": preset_val
+            }
+            
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = new_act
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(edit_idx)
+                self.app.update_status("Updated Gate Check", COLOR_SUCCESS)
+            else:
+                is_after = "After" in pos_var.get()
+                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(insert_idx, new_act)
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.update_status("Added Gate Check", COLOR_SUCCESS)
+            self.close_sub_menu()
+
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Gate Check"
+        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+        
     def _render_label_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
         curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
@@ -5157,8 +5341,6 @@ class ModernScrollableFrame(tk.Frame):
 
         self.canvas.pack(side="left", fill="both", expand=True)
 
-        # One active Settings scroll handler at a time. Using add="+" here
-        # leaked callbacks from destroyed Settings pages on every theme change.
         self.bind_all("<MouseWheel>", self._on_mousewheel)
 
 
