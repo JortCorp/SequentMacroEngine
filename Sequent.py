@@ -2319,6 +2319,26 @@ def dynamic_matching_block(actions, start, opening, closing, middle=None):
             branch = index
     raise MacroExecutionError(f'Unclosed {opening} block at step {start + 1}')
 
+def get_global_var(app, name, default=""):
+    """Reads a variable from the external globals.json file."""
+    path = os.path.join(app.presets_dir, "globals.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f).get(name, default)
+    except Exception:
+        return default
+
+def set_global_var(app, name, value):
+    """Saves a variable to the external globals.json file."""
+    path = os.path.join(app.presets_dir, "globals.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data[name] = str(value)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 class SequentDynamicEngine:
     """Structured action execution and conditions; no independent Tk GUI state."""
@@ -2331,8 +2351,18 @@ class SequentDynamicEngine:
 
     def interpolate(self, value):
         if not isinstance(value, str): return value
-        return re.sub(r'\$\{([A-Za-z_][\w.]*)\}',
-                      lambda m: str(self.app.variables.get(m.group(1), '')), value)
+        
+        def resolve_var(match):
+            var_name = match.group(1)
+            # Route to external file if prefixed with global.
+            if var_name.startswith("global."):
+                real_name = var_name.split(".", 1)[1]
+                return str(get_global_var(self.app, real_name))
+            
+            # Otherwise use the local session memory
+            return str(self.app.variables.get(var_name, ''))
+            
+        return re.sub(r'\$\{([A-Za-z_][\w.]*)\}', resolve_var, value)
 
     def _pause(self, seconds, idle=False):
         end = time.monotonic() + max(0, float(seconds))
@@ -2485,6 +2515,14 @@ class SequentDynamicEngine:
         if self.app.audio_cues: play_cue('match')
         return {'bounds':list(box),'mode':result[0],'x':result[1],'y':result[2]}
 
+    def _assign_variable(self, name, value):
+        """Routes variable assignment to local or global storage automatically."""
+        if name.startswith("global."):
+            real_name = name.split(".", 1)[1]
+            set_global_var(self.app, real_name, value)
+        else:
+            self.app.variables[name] = value
+
     def execute(self, action, *, idle=False):
         """Unified executor for all new queue actions."""
         typ = action.get('type')
@@ -2506,7 +2544,7 @@ class SequentDynamicEngine:
                 except IndexError as exc: raise MacroExecutionError('OCR regex group does not exist') from exc
             else: extracted = raw.strip()
             name = action.get('var_name','ocr_value')
-            self.app.variables[name] = extracted
+            self._assign_variable(name, extracted)
             result = {'value':extracted,'variable':name}
         elif typ == 'smart_wait':
             timeout = max(0,float(action.get('timeout',15)))
@@ -2580,7 +2618,7 @@ class SequentDynamicEngine:
         if 'bounds' in result and result['bounds']:
             self.app.variables['_last_bounds'] = json.dumps(result['bounds'])
         return self.last_result
-
+    
     def run_action_with_recovery(self, action, *, idle=False):
         mode = action.get('on_error',self.policy['on_error'])
         retries = max(0,min(20,int(action.get('retry_count',self.policy['retry_count']))))
