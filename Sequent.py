@@ -850,7 +850,7 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", ctypes.c_uint32), ("u", INPUT_UNION)]
 
 
-def wait_for_cursor_settled(x, y, timeout_s=0.90, settle_s=0.075, tolerance=2):
+def wait_for_cursor_settled(x, y, timeout_s=0.25, settle_s=0.05, tolerance=15):
     """Wait until the real cursor is at the target *continuously* for a short time.
 
     SetCursorPos returning success doesn't mean an application's event loop has
@@ -998,6 +998,16 @@ def press_virtual_key(vk):
     scan = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
     ctypes.windll.user32.keybd_event(vk, scan, flags, 0)
     time.sleep(0.05)
+    ctypes.windll.user32.keybd_event(vk, scan, flags | KEYEVENTF_KEYUP, 0)
+
+def hold_virtual_key(vk):
+    flags = KEYEVENTF_EXTENDEDKEY if vk in EXTENDED_KEYS else 0
+    scan = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
+    ctypes.windll.user32.keybd_event(vk, scan, flags, 0)
+
+def release_virtual_key(vk):
+    flags = KEYEVENTF_EXTENDEDKEY if vk in EXTENDED_KEYS else 0
+    scan = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
     ctypes.windll.user32.keybd_event(vk, scan, flags | KEYEVENTF_KEYUP, 0)
 
 def press_key_combo(mods, vk, hold_time=0.06):
@@ -1773,7 +1783,10 @@ DYNAMIC_ACTION_SPECS = {
    ('kind','Trigger when a new event occurs','choice','file',['file','window','clipboard','webhook']),
    ('value','File path/glob, window title, clipboard text, or /webhook path','text',''),
    ('port','Local webhook port (webhook mode only)','int',8765),
-   ('enabled','Enable background auto-start while idle','bool',True)])
+   ('enabled','Enable background auto-start while idle','bool',True)]),
+'Advanced Key':('key_action',[
+   ('key_name','Virtual Key Name (e.g. Alt, Tab, Shift)','text','Alt'),
+   ('action','Key Action','choice','Hold',['Press','Hold','Release'])])
 }
 
 
@@ -2237,7 +2250,8 @@ def sequent_xlsx_write(path,columns,rows):
 DYNAMIC_ACTION_TYPES = frozenset({
     'ui_element', 'smart_wait', 'ocr_extract', 'if_dynamic', 'else_dynamic',
     'end_if', 'loop_start', 'loop_end', 'find_image', 'recovery',
-    'data_load', 'data_save', 'data_set', 'trigger_start'
+    'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action',
+    'search_area', 'if_var', 'label', 'goto', 'clip_fallback'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end'})
 
@@ -2534,8 +2548,31 @@ class SequentDynamicEngine:
             result = {'table':name,'row':index,'column':col}
         elif typ in ('trigger_start','if_dynamic','else_dynamic','end_if','loop_start','loop_end'):
             pass # Control-flow actions are interpreted by run_program.
+
+        elif typ == 'key_action':
+            key_str = self.interpolate(action.get('key_name', '')).strip().upper()
+            sub_action = action.get('action', 'Hold')
+            
+            vk_map = {"ALT": VK_MENU, "TAB": VK_TAB, "CTRL": VK_CONTROL, 
+                      "SHIFT": VK_SHIFT, "WIN": VK_LWIN}
+            vk = vk_map.get(key_str)
+            if not vk and len(key_str) == 1:
+                vk = ctypes.windll.user32.VkKeyScanW(ord(key_str)) & 0xFF
+                
+            if not vk:
+                raise MacroExecutionError(f"Unknown key mapping for: {key_str}")
+                
+            if sub_action == 'Hold':
+                hold_virtual_key(vk)
+            elif sub_action == 'Release':
+                release_virtual_key(vk)
+            else:
+                press_virtual_key(vk)
+            result = {'key': key_str, 'action': sub_action}
+        
         else:
             raise MacroExecutionError(f'Unsupported dynamic action: {typ}')
+    
         self.last_result = {'type':typ,'success':True,**result}
         self.app.variables['_last_action'] = typ
         self.app.variables['_last_success'] = 'true'
@@ -2653,13 +2690,40 @@ class SequentDynamicEngine:
                 index+=1;continue
             if typ=='search_area':
                 target=action.get('text','').strip()
-                raw=self.app.ocr_screen_area(*dynamic_area(action.get('area')))
-                if raw.startswith('ERR:'):raise MacroExecutionError(raw)
-                if ((action.get('match_any') and bool(raw.strip())) or
-                    (target and target.casefold() in raw.casefold())):
-                    return {'switch':'preset','target':action.get('preset','')}
+                match_found = False
+                
+                # Check up to 5 times over 1 second to account for UI loading lag
+                for _ in range(5):
+                    raw=self.app.ocr_screen_area(*dynamic_area(action.get('area')))
+                    if raw.startswith('ERR:'):raise MacroExecutionError(raw)
+                    clean_target = "".join(ch for ch in target.casefold() if ch.isalnum())
+                    clean_raw = "".join(ch for ch in raw.casefold() if ch.isalnum())
+                    if ((action.get('match_any') and bool(raw.strip())) or
+                        (clean_target and clean_target in clean_raw)):
+                        match_found = True
+                        break
+                    self._pause(0.2, idle=idle)
+                    
+                if match_found:
+                    # Use the native 'preset' router, which automatically handles the paths and .json extensions
+                    return {'switch': 'preset', 'target': action.get('preset', '')}
                 index+=1;continue
+            
             if typ=='trigger_start':index+=1;continue
+            
+            if typ == 'clip_fallback':
+                cb_text = get_clipboard_text().casefold()
+                keywords = [k.strip().casefold() for k in action.get('keywords', []) if k.strip()]
+                
+                # Check if ANY of the keywords exist in the clipboard text
+                match_found = any(kw in cb_text for kw in keywords)
+                
+                # If NONE of them are found, abort and run the preset
+                if not match_found:
+                    return {'switch': 'preset', 'target': action.get('preset', '')}
+                
+                index += 1; continue
+
             result=self.run_action_with_recovery(action,idle=idle)
             if result.get('goto'):
                 target=next((i for i,a in enumerate(actions) if a.get('type')=='label' and a.get('name')==result['goto']),None)
@@ -2667,7 +2731,13 @@ class SequentDynamicEngine:
                 frames.clear();index=target+1;continue
             index+=1
             if not idle:
-                self._pause(max(0.01,self.app.action_delay/max(0.1,self.app.playback_speed)),idle=False)
+                # Bypass the standard global delay for raw mouse movements so they play fluidly
+                if typ not in ('move', 'drag'):
+                    self._pause(max(0.01, self.app.action_delay / max(0.1, self.app.playback_speed)), idle=False)
+                else:
+                    # Give a tiny 1ms breather to prevent locking the thread during long drags
+                    self._pause(0.001, idle=False)
+            
         if frames:raise MacroExecutionError('Unclosed loop in workflow')
         return {'completed':True,'next_index':len(actions),'steps':executed}
 
@@ -2688,8 +2758,10 @@ class VSCodeQueueViewer(tk.Frame):
         )),
         ("Variables & Inputs", (
             ("Read Clipboard", "Capture and inspect clipboard contents.", "CB"),
+            ("Clipboard Branch / Fallback", "If keywords are missing, run a preset.", "🔀"),
             ("Request Input", "Ask the user for a value at runtime.", "IN"),
             ("Type Variable", "Type the value of a saved variable.", "VAR"),
+            ("Advanced Key", "Press, hold, or release a specific key.", "⌨️"),
         )),
         ("Logic & Flow", (
             ("If Variable Condition", "Branch based on a variable comparison.", "IF"),
@@ -3193,6 +3265,7 @@ class VSCodeQueueViewer(tk.Frame):
             "disclaimer": "Disclaimer / Warning",
             "if_var": "If Variable Condition",
             "read_clipboard": "Read Clipboard",
+            "clip_fallback": "Clipboard Branch / Fallback",
             "prompt_input": "Request Input",
             "type_variable": "Type Variable",
             "search_area": "Search selected area",
@@ -3204,6 +3277,7 @@ class VSCodeQueueViewer(tk.Frame):
             **{spec[0]: label for label,spec in DYNAMIC_ACTION_SPECS.items()},
             "label": "Label Marker",
             "goto": "Jump to Label",
+            
         }
         edit_action = None
         if edit_idx is not None:
@@ -3563,6 +3637,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Disclaimer / Warning": self._render_disclaimer_view,
             "If Variable Condition": self._render_if_var_view,
             "Read Clipboard": self._render_read_clipboard_view,
+            "Clipboard Branch / Fallback": self._render_clipboard_fallback_view,
             "Request Input": self._render_request_input_view,
             "Type Variable": self._render_type_variable_view,
             "Search selected area": self._render_search_area_view,
@@ -3867,6 +3942,62 @@ class VSCodeQueueViewer(tk.Frame):
         btn_txt = "Save Changes" if edit_idx is not None else "Add Clipboard Search"
         ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
+    def _render_clipboard_fallback_view(self, line_num, edit_idx=None):
+        body = self.action_content_frame
+        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
+
+        tk.Label(body, text="Keywords to find (comma separated):", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
+        kw_entry = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        kw_entry.pack(fill=tk.X, ipady=3, pady=(0, 8))
+        init_kws = ", ".join(curr_act.get("keywords", [])) if (curr_act and curr_act.get("type") == "clip_fallback") else "Success, OK, Done"
+        kw_entry.insert(0, init_kws)
+
+        tk.Label(body, text="If NONE are found, Run Preset:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
+        preset_names = self.app.get_preset_names()
+        init_preset = curr_act.get("preset", "") if (curr_act and curr_act.get("type") == "clip_fallback") else ""
+        chosen_preset = init_preset if init_preset in preset_names else (preset_names[0] if preset_names else "-- No Presets Found --")
+        preset_var = tk.StringVar(value=chosen_preset)
+
+        opt_preset = tk.OptionMenu(body, preset_var, *(preset_names if preset_names else ["-- No Presets Found --"]))
+        opt_preset.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+        opt_preset["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        opt_preset.pack(fill=tk.X, pady=(0, 8))
+
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f"Before Line {line_num}")
+            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
+            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(0, 10))
+
+        def submit():
+            raw_kws = [k.strip() for k in kw_entry.get().split(",") if k.strip()]
+            target_preset = preset_var.get()
+            if not raw_kws or target_preset == "-- No Presets Found --":
+                return
+
+            new_act = {
+                "type": "clip_fallback",
+                "keywords": raw_kws,
+                "preset": target_preset
+            }
+
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = new_act
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(edit_idx)
+                self.app.update_status("Updated Clipboard Fallback", COLOR_SUCCESS)
+            else:
+                is_after = "After" in pos_var.get()
+                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(insert_idx, new_act)
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.update_status("Added Clipboard Fallback", COLOR_SUCCESS)
+            self.close_sub_menu()
+
+        btn_txt = "Save Changes" if edit_idx is not None else "Add Clipboard Fallback"
+        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
     def _render_type_variable_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
@@ -6228,6 +6359,22 @@ class BuiltInMacroApp:
         self.root = root
         self.root.title("Sequent")
 
+        # 1. Tell Windows this is a distinct app so it gets its own taskbar grouping
+        if os.name == 'nt':
+            try:
+                myappid = 'sequent.macro.engine.1' # Arbitrary unique ID
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+            except Exception:
+                pass
+
+        # 2. Apply the icon to the window and taskbar
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sequentTempLogo.ico")
+        if os.path.exists(icon_path):
+            try:
+                self.root.iconbitmap(icon_path)
+            except Exception:
+                pass
+
         # Dynamic DPI Scaling & Centering
         self.dpi_scale = get_dpi_scale()
         win_w = int(1150 * self.dpi_scale)
@@ -6241,7 +6388,7 @@ class BuiltInMacroApp:
         # Also protect programmatic size changes (not only edge-drag handles).
         self.root.minsize(int(940 * self.dpi_scale), int(700 * self.dpi_scale))
         self.root.configure(bg=BG_APP)
-        self.root.attributes('-topmost', True)
+        self.root.attributes('-topmost', False)
 
         # Use a *managed* Windows window with a custom-painted client area.
         # The former override-redirect + geometry() resize path remains only
@@ -7542,7 +7689,7 @@ class BuiltInMacroApp:
                 defaultextension=".chain.json", filetypes=[("Sequent Chain", "*.chain.json"), ("JSON Files", "*.json")]
             )
         finally:
-            self.root.attributes('-topmost', True)
+            self.root.attributes('-topmost', False)
 
         if file_path:
             try:
@@ -7561,7 +7708,7 @@ class BuiltInMacroApp:
                 filetypes=[("Sequent Chain", "*.chain.json"), ("JSON Files", "*.json"), ("All Files", "*.*")]
             )
         finally:
-            self.root.attributes('-topmost', True)
+            self.root.attributes('-topmost', False)
 
         if file_path:
             try:
@@ -7869,6 +8016,19 @@ class BuiltInMacroApp:
             return "📋 command.copy()"
         elif act_type == "paste": 
             return "📌 command.paste()"
+        elif act_type == "key_action":
+            sub = action.get('action', 'Hold')
+            key_name = action.get('key_name', '')
+            if sub == 'Hold':
+                return f"⬇️ keyboard.hold('{key_name}')"
+            elif sub == 'Release':
+                return f"⬆️ keyboard.release('{key_name}')"
+            else:
+                return f"⌨️ keyboard.press('{key_name}')"
+        elif act_type == "clip_fallback":
+            kws = action.get('keywords', [])
+            preview = kws[0] if len(kws) == 1 else f"{len(kws)} keywords"
+            return f"🔀 clipboard.fallback(miss='{preview}' ➔ preset '{action.get('preset', '')}')"
         return f"{act_type}"
         
 
@@ -9140,7 +9300,7 @@ try {{
                         filetypes=[("Audio Files", "*.wav *.mp3"), ("WAV Audio", "*.wav"), ("MP3 Audio", "*.mp3")]
                     )
                 finally:
-                    self.root.attributes('-topmost', True)
+                    self.root.attributes('-topmost', False)
                 if path:
                     CUSTOM_SOUND_PATHS[cue_key] = path
                     lbl_path.config(text=self.shorten_path(path), fg=SYNTAX_GREEN)
@@ -9604,7 +9764,7 @@ try {{
         try:
             chosen = filedialog.askdirectory(parent=self.root, initialdir=self.presets_dir, title="Select Macro Presets Folder")
         finally:
-            self.root.attributes('-topmost', True)
+            self.root.attributes('-topmost', False)
 
         if chosen:
             self.presets_dir = os.path.abspath(chosen)
@@ -9711,7 +9871,7 @@ try {{
                 defaultextension=".json", filetypes=[("JSON Macro File", "*.json"), ("All Files", "*.*")]
             )
         finally:
-            self.root.attributes('-topmost', True)
+            self.root.attributes('-topmost', False)
 
         if file_path:
             try:
@@ -9731,7 +9891,7 @@ try {{
                 filetypes=[("JSON Macro File", "*.json"), ("All Files", "*.*")]
             )
         finally:
-            self.root.attributes('-topmost', True)
+            self.root.attributes('-topmost', False)
 
         if file_path:
             try:
