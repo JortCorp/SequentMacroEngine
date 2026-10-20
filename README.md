@@ -6,7 +6,7 @@ Sequent combines a macro recorder, an editable action queue, screen recognition,
 
 Built with Python's standard library and native Windows APIs. **No third-party Python packages are required.** An **optional experimental C DLL** is available for fully borderless, natively resizable windows.
 
-> **Development status:** Sequent is actively developed and should be treated as experimental, especially its new native window chrome and screen-based targeting. The features below describe the current development source (v6.6); the public repository may lag until the corresponding code is committed. Test workflows in a safe application before using them with important data.
+> **Development status:** Sequent is actively developed and should be treated as experimental, especially native window chrome, OCR, image matching, and screen-based targeting. This README documents the **latest local development source** (including the post-v6.6 fixes and interface updates). The GitHub repository may not include these changes until they are committed. Test workflows in a safe application before using them with important data.
 
 ## Contents
 
@@ -15,10 +15,13 @@ Built with Python's standard library and native Windows APIs. **No third-party P
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Find Color & Click](#find-color--click)
+- [Search Selected Area](#search-selected-area)
 - [Workspace and debugger](#workspace-and-debugger)
 - [Actions and automation logic](#actions-and-automation-logic)
+- [Advanced automation and data workflows](#advanced-automation-and-data-workflows)
 - [Presets and macro chains](#presets-and-macro-chains)
 - [Appearance and window management](#appearance-and-window-management)
+- [Custom vector icons](#custom-vector-icons)
 - [Hotkeys](#hotkeys)
 - [Troubleshooting and limitations](#troubleshooting-and-limitations)
 - [Contributing and license](#contributing-and-license)
@@ -30,6 +33,8 @@ Built with Python's standard library and native Windows APIs. **No third-party P
 - Capture keyboard input, shortcuts, clicks, movement, dragging, and wheel scrolling using Windows APIs and low-level hooks.
 - Watch events appear in the live Action Queue, then reorder your workflow by inserting, editing, or removing actions.
 - Replay with pause/stop controls, loops, adjustable speed, window-relative coordinates, and optional Bézier mouse movement or timing variation.
+- Run recorded-only and mixed conditional/dynamic workflows through the **same execution engine** rather than switching playback behavior based on the actions in the queue.
+- Preserve mouse-drag button, duration, and window-relative endpoints; support basic cursor movement even when mouse-smoothing options are disabled.
 - Use the compact Mini HUD when you want playback controls without the full workspace visible.
 
 ### Build visually
@@ -39,18 +44,26 @@ Built with Python's standard library and native Windows APIs. **No third-party P
 - Preview mouse positions with an on-screen **Ghost Reticle**, including multi-action trajectory previews.
 - Add OCR, pixel checks, variables, prompts, and control-flow actions to turn a recording into a more adaptive workflow.
 - Combine saved presets into repeatable, multi-stage **Macro Chains**.
+- Work with **native-drawn toolbar and action icons**, rather than relying on emoji glyphs that vary by font or Windows version.
+- Keep **Record, Run, and Pause** accessible in a pinned controls section when the window is resized shorter; scroll to reach secondary transport settings.
 
 ### New in the latest development build
 
 | Area | Improvements |
 | --- | --- |
-| Color targeting | Connected-color-region detection, adjustable RGB tolerance, selectable anchors, and relative click offsets |
-| Visual editor | Draggable Ghost Reticle that can sit **inside or outside** the detected bounds, keyboard nudging, and live detection feedback |
-| Action editing | Double-click **Find Color & Click** to redefine search bounds, resample color, and preserve saved targeting options |
-| Click reliability | Shared targeting calculations across playback paths, cursor-settle checks, and checked `SendInput` click events |
-| Appearance | **Dark / Light / Match System** themes, saved accent colors, custom color picker with hue, saturation/brightness, HEX/RGB input, and presets |
-| Window chrome | Custom headers and live Windows-managed resizing; optional experimental native borderless DLL with safe fallback modes |
-| Stability | 64-bit GDI handle signatures, shared `POINT` type for cursor polling, and cleaner terminal interrupt handling |
+| Visual design | Custom Tkinter Canvas icon system for playback, navigation, toolbar actions, Action Library, search tools, and Mini HUD; hover, theme, and live-state updates |
+| Compact layouts | **Record / Run / Pause** pinned near the top of the Controls dock; secondary transport, playhead, and reticle options in a scrollable section |
+| Search Selected Area | Exact **Win32 virtual-screen coordinates** for the desktop selection, negative-monitor support, rectangle validation, and **Preview Actual Search Area** |
+| Color targeting | Connected-color-region detection with an optimized scanner, RGB tolerance, selectable anchors, and freely offset click targets |
+| Visual editor | Draggable Ghost Reticle **inside or outside** the match bounds, keyboard nudging, live detection feedback, and a shared preview/execution target calculation |
+| Playback consistency | Single structured interpreter for regular playback, chains, and debugger steps; consistent branching and legacy action handling |
+| Mouse & keyboard reliability | Preserved drag button/duration/window offsets; cursor settle checks; checked Win32 input; Unicode `SendInput` including surrogate pairs |
+| Safer cancellation | Cancelling a disclaimer aborts the macro; stopped searches and waits do not continue into a late click; cancellation is not handled as a retryable error |
+| Advanced workflows | Windows UI Automation selectors, image matching, smarter waits, conditions and loops, OCR-to-variable, CSV/XLSX actions, recovery rules, and triggers |
+| Appearance & window chrome | **Dark / Light / Match System** modes, custom accent picker, Windows-managed resizing, and an optional experimental native borderless DLL |
+| Stability | 64-bit handle/pointer signatures, shared `POINT` geometry, monitored screen bounds, and cleaner terminal interrupt handling |
+
+These are **implemented features in the development source**, not a claim that every possible Windows application, monitor layout, or DPI configuration has been tested.
 
 ## Requirements
 
@@ -60,6 +73,8 @@ Built with Python's standard library and native Windows APIs. **No third-party P
 | Python | Python 3.8+ with Tkinter; behavior can vary by Python/Tk and Windows version |
 | Python dependencies | Standard library only (`ctypes`, `tkinter`, `threading`, `json`, `winsound`, etc.) |
 | OCR | Windows OCR support and an installed OCR language pack |
+| Smart UI Element | Windows PowerShell 5.1 and built-in Microsoft UI Automation assemblies |
+| Spreadsheet / image actions | Built-in Python CSV/ZIP/XML tools and Windows GDI/GDI+; no third-party Python packages |
 | Optional native borderless mode | 64-bit Windows/Python; MSVC C++ Build Tools and the Windows SDK to compile the included DLL |
 
 OCR uses Windows' `Windows.Media.Ocr` through a PowerShell/WinRT bridge. **Administrator privileges are not a blanket requirement**, but Windows input security prevents Sequent from controlling some elevated, protected, or security-sensitive interfaces.
@@ -84,7 +99,7 @@ OCR uses Windows' `Windows.Media.Ocr` through a PowerShell/WinRT bridge. **Admin
 
 4. Open **Settings** to configure the appearance, preset paths, hotkeys, and playback preferences.
 
-**No `pip install` step is needed** to run the Python application. The native window DLL described below is optional and is **not** included as a compiled binary in the v6.6 source bundle.
+**No `pip install` step is needed** to run the Python application, use the vector icons, or read/write CSV and XLSX files. The native window DLL described below is optional; build it from its C source if you want to try the experimental borderless mode.
 
 ## Quick start
 
@@ -97,6 +112,8 @@ OCR uses Windows' `Windows.Media.Ocr` through a PowerShell/WinRT bridge. **Admin
 5. Inspect the Action Queue and edit any unwanted actions.
 6. Run with **Run Macro** or `F9`; stop with `F10`.
 
+The **Record, Run, and Pause** controls stay pinned above the scrollable transport panel, and the buttons use custom-drawn icons that reflect their current state.
+
 > **Privacy:** A macro recorder can capture sensitive typing and clipboard contents. Avoid recording passwords, tokens, private messages, or confidential data. Review exported presets before sharing them.
 
 ### 2. Modify an action
@@ -108,7 +125,16 @@ OCR uses Windows' `Windows.Media.Ocr` through a PowerShell/WinRT bridge. **Admin
 
 ### 3. Add a smarter wait
 
-Instead of assuming a page finishes loading after a fixed delay, add **Wait for Text** or **Wait Pixel**, configure its expected result and search position, then test how it behaves when the application is slow or the result is missing.
+Instead of assuming a page finishes loading after a fixed delay, add **Wait for Text**, **Wait Pixel**, or **Smart Wait & Retry**. Configure the expected result, screen area or selector, and timeout; then test how the macro behaves when the application is slow or the result is missing.
+
+### 4. Preview a saved screen search
+
+1. Add **Search Selected Area** from the Action Library, or double-click an existing one.
+2. Use **Snip** and drag around the part of the desktop that should be searched.
+3. Click **Preview Actual Search Area** to highlight the saved rectangle without running the macro.
+4. Save the action only after confirming its location and dimensions.
+
+See [Search Selected Area](#search-selected-area) for multi-monitor and DPI notes.
 
 ## Find Color & Click
 
@@ -155,6 +181,42 @@ A color action in an exported JSON preset can look like this:
 
 **Important limitations:** The preview outlines a **rectangular bounding box**, not a traced pixel-perfect silhouette. Matching chooses the largest connected region; multiple similar-colored objects or changes in lighting, scaling, and antialiasing can still affect the result. An accepted synthetic mouse event does not guarantee the target application acts on it. Test each visual target carefully.
 
+The connected-component scanner has been optimized for larger search regions while maintaining the same connected-object selection behavior. Searches still analyze a fixed rectangular area in **screen pixels**, and visually similar neighboring objects can affect the result.
+
+## Search Selected Area
+
+**Search Selected Area** performs OCR inside a rectangle you select on the desktop. It can match a specific phrase or use **Match Any Detected Text**, then switch to a chosen saved macro preset if a match is found.
+
+### Capture and inspect the correct rectangle
+
+1. Add or edit **Search Selected Area** in the Action Queue.
+2. Click **Snip** and drag over the desired region. The desktop picker takes its saved points from native Windows `GetCursorPos`, not Tkinter's potentially DPI-virtualized mouse-event coordinates.
+3. The saved area is stored as **`[x, y, width, height]`** in absolute **virtual-desktop pixels**. Dragging in either direction is supported; the picker clamps the selected area to the current virtual desktop.
+4. Select **Preview Actual Search Area** to draw an outline of the **exact saved rectangle** and show its position and dimensions before running the macro.
+5. Choose a target phrase (or **Match Any Detected Text**) and a saved preset to run on success; then save.
+
+### Multi-monitor behavior and limits
+
+- Monitors positioned **to the left or above** the primary screen can have **negative coordinates**; these are supported.
+- Saved rectangles are checked against the **current** virtual desktop. If a monitor disconnects or the layout changes and the rectangle no longer fits, Sequent raises an error and asks you to reselect it rather than quietly shifting or truncating the search.
+- Search regions are **absolute desktop locations**. They do **not** automatically follow a target window when that window moves; reselect the area after rearranging windows or monitors.
+- The visible content of the selected rectangle still matters. Overlapping windows, scroll position, resolution, scaling, and OCR recognition quality can affect results.
+- The **Preview Actual Search Area** outline is a diagnostic aid; confirm it before running any potentially destructive automation.
+
+Example search action:
+
+```json
+{
+  "type": "search_area",
+  "text": "Ready",
+  "area": [100, 120, 640, 320],
+  "preset": "NextStage",
+  "match_any": false
+}
+```
+
+The runtime makes several short OCR attempts before deciding whether to switch presets; a failed match leaves the workflow to continue to the next action.
+
 ## Workspace and debugger
 
 | Workspace | Purpose | Key tools |
@@ -165,9 +227,11 @@ A color action in an exported JSON preset can look like this:
 
 **Guided Tour:** A 12-step, non-destructive walkthrough introduces the interface, recording, presets, Mini HUD, debugger, and sequencer. Open it from the sidebar or **Settings → Help & Onboarding**.
 
-**Mini HUD:** A small floating control panel for pause/resume, stop, and returning to the main workspace.
+**Mini HUD:** A small floating control panel with custom-drawn controls for pause/resume, stop, and returning to the main workspace.
 
-**Debugging:** Queue line numbers, click-to-select playhead navigation, breakpoints, step execution, and visual reticles help you inspect a macro rather than replay the entire sequence each time.
+**Compact window behavior:** The **Record, Run, and Pause** buttons are pinned below the Controls header so they are not pushed out by the transport panel when the window is made shorter. Scroll the remainder of the Controls dock for step controls, playhead, loop settings, the active-action readout, and reticle settings. Extremely small sizes remain limited by Windows/Tk minimum geometry.
+
+**Debugging:** Queue line numbers, click-to-select playhead navigation, breakpoints, step execution, and visual reticles help you inspect a macro rather than replay the entire sequence each time. Regular playback, macro chains, and single-step execution use the same action dispatcher to reduce discrepancies between workflows.
 
 ## Actions and automation logic
 
@@ -175,21 +239,69 @@ The queue displays readable *action summaries*, not executable Python code. Crea
 
 | Action | Purpose |
 | --- | --- |
-| Mouse move / click / drag / scroll | Interact at a recorded position or follow the recorded mouse path |
-| Keyboard type / press / hotkey | Enter text and send key combinations |
+| Mouse move / click / drag / scroll | Interact at a recorded position or follow a recorded mouse path; drag playback retains button, duration, and window-relative endpoints |
+| Keyboard type / press / hotkey | Enter text and send key combinations; Unicode typing uses native `SendInput` for characters without a standard virtual key |
 | Delay | Wait a specified amount of time |
 | Wait Pixel | Wait for a pixel to match a chosen color |
 | Wait for Text | Watch a screen region for OCR text to appear or disappear |
-| Search selected area | OCR a region and optionally branch to a preset |
+| **Search Selected Area** | OCR a native-screen-pixel rectangle; match a phrase or any detected text, then optionally switch presets |
 | **Find Color & Click** | Locate a connected color region and move/click at an anchored, offset position |
+| **Find Text & Click** | Locate a text bounding box with Windows OCR and move/click relative to its anchor |
+| **Find Image & Click** | Match an image template to a desktop region and move/click relative to the detected bounds |
+| **Smart UI Element & Click** | Find a Windows accessibility/UI Automation element by name, ID, or control type |
 | Read Clipboard | Detect keywords and store a value in a variable |
 | Request Input | Ask the user for a value during playback |
 | Type Variable | Type the current contents of a variable |
-| If Variable Condition | Branch according to a variable comparison |
+| If Variable Condition | Compare a variable and jump to a label, switch presets, or run another saved file |
+| **IF / ELSE / END IF** | Evaluate conditions and execute only the matching action block |
+| **LOOP Start / LOOP End** | Repeat by count, while/until conditions, or each row of a loaded table |
+| **Smart Wait & Retry** | Wait for text, windows, colors, images, UI controls, files, clipboard values, or variables |
+| **OCR → Variable** | Capture OCR text or a regex match into a variable |
+| **Load / Export CSV or Excel** | Import or export tables without pandas or openpyxl |
+| **Update Table Cell** | Write or update a cell in the current table row |
+| **Recovery Policy** | Choose stop/skip/fallback label, retry count/delay, and optional failure screenshot |
+| **Auto-start Trigger** | Start a workflow on eligible file, window, clipboard, or authenticated local webhook events |
+| **Advanced Key** | Press, hold, or release a selected virtual key |
 | Label / Jump to Label | Mark a location and jump to it |
-| Disclaimer / Warning | Display a user-facing message during execution |
+| Disclaimer / Warning | Display a user-facing message; cancelling **aborts** the macro |
 
-OCR and visual recognition are best-effort. A failed match, timeout, or unexpected UI state may stop a workflow; avoid blindly repeating destructive actions.
+OCR and visual recognition are best-effort. A failed match, timeout, or unexpected UI state may stop a workflow; avoid blindly repeating destructive actions. When **Stop** is requested during a target search or text wait, the interpreter does not proceed to a late click. A cancelled disclaimer is treated as user cancellation, not a retryable error.
+
+### Playback engine and input consistency
+
+- **One interpreter:** Recording-only macros, macros with conditions, chains, and the debugger execute through the same structured action pipeline. Adding a dynamic action no longer selects a different legacy playback loop.
+- **Recorded drags:** Left/right button, recorded duration, and window-relative start/end positions are honored; the button is released after the drag even if execution fails.
+- **Mouse movement:** Movement continues to execute with both Fluid Mouse and Human Bézier switched off. Bézier movement remains optional.
+- **Text entry:** Native Windows `SendInput` handles UTF-16 scan codes, including surrogate pairs used by some emoji; the target application may still choose how it handles injected keystrokes.
+- **Control flow:** Older variable-condition actions without an explicit target type default to their legacy **preset** behavior.
+- **Click checks:** Mouse targeting uses cursor settle checks and reports Win32 injection failures instead of assuming every click was accepted.
+
+## Advanced automation and data workflows
+
+These tools are available from the **Action Library** and use native Windows facilities or Python's standard library—**no `pip install` commands**.
+
+### UI Automation, images, and OCR
+
+- **Smart UI Element & Click** searches Microsoft's accessibility tree by a window title substring, accessible name, Automation ID, and/or control type. It uses Windows PowerShell 5.1 with Microsoft's built-in UI Automation assemblies; it does **not** import the third-party `uiautomation` Python package. You can capture a selector from a recorded click where the target exposes accessibility metadata.
+- **Find Image & Click** searches for an image template in a screen rectangle using Windows image APIs and Python image-matching logic, then reuses anchored move/click positioning. Image appearance, UI scaling, and confidence thresholds affect reliability.
+- **OCR → Variable** reads a rectangle, saves the full text or a regex capture group, and exposes it to subsequent actions using `${variable_name}` interpolation.
+- **Smart Wait & Retry** supports appearing/disappearing conditions with configurable timeout and polling interval. It can watch text, window titles, colors, images, UI elements, clipboard values, files, and variables.
+
+### Conditions, loops, and recovery
+
+Use **IF (Dynamic Condition)** / **ELSE** / **END IF** for branching and **LOOP Start** / **LOOP End** for counted, while/until, and table-row repetition. Conditions support **ALL** or **ANY** grouping. Place labels and jumps where you want explicit control flow.
+
+A **Recovery Policy** can define retries, retry delays, skip/stop behavior, jumping to a fallback label, and an optional screenshot on final failure. Recovery is intended for ordinary action errors; **explicit user cancellation is never automatically retried**.
+
+### CSV and Excel without dependencies
+
+Use **Load CSV / Excel** to read a `.csv` or `.xlsx` file into a named table, **LOOP Start → for_each** to iterate rows, **Update Table Cell** to edit values, and **Export CSV / Excel** to save results. CSV uses `csv`; XLSX uses the built-in ZIP and XML tooling rather than `openpyxl` or pandas. Keep input files backed up when testing write operations.
+
+### Auto-start triggers
+
+An **Auto-start Trigger** must be placed as the **first action**. While Sequent is open and idle, it can react to a newly seen window, a changed clipboard state, or a new/modified matching file. Webhook mode accepts local requests on **`127.0.0.1`** with an `X-Sequent-Token` header. For webhook mode, set an unpredictable **`SEQUENT_WEBHOOK_TOKEN`** environment variable (at least 12 characters) before launching Sequent. The listener is intentionally loopback-only.
+
+Triggers are edge-based and best-effort, not a substitute for a system scheduling service. Do not expose the local listener to an untrusted network.
 
 ## Presets and macro chains
 
@@ -228,7 +340,7 @@ Go to **Settings → Appearance**:
 - **Match System** — follow Windows' app-theme preference while Sequent runs.
 - **Accent Color** — choose a quick swatch, enter a HEX value, or open **Customize...** for Sequent's own color editor.
 
-The custom picker has a hue strip, saturation/brightness selection, HEX and RGB fields, before/after preview, and **Apply/Cancel**. Accent changes update supported interface elements, including the **MACRO WORKSPACE** branding. Appearance settings persist in `settings.json`; older `light_mode` settings are supported for compatibility.
+The custom picker has a hue strip, saturation/brightness selection, HEX and RGB fields, before/after preview, and **Apply/Cancel**. Accent changes update supported interface elements, including the **MACRO WORKSPACE** branding and compatible vector icon controls. Appearance settings persist in `settings.json`; older `light_mode` settings are supported for compatibility.
 
 ### Custom window chrome (experimental)
 
@@ -239,7 +351,7 @@ Sequent uses custom-painted headers while preserving Windows-managed movement an
 To try the optional mode on **Windows x64**:
 
 1. Install **Visual Studio Build Tools** with **Desktop development with C++** and a Windows SDK.
-2. Ensure the repository includes the `native` directory from the v6.6 source package.
+2. Ensure the repository includes the `native` directory from the source package.
 3. Open an **x64 Native Tools Command Prompt for VS** in the project directory.
 4. Build:
 
@@ -271,6 +383,19 @@ Set one mode before each launch; these examples show alternatives, not commands 
 
 > **Technical note:** The native code handles `WM_NCCALCSIZE` and `WM_NCHITTEST` without a Python `WNDPROC` callback. This is intended to avoid the GIL-related interpreter crash observed when resizing through a Python-level window subclass. Native behavior still needs real Windows testing across different displays and versions.
 
+## Custom vector icons
+
+Sequent's updated interface uses a lightweight **`SequentIcon`** renderer built from Tkinter `Canvas` shapes instead of emoji, bitmap image files, third-party SVG packages, or special icon fonts.
+
+- **Playback:** Record, Play, Pause/Resume, Stop, previous/next, and Step controls.
+- **Navigation:** Playback, Sequencer, Settings, and Guided Tour icons.
+- **Action Library:** Consistent symbols for screen recognition, timing, input, files, conditions, and other action families.
+- **Toolbars and editors:** Import, Export, Search, Save, Refresh, Snip, preview, targeting, and related actions.
+- **Mini HUD:** Matching visual controls in the compact floating view.
+- **Interaction:** Colors update for themes, hover, and changing button states (for example, Record → Stop Recording and Pause → Resume).
+
+The renderer uses native Tk Canvas geometry and needs **no icon downloads, assets folder, font installation, or Python dependencies**. Some ordinary UI text and non-button symbols may still use Unicode; this feature replaces the key **interactive iconography**, not every Unicode character in the application.
+
 ## Hotkeys
 
 | Default | Action |
@@ -285,7 +410,7 @@ Global hotkeys can be changed under **Settings → Global Hotkeys**. Other pause
 ## Troubleshooting and limitations
 
 **Recording crashes with `expected LP_POINT instance`**  
-Update to the latest source. A previous window-motion implementation changed the shared `GetCursorPos` signature to an incompatible local structure type; the v6.6 source uses the common `POINT` type.
+Update to the latest source. A previous window-motion implementation changed the shared `GetCursorPos` signature to an incompatible local structure type; the updated development source uses the common `POINT` type.
 
 **The window has a border or resizing behaves unexpectedly**  
 The compiled native borderless DLL is optional and experimental. Set `SEQUENT_WINDOW_MODE=legacy` for the safer thin-frame resizing mode, or `native` for normal Windows decorations. Include your Windows/Python versions and a screenshot when reporting a problem.
@@ -293,11 +418,26 @@ The compiled native borderless DLL is optional and experimental. Set `SEQUENT_WI
 **Find Color & Click misses, flickers, or clicks the wrong point**  
 Confirm the search rectangle, sampled HEX color, RGB tolerance, anchor, and offsets. Review the live bounding box and reticle. Avoid capturing multiple disconnected objects of the same color in one search region. For click delivery failures, verify that **When found** is not **Move Only** and that the target accepts simulated input.
 
+**Search Selected Area scans the wrong location or stops after display changes**  
+Open the action and click **Preview Actual Search Area**. Reselect the region after moving the target window, disconnecting a monitor, changing its arrangement, or altering display scaling. The saved rectangle uses absolute screen pixels and does not follow a particular window automatically. A rectangle outside the current desktop now produces a clear error rather than being silently moved.
+
+**Record / Run / Pause disappear when the window is short**  
+Use the latest Controls dock with pinned execution buttons. Secondary transport controls are in a scrollable panel beneath them; check the application's minimum practical size if even the pinned header cannot fit.
+
+**Icons look different or do not update**  
+Use the updated source with `SequentIcon`. It draws icons locally through Tkinter and does not rely on emoji support or installing a font. If a particular label still shows an older Unicode symbol, it may be decorative text rather than a converted interactive icon.
+
 **OCR misses text**  
 Check the selected screen area, scaling, target text, language pack, and whether the text is visible. Windows OCR can be slow or inaccurate.
 
 **A macro is blocked by another application**  
 Some elevated, protected, remote, or specialized applications ignore synthetic input. Sequent cannot bypass the Windows secure desktop or guarantee access across integrity levels.
+
+**Smart UI Element cannot find a control**  
+Some applications, custom-rendered controls, and elevated windows do not expose stable accessibility metadata. Check the captured selector, window-title filter, target privilege level, and whether the control appears in Windows' accessibility tree.
+
+**XLSX / image actions behave unexpectedly**  
+These features use Windows APIs and standard-library implementations; no third-party package is required, but real-world workbook and image formats vary. Validate results against a small sample before using production files.
 
 **Closing from a terminal shows `KeyboardInterrupt`**  
 Ctrl+C interrupts Tkinter's event loop. The current development source handles this more gracefully; use Sequent's normal window controls for ordinary shutdown.
@@ -306,6 +446,6 @@ Ctrl+C interrupts Tkinter's event loop. The current development source handles t
 
 ## Contributing and license
 
-Issues, reproducible bug reports, documentation improvements, and pull requests are welcome in the [SequentMacroEngine repository](https://github.com/JortCorp/SequentMacroEngine). For GUI issues, include your Windows version, Python version, window mode, DPI scaling, exact reproduction steps, and relevant traceback (without sensitive information).
+Issues, reproducible bug reports, documentation improvements, and pull requests are welcome in the [SequentMacroEngine repository](https://github.com/JortCorp/SequentMacroEngine). For GUI issues, include your Windows version, Python version, window mode, DPI scaling, number/arrangement of monitors, exact reproduction steps, and relevant traceback (without sensitive information).
 
 Sequent is licensed under the **GNU General Public License v3.0 (GPL-3.0)**. See [LICENSE](LICENSE).
