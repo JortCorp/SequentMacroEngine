@@ -29,6 +29,10 @@ class MacroExecutionError(Exception):
     """Expected macro failure, such as an unmet verification condition."""
 
 
+class MacroCancelled(MacroExecutionError):
+    """A deliberate user abort; never retry, skip, or mark as a normal failure."""
+
+
 # --- Native Audio Feedback (Non-Blocking Kernel32 Beeps & WAVs) ---
 def play_cue(cue_type):
     global ACTIVE_SOUND_THEME, CUSTOM_SOUND_PATHS
@@ -110,6 +114,43 @@ def get_active_window_info():
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
+
+def configure_sequent_win32_signatures():
+    """Declare shared Win64-safe HWND/HMONITOR/HDC APIs before any GUI calls.
+
+    ctypes defaults to a 32-bit c_int return type without restype, which can
+    truncate real handles on x64. Reuse these same types across Sequent.
+    """
+    if os.name != 'nt':
+        return
+    user32 = ctypes.windll.user32
+    handle = ctypes.c_void_p
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = handle
+    user32.GetWindowTextW.argtypes = [handle, ctypes.c_wchar_p, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [handle, ctypes.c_void_p]
+    user32.GetWindowRect.restype = ctypes.c_int
+    user32.ScreenToClient.argtypes = [handle, ctypes.POINTER(POINT)]
+    user32.ScreenToClient.restype = ctypes.c_int
+    user32.ClientToScreen.argtypes = [handle, ctypes.POINTER(POINT)]
+    user32.ClientToScreen.restype = ctypes.c_int
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+    user32.GetCursorPos.restype = ctypes.c_int
+    user32.MonitorFromWindow.argtypes = [handle, ctypes.c_uint]
+    user32.MonitorFromWindow.restype = handle
+    user32.MonitorFromPoint.argtypes = [POINT, ctypes.c_uint]
+    user32.MonitorFromPoint.restype = handle
+    user32.GetMonitorInfoW.argtypes = [handle, ctypes.c_void_p]
+    user32.GetMonitorInfoW.restype = ctypes.c_int
+    user32.GetDC.argtypes = [handle]
+    user32.GetDC.restype = handle
+    user32.ReleaseDC.argtypes = [handle, handle]
+    user32.ReleaseDC.restype = ctypes.c_int
+
+
+configure_sequent_win32_signatures()
+
 def screen_to_client_pos(hwnd, x, y):
     pt = POINT(int(x), int(y))
     ctypes.windll.user32.ScreenToClient(hwnd, ctypes.byref(pt))
@@ -182,11 +223,18 @@ def get_dpi_scale():
     except Exception:
         pass
     try:
-        hdc = ctypes.windll.user32.GetDC(0)
-        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX = 88
-        ctypes.windll.user32.ReleaseDC(0, hdc)
-        if dpi > 0:
-            return dpi / 96.0
+        user32 = ctypes.windll.user32
+        hdc = user32.GetDC(None)
+        if hdc:
+            try:
+                gdi32 = ctypes.windll.gdi32
+                gdi32.GetDeviceCaps.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                gdi32.GetDeviceCaps.restype = ctypes.c_int
+                dpi = gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX = 88
+            finally:
+                user32.ReleaseDC(None, hdc)
+            if dpi > 0:
+                return dpi / 96.0
     except Exception:
         pass
     return 1.0
@@ -283,55 +331,87 @@ def find_ocr_word_match(words, target_text, match_any=False):
 
 
 def largest_color_component(raw, width, height, stride, rgb, tolerance=8):
-    """Return bounding box of largest 4-connected matching region, or None.
+    """Bounds of the largest 4-connected BGR color region (exclusive edges).
 
-    raw is a top-down 24-bit BGR screenshot; the returned box is relative to
-    that screenshot, with exclusive right and bottom edges. Isolated matches
-    never merge merely because they share a color.
+    Match pixels into a compact mask, then union overlapping horizontal runs.
+    This avoids allocating a Python queue entry for each matching pixel and
+    greatly reduces work on large solid regions. Separate same-color objects
+    stay separate; diagonal-only pixels are not connected.
     """
-    from collections import deque
-
+    if width <= 0 or height <= 0:
+        return None
     tolerance = max(0, min(255, int(tolerance)))
     tr, tg, tb = rgb
     mask = bytearray(width * height)
     for y in range(height):
-        row = y * stride
-        base = y * width
+        src = y * stride
+        dst = y * width
         for x in range(width):
-            idx = row + 3 * x
+            idx = src + 3 * x
             if (abs(raw[idx] - tb) <= tolerance and
                 abs(raw[idx + 1] - tg) <= tolerance and
                 abs(raw[idx + 2] - tr) <= tolerance):
-                mask[base + x] = 1
+                mask[dst + x] = 1
 
-    best_box = None
-    best_count = 0
-    for seed in range(len(mask)):
-        if not mask[seed]:
-            continue
-        mask[seed] = 0
-        pending = deque((seed,))
-        pixels = 0
-        x1, y1 = width, height
-        x2 = y2 = -1
-        while pending:
-            i = pending.popleft()
-            py, px = divmod(i, width)
-            pixels += 1
-            x1, y1 = min(x1, px), min(y1, py)
-            x2, y2 = max(x2, px), max(y2, py)
-            for neighbor in (i - width, i + width, i - 1, i + 1):
-                if ((neighbor == i - 1 and px == 0) or
-                    (neighbor == i + 1 and px == width - 1) or
-                    neighbor < 0 or neighbor >= len(mask)):
-                    continue
-                if mask[neighbor]:
-                    mask[neighbor] = 0
-                    pending.append(neighbor)
-        if pixels > best_count:
-            best_count = pixels
-            best_box = (x1, y1, x2 + 1, y2 + 1)
-    return best_box
+    # Run labels and aggregates are created lazily (one per run, not pixel).
+    parents, counts, bounds, first_seeds = [], [], [], []
+
+    def root(i):
+        while parents[i] != i:
+            parents[i] = parents[parents[i]]
+            i = parents[i]
+        return i
+
+    def merge(a, b):
+        a, b = root(a), root(b)
+        if a == b:
+            return a
+        if counts[a] < counts[b]:
+            a, b = b, a
+        parents[b] = a
+        counts[a] += counts[b]
+        x1, y1, x2, y2 = bounds[a]
+        xx1, yy1, xx2, yy2 = bounds[b]
+        bounds[a] = (min(x1, xx1), min(y1, yy1),
+                     max(x2, xx2), max(y2, yy2))
+        first_seeds[a] = min(first_seeds[a], first_seeds[b])
+        return a
+
+    previous = []
+    for y in range(height):
+        row_start = y * width
+        row_end = row_start + width
+        current = []
+        position = row_start
+        while (start := mask.find(1, position, row_end)) != -1:
+            end = mask.find(0, start, row_end)
+            if end < 0:
+                end = row_end
+            x1, x2 = start - row_start, end - row_start
+            label = len(parents)
+            parents.append(label)
+            counts.append(x2 - x1)
+            bounds.append((x1, y, x2, y + 1))
+            first_seeds.append(y * width + x1)
+            current.append((x1, x2, label))
+            position = end
+
+        # Overlap by at least one pixel means a vertical 4-neighbor link.
+        prev_cursor = 0
+        for x1, x2, label in current:
+            while prev_cursor < len(previous) and previous[prev_cursor][1] <= x1:
+                prev_cursor += 1
+            k = prev_cursor
+            while k < len(previous) and previous[k][0] < x2:
+                merge(label, previous[k][2])
+                k += 1
+        previous = current
+
+    if not parents:
+        return None
+    best = max((i for i, parent in enumerate(parents) if parent == i),
+               key=lambda i: (counts[i], -first_seeds[i]))
+    return bounds[best]
 
 
 
@@ -790,9 +870,59 @@ def get_clipboard_text():
         user32.CloseClipboard()
 
 # --- Native Windows API Functions ---
+def screen_selection_rect(start, end, desktop_bounds):
+    """Normalize a native-screen drag into a clipped x,y,width,height area.
+
+    Coordinates are Win32 virtual-desktop pixels, not tkinter's possibly
+    DPI-virtualized event.x_root/y_root. Negative monitor origins are valid.
+    """
+    vx, vy, vw, vh = map(int, desktop_bounds)
+    if vw <= 0 or vh <= 0:
+        raise MacroExecutionError("No usable virtual desktop for region selection")
+    sx, sy = map(int, start)
+    ex, ey = map(int, end)
+    x1 = max(vx, min(sx, ex))
+    y1 = max(vy, min(sy, ey))
+    x2 = min(vx + vw, max(sx, ex))
+    y2 = min(vy + vh, max(sy, ey))
+    return (x1, y1, max(0, x2 - x1), max(0, y2 - y1))
+
+
+def get_virtual_desktop_bounds():
+    """Virtual desktop rectangle in the same Win32 coordinates as GDI capture."""
+    user32 = ctypes.windll.user32
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+    return tuple(user32.GetSystemMetrics(i) for i in (
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN))
+
+
+def validated_capture_area(value):
+    """Validate an already-saved absolute region instead of silently moving it.
+
+    A disconnected or rearranged display must not cause Search Selected Area
+    to scan a different location or a truncated rectangle without warning.
+    """
+    if value is None:
+        raise MacroExecutionError("Select a screen area before running this search")
+    x, y, w, h = dynamic_area(value)
+    vx, vy, vw, vh = get_virtual_desktop_bounds()
+    if (vw <= 0 or vh <= 0 or x < vx or y < vy
+            or x + w > vx + vw or y + h > vy + vh):
+        raise MacroExecutionError(
+            f"Saved search area ({x}, {y}, {w}x{h}) lies outside the current "
+            "desktop. Edit the action and reselect its screen area.")
+    return x, y, w, h
+
+
 def get_mouse_pos():
     pt = POINT()
-    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    user32 = ctypes.windll.user32
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+    user32.GetCursorPos.restype = ctypes.c_int
+    if not user32.GetCursorPos(ctypes.byref(pt)):
+        raise MacroExecutionError("Windows could not read the cursor position")
     return pt.x, pt.y
 
 def move_mouse(x, y):
@@ -842,8 +972,14 @@ class MOUSEINPUT(ctypes.Structure):
                 ("time", ctypes.c_uint32), ("dwExtraInfo", ctypes.c_size_t)]
 
 
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_uint16), ("wScan", ctypes.c_uint16),
+                ("dwFlags", ctypes.c_uint32), ("time", ctypes.c_uint32),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
 class INPUT_UNION(ctypes.Union):
-    _fields_ = [("mi", MOUSEINPUT)]
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
 
 
 class INPUT(ctypes.Structure):
@@ -914,6 +1050,72 @@ def click(button="left", hold_s=0.055):
         raise MacroExecutionError(f"Windows rejected mouse-up for {button} click")
 
 
+
+def resolve_recorded_drag_points(action):
+    """Resolve both endpoints using the same recorded window anchor."""
+    sx, sy = int(action.get('start_x', 0)), int(action.get('start_y', 0))
+    ex, ey = int(action.get('end_x', 0)), int(action.get('end_y', 0))
+    title = action.get('win_title')
+    if title:
+        hwnd = find_window_by_title_substr(title)
+        if hwnd:
+            sx, sy = client_to_screen_pos(
+                hwnd, action.get('rel_start_x', sx), action.get('rel_start_y', sy))
+            ex, ey = client_to_screen_pos(
+                hwnd, action.get('rel_end_x', ex), action.get('rel_end_y', ey))
+    return (sx, sy), (ex, ey)
+
+
+def send_mouse_button_event(flag):
+    """Mouse down/up, with Win32 failure detection and proper INPUT layout."""
+    user32 = ctypes.windll.user32
+    user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
+    user32.SendInput.restype = ctypes.c_uint
+    event = INPUT()
+    event.type = 0
+    event.u.mi.dwFlags = flag
+    if user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) != 1:
+        raise MacroExecutionError('Windows rejected simulated mouse button event')
+
+
+def perform_recorded_drag(action, playback_speed=1.0, human_bezier=False):
+    """Replay recorded button, duration and window-relative start/end."""
+    (sx, sy), (ex, ey) = resolve_recorded_drag_points(action)
+    button = action.get('btn', 'left')
+    if button not in ('left', 'right'):
+        raise MacroExecutionError(f'Unsupported drag button: {button!r}')
+    down, up = ((MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP) if button == 'left'
+                else (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP))
+    try:
+        duration = max(0.15, float(action.get('duration', 0.3)))
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise MacroExecutionError('Invalid drag duration') from exc
+    if not math.isfinite(duration):
+        raise MacroExecutionError('Drag duration must be finite')
+    speed = max(0.1, float(playback_speed))
+    move_mouse(sx, sy)
+    wait_for_cursor_settled(sx, sy)
+    send_mouse_button_event(down)
+    try:
+        time.sleep(0.04)
+        # Bézier is opt-in, but both modes retain continuous held-button motion.
+        steps = max(2, min(120, round(duration * 60)))
+        if human_bezier:
+            points = calculate_bezier_trajectory((sx, sy), (ex, ey), steps)
+        else:
+            points = [(round(sx + (ex - sx) * i / steps),
+                       round(sy + (ey - sy) * i / steps))
+                      for i in range(1, steps + 1)]
+        step_sleep = max(0.001, (duration / speed - 0.06) / len(points))
+        for x, y in points:
+            move_mouse(x, y)
+            time.sleep(step_sleep)
+        move_mouse(ex, ey)
+        time.sleep(0.02)
+    finally:
+        # Release even if movement failed or the playback thread was interrupted.
+        send_mouse_button_event(up)
+
 def perform_color_target_action(action, found_box, playback_speed=1.0):
     """Shared Find Color & Click behavior for player, debugger, and chains.
 
@@ -944,16 +1146,26 @@ def perform_color_target_action(action, found_box, playback_speed=1.0):
     return (mode, tx, ty)
 
 def send_unicode_char(char):
-    """Dispatches raw Unicode characters that lack a standard Virtual Key code."""
-    KEYEVENTF_KEYUP = 0x0002
-    KEYEVENTF_UNICODE = 0x0004
-    char_code = ord(char)
-    ctypes.windll.user32.keybd_event(0, char_code, KEYEVENTF_UNICODE, 0)
-    ctypes.windll.user32.keybd_event(0, char_code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0)
+    """Inject UTF-16 scan codes via native SendInput (including emoji pairs)."""
+    user32 = ctypes.windll.user32
+    user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
+    user32.SendInput.restype = ctypes.c_uint
+    # KEYEVENTF_UNICODE is valid on KEYBDINPUT.dwFlags, not keybd_event().
+    utf16 = str(char).encode('utf-16-le', errors='surrogatepass')
+    for (unit,) in struct.iter_unpack('<H', utf16):
+        for flag in (0x0004, 0x0004 | KEYEVENTF_KEYUP):
+            event = INPUT()
+            event.type = 1  # INPUT_KEYBOARD
+            event.u.ki.wScan = unit
+            event.u.ki.dwFlags = flag
+            if user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) != 1:
+                raise MacroExecutionError('Windows rejected Unicode keyboard input')
+
 
 def type_string(text, speed_multiplier=1.0):
     for char in text:
-        res = ctypes.windll.user32.VkKeyScanW(ord(char))
+        # VkKeyScanW only accepts one UTF-16 code unit.
+        res = ctypes.windll.user32.VkKeyScanW(ord(char)) if ord(char) <= 0xFFFF else -1
         if res == -1 or res == 0xFFFF:
             send_unicode_char(char)
             time.sleep(max(0.001, 0.02 / speed_multiplier))
@@ -1135,19 +1347,252 @@ def sequent_dock_header(parent, title, subtitle="", right_text=""):
     return shell
 
 
-def sequent_toolbar_button(parent, text, command, accent=False):
-    """Compact Sequent toolbar button with clear hover affordance."""
-    base = COLOR_ACCENT if accent else BG_INPUT
-    hover = COLOR_ACCENT_HOV if accent else BG_HOVER
-    label = tk.Label(parent, text=text, bg=base,
-                     fg=TEXT_ON_ACCENT if accent else TEXT_PRIMARY,
-                     font=("Segoe UI", 9, "bold"), padx=11, pady=6,
-                     cursor="hand2", highlightbackground=BG_BORDER,
-                     highlightthickness=0 if accent else 1)
-    label.bind("<Button-1>", lambda e: command())
-    label.bind("<Enter>", lambda e: label.config(bg=hover))
-    label.bind("<Leave>", lambda e: label.config(bg=base))
-    return label
+# --- Sequent vector icon system (Tk Canvas; no fonts, images, or packages) ---
+# Named icons are drawn as scalable geometry, so Windows emoji/fonts have no say
+# in their appearance. The renderer deliberately stays on the Tk UI thread.
+def sequent_icon_for_caption(caption):
+    """Infer a toolbar/button icon from its semantic label, including live states."""
+    t = str(caption).strip().casefold()
+    if not t: return None
+    keys = (
+        ('stop recording', 'stop'), ('start recording', 'record'),
+        ('stop macro', 'stop'), ('run macro', 'play'), ('run active', 'play'),
+        ('run chain', 'play'), ('pause', 'pause'), ('resume', 'play'),
+        ('start guided', 'play'), ('step', 'step'), ('jump', 'first'),
+        ('prev', 'back'), ('next', 'forward'), ('import', 'upload'),
+        ('export', 'download'), ('refresh', 'refresh'),
+        ('clear', 'trash'), ('delete', 'trash'), ('snip', 'target'), ('cancel', 'close'),
+        ('abort', 'close'), ('save', 'save'), ('apply', 'check'),
+        ('proceed', 'check'), ('submit', 'check'), ('add ', 'plus'),
+        ('browse', 'folder'), ('inspect', 'target'), ('sample', 'target'),
+        ('capture', 'target'), ('redefine', 'target'),
+        ('define search', 'target'), ('preview actual', 'eye'),
+        ('finish reticle', 'check'), ('adjust ghost', 'target'),
+        ('mini hud', 'layout'), ('guided tour', 'help'),
+        ('playback', 'play'), ('sequencer', 'layers'), ('settings', 'settings'),
+        ('customize', 'settings'), ('reset', 'refresh'),
+    )
+    for prefix, icon in keys:
+        if prefix in t: return icon
+    return {'▶':'play','◀':'back','⏮':'first','↻':'refresh',
+            '↥':'upload','↧':'download','⌖':'target','▣':'layout',
+            '⚡':'step','⚙':'settings','?':'help','+':'plus',
+            '✕':'close','—':'minimize','□':'maximize','☰':'menu',
+            '⛶':'target','◻':'eye'}.get(t.split(' ')[0], None)
+
+
+def sequent_clean_caption(text):
+    """Discard decorative legacy pictograms; keep user-facing descriptions."""
+    t = str(text).strip()
+    for mark in ('⏮','◀','▶','↻','↥','↧','⌖','▣','⚡','⚙','⛶','◻','✓','☰'):
+        if t.startswith(mark):
+            return t[len(mark):].strip()
+    return t
+
+
+def sequent_icon_for_action(name):
+    """Map action-picker categories to a stable pictogram, not textual sigils."""
+    name = str(name).casefold()
+    if any(w in name for w in ('delay', 'wait', 'retry')): return 'clock'
+    if any(w in name for w in ('find', 'search', 'ocr', 'pixel', 'smart ui')): return 'target'
+    if any(w in name for w in ('clipboard','copy', 'paste')): return 'layers'
+    if any(w in name for w in ('file', 'csv', 'excel', 'export', 'load ')): return 'folder'
+    if any(w in name for w in ('input','variable', 'key')): return 'edit'
+    if any(w in name for w in ('if ', 'gate','else', 'loop', 'jump', 'label')): return 'layers'
+    if 'warning' in name or 'disclaimer' in name: return 'alert'
+    if 'recovery' in name or 'policy' in name: return 'settings'
+    if 'trigger' in name: return 'play'
+    return 'layout'
+
+
+class SequentIcon(tk.Canvas):
+    """An antialias-independent 20px vector icon, redrawn for hover/theme colors."""
+    def __init__(self, parent, name, color=TEXT_PRIMARY, bg=BG_INPUT, size=19):
+        self.size = size
+        super().__init__(parent, width=size, height=size, bg=bg, bd=0,
+                         highlightthickness=0, takefocus=0, cursor='hand2')
+        self.name = name
+        self.ink = color
+        self.paint(bg=bg, color=color)
+
+    def paint(self, bg=None, color=None, name=None):
+        if bg is not None: super().configure(bg=bg)
+        if color is not None: self.ink = color
+        if name is not None: self.name = name
+        self.delete('all')
+        c = self.ink
+        s = self.size / 20.0
+        def xy(*v): return [q*s for q in v]
+        def line(*v, **kw):
+            self.create_line(*xy(*v), fill=c, width=2*s, capstyle=tk.ROUND,
+                             joinstyle=tk.ROUND, **kw)
+        def box(x1,y1,x2,y2,**kw):
+            self.create_rectangle(*xy(x1,y1,x2,y2), outline=c,
+                                  width=1.7*s, **kw)
+        def oval(x1,y1,x2,y2,**kw):
+            self.create_oval(*xy(x1,y1,x2,y2), outline=c,
+                             width=1.7*s, **kw)
+        def polygon(*v, **kw):
+            self.create_polygon(*xy(*v), fill=c, outline=c, **kw)
+        n = self.name
+        if n == 'play': polygon(6,3,17,10,6,17)
+        elif n == 'stop': polygon(5,5,15,5,15,15,5,15)
+        elif n == 'record': oval(5,5,15,15,fill=c)
+        elif n == 'pause':
+            box(5,4,8,16,fill=c); box(12,4,15,16,fill=c)
+        elif n in ('forward','back','first'):
+            if n == 'back': polygon(15,4,5,10,15,16)
+            elif n == 'forward': polygon(5,4,15,10,5,16)
+            else: polygon(16,4,7,10,16,16); line(4,4,4,16)
+        elif n == 'step':
+            line(13,4,13,16); polygon(5,5,12,10,5,15)
+        elif n == 'menu':
+            for y in (5,10,15): line(4,y,16,y)
+        elif n == 'close': line(5,5,15,15); line(15,5,5,15)
+        elif n == 'minimize': line(4,12,16,12)
+        elif n == 'maximize': box(4,4,16,16)
+        elif n == 'check': line(3,10,8,15,17,5)
+        elif n == 'plus': line(10,4,10,16); line(4,10,16,10)
+        elif n == 'trash':
+            box(6,6,14,16); line(4,5,16,5); line(8,3,12,3); line(9,9,9,13); line(11,9,11,13)
+        elif n == 'search': oval(3,3,12,12); line(12,12,17,17)
+        elif n == 'target':
+            oval(5,5,15,15); oval(9,9,11,11,fill=c)
+            for v in ((10,1,10,6),(10,14,10,19),(1,10,6,10),(14,10,19,10)):
+                line(*v)
+        elif n == 'eye':
+            self.create_arc(*xy(2,5,18,15), start=0, extent=180, style='arc',
+                            outline=c, width=1.8*s)
+            self.create_arc(*xy(2,5,18,15), start=180, extent=180, style='arc',
+                            outline=c, width=1.8*s)
+            oval(8,8,12,12,fill=c)
+        elif n == 'refresh':
+            self.create_arc(*xy(3,3,17,17), start=55, extent=265, style='arc',
+                            outline=c, width=1.9*s)
+            polygon(13,3,18,4,16,9)
+        elif n == 'upload' or n == 'download':
+            line(4,16,16,16); line(4,13,4,16); line(16,13,16,16)
+            if n == 'upload':
+                line(10,13,10,3); line(6,7,10,3,14,7)
+            else:
+                line(10,3,10,13); line(6,9,10,13,14,9)
+        elif n == 'save':
+            box(3,3,17,17); box(6,3,13,8); box(6,11,14,17)
+        elif n == 'folder':
+            polygon(3,5,8,5,10,7,17,7,17,16,3,16)
+        elif n == 'edit':
+            line(4,16,7,16,16,7,13,4,4,13,4,16)
+            line(11,6,14,9)
+        elif n == 'alert':
+            polygon(10,2,19,17,1,17)
+            self.create_line(*xy(10,7,10,12), fill=self.cget('bg'),
+                             width=2*s,capstyle=tk.ROUND)
+            self.create_oval(*xy(9,14,11,16), fill=self.cget('bg'),
+                             outline=self.cget('bg'))
+        elif n == 'layout':
+            box(3,3,17,17); line(3,7,17,7); line(8,7,8,17)
+        elif n == 'expand':
+            line(7,3,3,3,3,7); line(13,3,17,3,17,7)
+            line(3,13,3,17,7,17); line(13,17,17,17,17,13)
+        elif n == 'layers':
+            line(3,7,10,3,17,7,10,11,3,7)
+            line(3,11,10,15,17,11); line(3,14,10,18,17,14)
+        elif n == 'settings':
+            oval(6,6,14,14); oval(9,9,11,11,fill=c)
+            for a in range(8):
+                ang=a*math.pi/4
+                x1=10+6.0*math.cos(ang); y1=10+6.0*math.sin(ang)
+                x2=10+8.1*math.cos(ang); y2=10+8.1*math.sin(ang)
+                line(x1,y1,x2,y2)
+        elif n == 'help':
+            oval(2,2,18,18)
+            self.create_text(10*s,10*s,text='?',fill=c,
+                             font=('Segoe UI',round(12*s),'bold'))
+        elif n == 'clock':
+            oval(3,3,17,17); line(10,6,10,10,13,12)
+        else: box(4,4,16,16)
+
+
+class SequentCaptionLabel(tk.Label):
+    """A normal Tk label whose text updates also update its partner icon."""
+    def __init__(self, parent, *, on_caption=None, **kwargs):
+        self._on_caption = on_caption
+        super().__init__(parent, **kwargs)
+    def configure(self, cnf=None, **kw):
+        d = dict(cnf or {}) if isinstance(cnf, dict) else {}
+        d.update(kw)
+        new_text = d.get('text')
+        if new_text is not None and self._on_caption:
+            self._on_caption(str(new_text))
+        return super().configure(cnf, **kw)
+    config = configure
+
+
+class SequentToolbarButton(tk.Frame):
+    """Compact icon/text toolbar button; keeps .config(text=...) compatibility."""
+    def __init__(self, parent, text, command, accent=False, icon=None):
+        base = COLOR_ACCENT if accent else BG_INPUT
+        super().__init__(parent, bg=base, cursor='hand2',
+                         highlightbackground=BG_BORDER, highlightthickness=0 if accent else 1)
+        self.command = command
+        self.base = base
+        self.hover = COLOR_ACCENT_HOV if accent else BG_HOVER
+        self.fg = TEXT_ON_ACCENT if accent else TEXT_PRIMARY
+        self.name = icon or sequent_icon_for_caption(text)
+        self.icon = SequentIcon(self, self.name, color=self.fg, bg=base, size=17) if self.name else None
+        if self.icon is not None: self.icon.pack(side=tk.LEFT, padx=(7,3))
+        label_text = sequent_clean_caption(text)
+        self.label = tk.Label(self, text=label_text, bg=base, fg=self.fg,
+                              font=('Segoe UI',9,'bold'), cursor='hand2',
+                              padx=5 if self.name else 11, pady=6)
+        self.label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._attach_events()
+
+    def _attach_events(self):
+        for widget in (self, self.label, self.icon):
+            if widget is None: continue
+            widget.bind('<Button-1>', lambda e: self.command() if self.command else None)
+            widget.bind('<Enter>', lambda e: self._paint(self.hover))
+            widget.bind('<Leave>', self._mouse_leave)
+
+    def _mouse_leave(self, event):
+        # Leaving a child for another child must not flash the button.
+        self.after_idle(self._refresh_hover)
+
+    def _refresh_hover(self):
+        if not self.winfo_exists(): return
+        try:
+            target = self.winfo_containing(*self.winfo_pointerxy())
+            if target is not None and (target == self or str(target).startswith(str(self)+'.')):
+                return
+        except tk.TclError: pass
+        self._paint(self.base)
+
+    def _paint(self, bg):
+        if not self.winfo_exists(): return
+        super().configure(bg=bg)
+        self.label.configure(bg=bg)
+        if self.icon: self.icon.paint(bg=bg)
+
+    def configure(self, cnf=None, **kw):
+        data = dict(cnf or {}) if isinstance(cnf, dict) else {}
+        data.update(kw)
+        if 'text' in data:
+            caption = data.pop('text')
+            self.label.config(text=sequent_clean_caption(caption))
+            icon_name = sequent_icon_for_caption(caption)
+            if icon_name:
+                if self.icon is None:
+                    self.icon = SequentIcon(self, icon_name, color=self.fg, bg=self.base, size=17)
+                    self.icon.pack(side=tk.LEFT, before=self.label, padx=(7,3))
+                    self._attach_events()
+                else: self.icon.paint(name=icon_name)
+        return super().configure(cnf if not isinstance(cnf, dict) else None, **data)
+    config = configure
+
+
+def sequent_toolbar_button(parent, text, command, accent=False, icon=None):
+    return SequentToolbarButton(parent, text, command, accent=accent, icon=icon)
 
 
 # --- Sequent native-looking, dependency-free custom accent color dialog ---
@@ -1247,9 +1692,8 @@ class SequentAccentColorDialog:
         if os.name == 'nt':
             for widget in [title_box, *title_box.winfo_children()]:
                 widget.bind('<Button-1>', lambda e: begin_native_window_motion(self.window))
-        close = tk.Label(head, text="✕", bg=BG_HEADER, fg=TEXT_MUTED,
-                         font=("Segoe UI", 13), padx=17, cursor="hand2")
-        close.pack(side=tk.RIGHT, fill=tk.Y)
+        close = SequentIcon(head, 'close', bg=BG_HEADER, color=TEXT_MUTED, size=19)
+        close.pack(side=tk.RIGHT, padx=15, pady=24)
         close.bind("<Button-1>", lambda e: self.cancel())
 
         # Reserve footer space before growing the content frame, so buttons
@@ -1515,15 +1959,38 @@ class ModernTooltip:
         self.tip_win = None
         self._after_id = None
 
-        self.widget.bind("<Enter>", self._on_enter, add="+")
-        self.widget.bind("<Leave>", self._on_leave, add="+")
-        self.widget.bind("<ButtonPress>", self._on_leave, add="+")
+        # Icon buttons are composed of a Frame, a Canvas and a text Label.
+        # Tk doesn't dispatch child pointer events to their parent bindings.
+        # Follow children as well so tooltips remain functional over the icon.
+        def bind_target(target):
+            target.bind("<Enter>", self._on_enter, add="+")
+            target.bind("<Leave>", self._on_leave, add="+")
+            target.bind("<ButtonPress>", self._on_press, add="+")
+            for child in target.winfo_children():
+                bind_target(child)
+        bind_target(self.widget)
+
+    def _on_press(self, event=None):
+        self._cancel()
+        self.hide()
 
     def _on_enter(self, event=None):
         self._cancel()
         self._after_id = self.widget.after(self.delay_ms, self._show)
 
     def _on_leave(self, event=None):
+        # Crossing from the icon into its caption is not leaving the button.
+        self.widget.after_idle(self._hide_if_outside)
+
+    def _hide_if_outside(self):
+        if not self.widget.winfo_exists(): return
+        try:
+            target = self.widget.winfo_containing(*self.widget.winfo_pointerxy())
+            if target is not None and (target == self.widget or
+                    str(target).startswith(str(self.widget) + '.')):
+                return
+        except tk.TclError:
+            pass
         self._cancel()
         self.hide()
 
@@ -2368,7 +2835,7 @@ class SequentDynamicEngine:
         end = time.monotonic() + max(0, float(seconds))
         while time.monotonic() < end:
             if not idle and not self.app.playing:
-                raise MacroExecutionError('Execution stopped')
+                raise MacroCancelled('Execution stopped')
             if self.app.is_paused and not idle:
                 frozen_at = time.monotonic()
                 while self.app.is_paused and self.app.playing:
@@ -2627,8 +3094,11 @@ class SequentDynamicEngine:
             try:
                 if action.get('type') in DYNAMIC_ACTION_TYPES:
                     return self.execute(action,idle=idle)
-                self.app.execute_single_action(action)
+                self.app.execute_single_action(action, idle=idle)
                 return {'success':True}
+            except MacroCancelled:
+                # User abort is not a retryable/recoverable failure.
+                raise
             except Exception as exc:
                 self.app.variables['_last_success'] = 'false'
                 self.app.variables['_last_error'] = str(exc)
@@ -2719,11 +3189,14 @@ class SequentDynamicEngine:
             if typ=='if_var':
                 actual=str(self.app.variables.get(action.get('var_name',''),''))
                 if dynamic_compare(actual,action.get('op','=='),self.interpolate(action.get('val',''))):
-                    target_type=action.get('target_type','label')
+                    # Old macros and the editor both default to preset routing.
+                    target_type=action.get('target_type','preset')
                     if target_type=='label':
                         target=next((i for i,a in enumerate(actions) if a.get('type')=='label' and a.get('name')==action.get('target')),None)
                         if target is None:raise MacroExecutionError('IF Variable label not found')
                         frames.clear();index=target+1;continue
+                    if target_type not in ('preset', 'file'):
+                        raise MacroExecutionError(f'Unsupported IF Variable target: {target_type}')
                     return {'switch':target_type,'target':action.get('target','')}
                 index+=1;continue
             if typ=='search_area':
@@ -2732,7 +3205,7 @@ class SequentDynamicEngine:
                 
                 # Check up to 5 times over 1 second to account for UI loading lag
                 for _ in range(5):
-                    raw=self.app.ocr_screen_area(*dynamic_area(action.get('area')))
+                    raw=self.app.ocr_screen_area(*validated_capture_area(action.get('area')))
                     if raw.startswith('ERR:'):raise MacroExecutionError(raw)
                     clean_target = "".join(ch for ch in target.casefold() if ch.isalnum())
                     clean_raw = "".join(ch for ch in raw.casefold() if ch.isalnum())
@@ -2784,7 +3257,10 @@ class SequentDynamicEngine:
             if not idle:
                 # Bypass the standard global delay for raw mouse movements so they play fluidly
                 if typ not in ('move', 'drag'):
-                    self._pause(max(0.01, self.app.action_delay / max(0.1, self.app.playback_speed)), idle=False)
+                    delay = max(0.01, self.app.action_delay / max(0.1, self.app.playback_speed))
+                    if self.app.delay_jitter:
+                        delay *= random.uniform(0.85, 1.15)
+                    self._pause(delay, idle=False)
                 else:
                     # Give a tiny 1ms breather to prevent locking the thread during long drags
                     self._pause(0.001, idle=False)
@@ -3543,12 +4019,11 @@ class VSCodeQueueViewer(tk.Frame):
         tk.Label(head, text="SEQUENT  /  ACTION LIBRARY",
                  font=("Segoe UI", 8), bg=BG_HEADER,
                  fg=TEXT_MUTED).pack(side=tk.LEFT, padx=20)
-        close_btn = tk.Label(head, text="  ✕  ", font=("Segoe UI", 11),
-                             bg=BG_HEADER, fg=TEXT_MUTED, cursor="hand2")
-        close_btn.pack(side=tk.RIGHT, padx=8)
+        close_btn = SequentIcon(head, 'close', bg=BG_HEADER, color=TEXT_MUTED, size=19)
+        close_btn.pack(side=tk.RIGHT, padx=13, pady=10)
         close_btn.bind("<Button-1>", lambda e: self.close_sub_menu())
-        close_btn.bind("<Enter>", lambda e: close_btn.config(fg=TEXT_PRIMARY, bg=COLOR_DANGER))
-        close_btn.bind("<Leave>", lambda e: close_btn.config(fg=TEXT_MUTED, bg=BG_HEADER))
+        close_btn.bind("<Enter>", lambda e: close_btn.paint(bg=COLOR_DANGER, color=TEXT_PRIMARY))
+        close_btn.bind("<Leave>", lambda e: close_btn.paint(bg=BG_HEADER, color=TEXT_MUTED))
         for w in (head, title_lbl, line_lbl):
             w.bind("<Button-1>", start_drag)
             w.bind("<B1-Motion>", do_drag)
@@ -3571,8 +4046,8 @@ class VSCodeQueueViewer(tk.Frame):
         search_shell = tk.Frame(nav, bg=BG_INPUT, highlightbackground=BG_BORDER,
                                 highlightthickness=1)
         search_shell.pack(fill=tk.X, padx=12, pady=(12, 12))
-        tk.Label(search_shell, text="⌕", bg=BG_INPUT, fg=TEXT_MUTED,
-                 font=("Segoe UI", 13)).pack(side=tk.LEFT, padx=(8, 4))
+        SequentIcon(search_shell, 'search', bg=BG_INPUT,
+                    color=TEXT_MUTED, size=18).pack(side=tk.LEFT, padx=(8, 4))
         self._action_search_var = tk.StringVar()
         self._action_search_entry = tk.Entry(
             search_shell, textvariable=self._action_search_var,
@@ -3744,9 +4219,8 @@ class VSCodeQueueViewer(tk.Frame):
                                   bg=COLOR_ACCENT if selected else row_color)
                 accent.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 9))
                 accent.pack_propagate(False)
-                tag = tk.Label(tile, text=sigil, width=3,
-                               font=("Consolas", 8, "bold"),
-                               bg=BG_INPUT, fg=SYNTAX_BLUE, pady=4)
+                tag = SequentIcon(tile, sequent_icon_for_action(name),
+                                  color=SYNTAX_BLUE, bg=BG_INPUT, size=24)
                 tag.pack(side=tk.LEFT, padx=(0, 8))
                 names = tk.Frame(tile, bg=row_color)
                 names.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -4075,7 +4549,7 @@ class VSCodeQueueViewer(tk.Frame):
             if self.sub_menu: self.sub_menu.withdraw()
             self.app.start_pixel_inspection(on_pixel_sampled)
 
-        btn_inspect = ModernButton(body, text="⌖ Inspect Desktop Pixel", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=trigger_inspect)
+        btn_inspect = ModernButton(body, text="Inspect Desktop Pixel", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=trigger_inspect)
         btn_inspect.pack(fill=tk.X, pady=(0, 8))
 
         if edit_idx is None:
@@ -4852,10 +5326,9 @@ class VSCodeQueueViewer(tk.Frame):
             # The existing selector restores the application and submenu on completion/cancel.
             self.app.start_screen_selection(snip_done)
 
-        snip = tk.Label(area_row, text="⛶ Snip", font=("Segoe UI", 8, "bold"),
-                        bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=8, pady=3)
+        snip = sequent_toolbar_button(area_row, "Snip", choose_area,
+                                      accent=True, icon='target')
         snip.pack(side=tk.RIGHT)
-        snip.bind("<Button-1>", lambda event: choose_area())
 
         if edit_idx is None:
             pos_var = tk.StringVar(value=f"Before Line {line_num}")
@@ -4959,9 +5432,19 @@ class VSCodeQueueViewer(tk.Frame):
             if self.sub_menu: self.sub_menu.withdraw()
             self.app.start_screen_selection(on_area_snip_completed)
 
-        btn_snip = tk.Label(area_row, text="⛶ Snip", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=8, pady=3)
+        btn_snip = sequent_toolbar_button(area_row, "Snip", trigger_snip,
+                                          accent=True, icon='target')
         btn_snip.pack(side=tk.RIGHT)
-        btn_snip.bind("<Button-1>", lambda e: trigger_snip())
+
+        def preview_area():
+            try:
+                self.app.preview_screen_search_area(selected_box["area"])
+            except (MacroExecutionError, OSError, ValueError) as exc:
+                lbl_area_status.config(text=str(exc), fg=COLOR_DANGER)
+
+        ModernButton(body, text="Preview Actual Search Area",
+                     bg_color=BG_BORDER, hover_color=BG_HOVER,
+                     command=preview_area).pack(fill=tk.X, pady=(0, 8))
 
         tk.Label(body, text="If Found, Stop & Run Preset:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
         preset_names = self.app.get_preset_names()
@@ -4989,6 +5472,11 @@ class VSCodeQueueViewer(tk.Frame):
                 return
             if not selected_box["area"]:
                 lbl_area_status.config(highlightbackground=COLOR_DANGER, text="Area Required!")
+                return
+            try:
+                validated_capture_area(selected_box["area"])
+            except MacroExecutionError as exc:
+                lbl_area_status.config(text=str(exc), fg=COLOR_DANGER)
                 return
             target_preset = preset_var.get()
             if target_preset == "-- No Presets Found --": return
@@ -5091,7 +5579,7 @@ class VSCodeQueueViewer(tk.Frame):
                 self.app.restore_after_desktop_picker()
                 error_lbl.config(text=f"Could not open screen selector: {exc}")
 
-        search_box_label = "⛶ Redefine Search Box on Desktop" if curr else "Define Search Box"
+        search_box_label = "Redefine Search Box on Desktop" if curr else "Define Search Box"
         ModernButton(body, text=search_box_label,
                      bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
                      command=pick_new_area).pack(fill=tk.X, pady=(0, 12))
@@ -5118,7 +5606,7 @@ class VSCodeQueueViewer(tk.Frame):
                 self.app.restore_after_desktop_picker()
                 error_lbl.config(text=f"Could not open color inspector: {exc}")
 
-        ModernButton(col_row, text="⌖ Sample Color", bg_color=COLOR_ACCENT,
+        ModernButton(col_row, text="Sample Color", bg_color=COLOR_ACCENT,
                      hover_color=COLOR_ACCENT_HOV, command=inspect_color).pack(side=tk.LEFT)
 
         # Target movement is anchored to detected component, not constrained
@@ -5283,7 +5771,7 @@ class VSCodeQueueViewer(tk.Frame):
                 self.app.restore_after_desktop_picker()
                 error_lbl.config(text=f"Could not open screen selector: {exc}")
 
-        search_box_label = "⛶ Redefine Search Box on Desktop" if curr else "Define Search Box"
+        search_box_label = "Redefine Search Box on Desktop" if curr else "Define Search Box"
         ModernButton(body, text=search_box_label,
                      bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
                      command=pick_new_area).pack(fill=tk.X, pady=(0, 12))
@@ -5458,14 +5946,31 @@ class ModernButton(tk.Frame):
         self._fade_job = None
 
         fg_color = self._get_contrast_fg(bg_color)
-        self.label = tk.Label(self, text=text, bg=bg_color, fg=fg_color, font=("Segoe UI", 10, "bold"), cursor="hand2")
-        self.label.pack(expand=True, fill=tk.BOTH, padx=16, pady=9)
+        self.icon = SequentIcon(self, sequent_icon_for_caption(text) or 'check',
+                                color=fg_color, bg=bg_color, size=19)
+        self.icon.pack(side=tk.LEFT, padx=(15, 6))
+        self.label = SequentCaptionLabel(
+            self, text=sequent_clean_caption(text), bg=bg_color, fg=fg_color,
+            font=("Segoe UI", 10, "bold"), cursor="hand2",
+            on_caption=self._on_caption_change)
+        self.label.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=(0, 14), pady=9)
 
-        for widget in (self, self.label):
+        for widget in (self, self.label, self.icon):
             widget.bind("<Enter>", self.on_hover)
             widget.bind("<Leave>", self.on_leave)
             widget.bind("<Button-1>", self.on_click)
 
+
+    def _on_caption_change(self, caption):
+        self.icon.paint(name=sequent_icon_for_caption(caption) or 'check')
+        # Strip decorative glyphs when a legacy setter updates a caption.
+        clean = sequent_clean_caption(caption)
+        if clean != caption:
+            self.label.after_idle(lambda: self.label.winfo_exists() and
+                                  self.label.configure(text=clean))
+
+    def _paint_icon(self, bg):
+        self.icon.paint(bg=bg, color=self._get_contrast_fg(bg))
 
     def _get_contrast_fg(self, hex_color):
         """Calculates perceptual luminance and returns high-contrast text color."""
@@ -5487,6 +5992,7 @@ class ModernButton(tk.Frame):
             else:
                 self.configure(bg=self.hover_color)
                 self.label.configure(bg=self.hover_color, fg=self._get_contrast_fg(self.hover_color))
+                self._paint_icon(self.hover_color)
                 self.current_color = self.hover_color
     
     def on_leave(self, event):
@@ -5496,6 +6002,7 @@ class ModernButton(tk.Frame):
             else:
                 self.configure(bg=self.bg_color)
                 self.label.configure(bg=self.bg_color, fg=self._get_contrast_fg(self.bg_color))
+                self._paint_icon(self.bg_color)
                 self.current_color = self.bg_color
     
     def _fade_to(self, target_hex, step=1, total_steps=5):
@@ -5527,6 +6034,7 @@ class ModernButton(tk.Frame):
 
         self.configure(bg=interpolated)
         self.label.configure(bg=interpolated, fg=self._get_contrast_fg(interpolated))
+        self._paint_icon(interpolated)
         self.current_color = interpolated
 
         if step < total_steps:
@@ -5535,6 +6043,7 @@ class ModernButton(tk.Frame):
             self.current_color = target_hex
             self.configure(bg=target_hex)
             self.label.configure(bg=target_hex, fg=self._get_contrast_fg(target_hex))
+            self._paint_icon(target_hex)
 
 
     def on_click(self, event):
@@ -5549,9 +6058,11 @@ class ModernButton(tk.Frame):
         active_bg = DISABLED if self.disabled else self.bg_color
         self.configure(bg=active_bg)
         self.label.configure(bg=active_bg)
+        self._paint_icon(active_bg)
         cursor = "arrow" if self.disabled else "hand2"
         self.configure(cursor=cursor)
         self.label.configure(cursor=cursor)
+        self.icon.configure(cursor=cursor)
         self.label.config(fg=self._get_contrast_fg(active_bg))
 
 
@@ -5893,11 +6404,15 @@ class SidebarButton(tk.Frame):
         self.indicator = tk.Frame(self, bg=BG_SIDEBAR, width=4)
         self.indicator.pack(side=tk.LEFT, fill=tk.Y)
         
-        nav_text = f"  {text.title()}"
-        self.label = tk.Label(self, text=nav_text, bg=BG_SIDEBAR, fg=TEXT_MUTED, font=("Segoe UI", 10, "bold"), cursor="hand2", anchor="w")
-        self.label.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=12, pady=8)
+        name = sequent_icon_for_caption(text) or 'layout'
+        self.icon = SequentIcon(self, name, color=TEXT_MUTED, bg=BG_SIDEBAR, size=19)
+        self.icon.pack(side=tk.LEFT, padx=(11, 2))
+        nav_text = sequent_clean_caption(text).title()
+        self.label = tk.Label(self, text=nav_text, bg=BG_SIDEBAR, fg=TEXT_MUTED,
+                              font=("Segoe UI", 10, "bold"), cursor="hand2", anchor="w")
+        self.label.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=(6, 12), pady=8)
 
-        for widget in (self, self.label, self.indicator):
+        for widget in (self, self.label, self.icon, self.indicator):
             widget.bind("<Enter>", self.on_hover)
             widget.bind("<Leave>", self.on_leave)
             widget.bind("<Button-1>", self.on_click)
@@ -5906,11 +6421,13 @@ class SidebarButton(tk.Frame):
         if not self.active:
             self.configure(bg=BG_HOVER)
             self.label.configure(bg=BG_HOVER, fg=TEXT_PRIMARY)
+            self.icon.paint(bg=BG_HOVER, color=TEXT_PRIMARY)
 
     def on_leave(self, event):
         if not self.active:
             self.configure(bg=BG_SIDEBAR)
             self.label.configure(bg=BG_SIDEBAR, fg=TEXT_MUTED)
+            self.icon.paint(bg=BG_SIDEBAR, color=TEXT_MUTED)
 
     def on_click(self, event):
         if self.command: self.command()
@@ -5922,6 +6439,7 @@ class SidebarButton(tk.Frame):
         ind_color = COLOR_ACCENT if is_active else color
         self.configure(bg=color)
         self.label.configure(bg=color, fg=fg_color)
+        self.icon.paint(bg=color, color=fg_color)
         self.indicator.configure(bg=ind_color)
 
 class GhostReticle:
@@ -6904,17 +7422,20 @@ class BuiltInMacroApp:
         self.hud_status_lbl = tk.Label(card, text="● Sequent", font=("Segoe UI", 8, "bold"), bg=BG_HEADER, fg=TEXT_PRIMARY)
         self.hud_status_lbl.pack(side=tk.LEFT, padx=(2, 8))
 
-        btn_pause = tk.Label(card, text="❚❚", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=TEXT_PRIMARY, cursor="hand2", padx=6, pady=2)
-        btn_pause.pack(side=tk.LEFT, padx=(0, 4))
+        btn_pause = SequentIcon(card, 'pause', bg=BG_INPUT, color=TEXT_PRIMARY, size=19)
+        btn_pause.pack(side=tk.LEFT, padx=(0, 7))
         btn_pause.bind("<Button-1>", lambda e: self.toggle_pause())
+        ModernTooltip(btn_pause, "Pause or Resume")
 
-        btn_stop = tk.Label(card, text="⏹", font=("Segoe UI", 8, "bold"), bg=BG_INPUT, fg=COLOR_DANGER, cursor="hand2", padx=6, pady=2)
-        btn_stop.pack(side=tk.LEFT, padx=(0, 6))
+        btn_stop = SequentIcon(card, 'stop', bg=BG_INPUT, color=COLOR_DANGER, size=19)
+        btn_stop.pack(side=tk.LEFT, padx=(0, 7))
         btn_stop.bind("<Button-1>", lambda e: self.stop_macro())
+        ModernTooltip(btn_stop, "Stop Macro")
 
-        btn_expand = tk.Label(card, text="⤢", font=("Segoe UI", 9, "bold"), bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=7, pady=2)
-        btn_expand.pack(side=tk.RIGHT, padx=6)
+        btn_expand = SequentIcon(card, 'expand', bg=COLOR_ACCENT, color=TEXT_ON_ACCENT, size=19)
+        btn_expand.pack(side=tk.RIGHT, padx=7)
         btn_expand.bind("<Button-1>", lambda e: self.toggle_mini_hud())
+        ModernTooltip(btn_expand, "Expand Sequent")
 
     def update_status(self, text, fg_color=TEXT_MUTED):
         def _apply():
@@ -7061,13 +7582,12 @@ class BuiltInMacroApp:
         top_bar.bind("<Button-1>", self.start_drag)
         top_bar.bind("<B1-Motion>", self.drag_window)
 
-        self.hamburger = tk.Label(top_bar, text="☰", bg=BG_HEADER,
-                                  fg=TEXT_MUTED, font=("Segoe UI", 14),
-                                  padx=12, cursor="hand2")
-        self.hamburger.pack(side=tk.LEFT, fill=tk.Y)
+        self.hamburger = SequentIcon(top_bar, 'menu', color=TEXT_MUTED,
+                                    bg=BG_HEADER, size=20)
+        self.hamburger.pack(side=tk.LEFT, padx=13, pady=14)
         self.hamburger.bind("<Button-1>", lambda e: self.toggle_sidebar())
-        self.hamburger.bind("<Enter>", lambda e: self.hamburger.config(bg=BG_HOVER))
-        self.hamburger.bind("<Leave>", lambda e: self.hamburger.config(bg=BG_HEADER))
+        self.hamburger.bind("<Enter>", lambda e: self.hamburger.paint(bg=BG_HOVER))
+        self.hamburger.bind("<Leave>", lambda e: self.hamburger.paint(bg=BG_HEADER))
         ModernTooltip(self.hamburger, "Toggle Workspace Navigation")
 
         brand = tk.Frame(top_bar, bg=BG_HEADER)
@@ -7084,36 +7604,34 @@ class BuiltInMacroApp:
         # Align the Mini HUD once with the expanded sidebar boundary.
         # Its position is independent of sidebar opening/closing animations.
         self._topbar_brand = brand
-        self.mini_hud_button = sequent_toolbar_button(top_bar, "▣  Mini HUD", self.toggle_mini_hud)
+        self.mini_hud_button = sequent_toolbar_button(top_bar, "Mini HUD", self.toggle_mini_hud)
         self.mini_hud_button.place(x=self.sidebar_width + 12, rely=0.5, anchor=tk.W)
         top_bar.bind("<Configure>", self._position_mini_hud_button, add="+")
 
         win_controls = tk.Frame(top_bar, bg=BG_HEADER)
         win_controls.pack(side=tk.RIGHT, fill=tk.Y)
-        btn_close = tk.Label(win_controls, text="✕", bg=BG_HEADER,
-                             fg=TEXT_MUTED, font=("Segoe UI", 10),
-                             cursor="hand2", padx=17)
-        btn_close.pack(side=tk.RIGHT, fill=tk.Y)
+        btn_close = SequentIcon(win_controls, 'close', bg=BG_HEADER,
+                                color=TEXT_MUTED, size=19)
+        btn_close.pack(side=tk.RIGHT, padx=15, pady=15)
         btn_close.bind("<Button-1>", lambda e: self.root.destroy())
-        btn_close.bind("<Enter>", lambda e: btn_close.config(bg=COLOR_DANGER, fg="#fff"))
-        btn_close.bind("<Leave>", lambda e: btn_close.config(bg=BG_HEADER, fg=TEXT_MUTED))
-        btn_min = tk.Label(win_controls, text="—", bg=BG_HEADER,
-                           fg=TEXT_MUTED, font=("Segoe UI", 10),
-                           cursor="hand2", padx=16)
-        btn_min.pack(side=tk.RIGHT, fill=tk.Y)
+        btn_close.bind("<Enter>", lambda e: btn_close.paint(bg=COLOR_DANGER, color="#fff"))
+        btn_close.bind("<Leave>", lambda e: btn_close.paint(bg=BG_HEADER, color=TEXT_MUTED))
+        btn_min = SequentIcon(win_controls, 'minimize', bg=BG_HEADER,
+                              color=TEXT_MUTED, size=19)
+        btn_min.pack(side=tk.RIGHT, padx=13, pady=15)
         btn_min.bind("<Button-1>", lambda e: self.minimize_window())
-        btn_min.bind("<Enter>", lambda e: btn_min.config(bg=BG_HOVER))
-        btn_min.bind("<Leave>", lambda e: btn_min.config(bg=BG_HEADER))
+        btn_min.bind("<Enter>", lambda e: btn_min.paint(bg=BG_HOVER))
+        btn_min.bind("<Leave>", lambda e: btn_min.paint(bg=BG_HEADER))
         # The native title bar already supplies Windows minimize/close controls.
         if self.native_window_resize:
             win_controls.pack_forget()
         elif self.native_chrome is not None:
-            btn_max = tk.Label(win_controls, text="□", bg=BG_HEADER,
-                    fg=TEXT_MUTED, font=("Segoe UI", 12), cursor="hand2", padx=15)
-            btn_max.pack(side=tk.RIGHT, fill=tk.Y, before=btn_min)
+            btn_max = SequentIcon(win_controls, 'maximize', bg=BG_HEADER,
+                                   color=TEXT_MUTED, size=19)
+            btn_max.pack(side=tk.RIGHT, padx=13, pady=15, before=btn_min)
             btn_max.bind("<Button-1>", lambda e: self.toggle_maximize_window())
-            btn_max.bind("<Enter>", lambda e: btn_max.config(bg=BG_HOVER))
-            btn_max.bind("<Leave>", lambda e: btn_max.config(bg=BG_HEADER))
+            btn_max.bind("<Enter>", lambda e: btn_max.paint(bg=BG_HOVER))
+            btn_max.bind("<Leave>", lambda e: btn_max.paint(bg=BG_HEADER))
             # Windows handles double-click-to-maximize on the custom caption.
             top_bar.bind("<Double-Button-1>", lambda e: self.toggle_maximize_window())
 
@@ -7137,7 +7655,7 @@ class BuiltInMacroApp:
                                         activeforeground=TEXT_ON_ACCENT, bd=0)
         self.preset_menu.pack(side=tk.LEFT, pady=2)
         self.preset_menu.configure(width=17)
-        btn_refresh = sequent_toolbar_button(preset_card, "↻", self.refresh_preset_menu)
+        btn_refresh = sequent_toolbar_button(preset_card, "", self.refresh_preset_menu, icon="refresh")
         btn_refresh.pack(side=tk.LEFT, padx=(0, 4), pady=2)
         ModernTooltip(btn_refresh, "Refresh Saved Presets")
 
@@ -7344,7 +7862,7 @@ class BuiltInMacroApp:
             self.update_status("Couldn't display a reticle for this action", COLOR_DANGER)
             return
         self._reticle_edit_index = idx
-        self.btn_edit_reticle.config(text="✓ Finish Reticle Editing")
+        self.btn_edit_reticle.config(text="Finish Reticle Editing")
         self._set_color_live_label("◌ LIVE PREVIEW • Searching for matching region…", SYNTAX_BLUE)
         self.ghost_reticle.start_live_preview(self, idx)
         if self.ghost_reticle.last_found_box is None:
@@ -7367,7 +7885,7 @@ class BuiltInMacroApp:
             self.ghost_reticle.hide()  # Removes the live bounds when editing ends.
         self._reticle_edit_index = None
         if hasattr(self, "btn_edit_reticle"):
-            self.btn_edit_reticle.config(text="⌖ Adjust Ghost Reticle")
+            self.btn_edit_reticle.config(text="Adjust Ghost Reticle")
         self._set_color_live_label("Preview off • Adjust Ghost Reticle to inspect", TEXT_MUTED)
 
     def build_sidebar(self):
@@ -7380,20 +7898,20 @@ class BuiltInMacroApp:
                  anchor="w").pack(fill=tk.X, pady=(3, 0))
         tk.Frame(self.sidebar_frame, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(0, 12))
         self.btn_tab_playback = SidebarButton(
-            self.sidebar_frame, text="▣  PLAYBACK",
+            self.sidebar_frame, text="PLAYBACK",
             command=lambda: self.show_tab("playback"))
         self.btn_tab_playback.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_sequencer = SidebarButton(
-            self.sidebar_frame, text="⇄  SEQUENCER",
+            self.sidebar_frame, text="SEQUENCER",
             command=lambda: self.show_tab("sequencer"))
         self.btn_tab_sequencer.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_settings = SidebarButton(
-            self.sidebar_frame, text="⚙  SETTINGS",
+            self.sidebar_frame, text="SETTINGS",
             command=lambda: self.show_tab("settings"))
         self.btn_tab_settings.pack(fill=tk.X, padx=7, pady=2)
         tk.Frame(self.sidebar_frame, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(20, 10))
         self.btn_tab_guide = SidebarButton(
-            self.sidebar_frame, text="?  GUIDED TOUR", command=self.start_walkthrough)
+            self.sidebar_frame, text="GUIDED TOUR", command=self.start_walkthrough)
         self.btn_tab_guide.pack(fill=tk.X, padx=7, pady=(0, 12))
         tk.Label(self.sidebar_frame, text="Ctrl+F in Action Library\nF7 Record   •   F9 Run",
                  bg=BG_SIDEBAR, fg=TEXT_MUTED, justify="left",
@@ -7589,21 +8107,63 @@ class BuiltInMacroApp:
         self._place_controls_dock()
         sequent_dock_header(self.control_dock, "Controls", "REC / PLAY")
 
-        controls = tk.Frame(self.control_dock, bg=BG_PANEL, padx=13, pady=14)
-        controls.pack(fill=tk.BOTH, expand=True)
+        # The execution buttons must never be clipped by the taller transport
+        # widgets. Pin them immediately under the dock header; scroll the rest.
+        controls_host = tk.Frame(self.control_dock, bg=BG_PANEL)
+        controls_host.pack(fill=tk.BOTH, expand=True)
+        execution = tk.Frame(controls_host, bg=BG_PANEL, padx=13, pady=9)
+        execution.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(execution, text="EXECUTION", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        self.record_btn = ModernButton(
+            execution, text=self.get_btn_text("start_rec"),
+            bg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOV,
+            command=self.toggle_recording)
+        self.record_btn.pack(fill=tk.X, pady=(7, 5))
+        self.play_btn = ModernButton(
+            execution, text=self.get_btn_text("start_play"),
+            bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+            command=self.toggle_playback)
+        self.play_btn.pack(fill=tk.X, pady=(0, 5))
+        self.pause_btn = ModernButton(
+            execution, text="Pause (F9)", bg_color=BG_BORDER,
+            hover_color=BG_HOVER, command=self.toggle_pause)
+        self.pause_btn.pack(fill=tk.X)
+        self.pause_btn.set_state("disabled")
+        ModernTooltip(self.record_btn, "Toggle Recording", self.hotkeys["start_rec"]["name"])
+        ModernTooltip(self.play_btn, "Run Active Macro", self.hotkeys["start_play"]["name"])
+        ModernTooltip(self.pause_btn, "Pause or Resume", "F9")
+        tk.Frame(controls_host, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=(4, 0))
+
+        scroll_host = tk.Frame(controls_host, bg=BG_PANEL)
+        scroll_host.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        control_canvas = tk.Canvas(scroll_host, bg=BG_PANEL, highlightthickness=0,
+                                   bd=0, yscrollincrement=14)
+        scrollbar = ModernScrollBar(scroll_host, command=control_canvas.yview,
+                                    width=12, bg_trough=BG_PANEL)
+        control_canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        control_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        controls = tk.Frame(control_canvas, bg=BG_PANEL, padx=13, pady=12)
+        control_window = control_canvas.create_window((0, 0), window=controls,
+                                                      anchor="nw")
+        controls.bind("<Configure>", lambda e: control_canvas.configure(
+            scrollregion=control_canvas.bbox("all")))
+        control_canvas.bind("<Configure>", lambda e: control_canvas.itemconfigure(
+            control_window, width=e.width))
         tk.Label(controls, text="TRANSPORT", bg=BG_PANEL, fg=TEXT_MUTED,
                  font=("Segoe UI", 8, "bold")).pack(fill=tk.X, anchor="w")
         self.scrub_card = tk.Frame(controls, bg=BG_PANEL)
         self.scrub_card.pack(fill=tk.X, pady=(9, 9))
         step_controls = tk.Frame(self.scrub_card, bg=BG_PANEL)
         step_controls.pack(fill=tk.X, pady=(0, 12))
-        for title, callback, hint in [
-            ("⏮", self.jump_to_start, "Home"),
-            ("◀", self.step_backward, "Previous"),
-            ("▶", self.step_forward, "Next"),
-            ("⚡ Step", self.run_single_step, "Execute selected action"),
+        for title, callback, hint, icon_name in [
+            ("", self.jump_to_start, "Home", "first"),
+            ("", self.step_backward, "Previous", "back"),
+            ("", self.step_forward, "Next", "forward"),
+            ("Step", self.run_single_step, "Execute selected action", "step"),
         ]:
-            btn = sequent_toolbar_button(step_controls, title, callback)
+            btn = sequent_toolbar_button(step_controls, title, callback, icon=icon_name)
             btn.pack(side=tk.LEFT, padx=(0, 5))
             ModernTooltip(btn, hint)
         tk.Label(self.scrub_card, text="PLAYHEAD", bg=BG_PANEL, fg=TEXT_MUTED,
@@ -7639,7 +8199,7 @@ class BuiltInMacroApp:
                                           wraplength=245, justify="left")
         self.lbl_active_action.pack(fill=tk.X, pady=(6, 0))
         self.btn_edit_reticle = sequent_toolbar_button(
-            controls, "⌖ Adjust Ghost Reticle", self.toggle_reticle_edit)
+            controls, "Adjust Ghost Reticle", self.toggle_reticle_edit)
         self.btn_edit_reticle.pack(fill=tk.X, pady=(8, 0))
         ModernTooltip(self.btn_edit_reticle,
                       "Select Find Color & Click; drag the ghost or use Alt+Arrows to nudge")
@@ -7649,24 +8209,22 @@ class BuiltInMacroApp:
             justify="left", anchor="w", wraplength=235)
         self.lbl_color_live_preview.pack(fill=tk.X, pady=(6, 0))
         tk.Frame(controls, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=14)
-        tk.Label(controls, text="EXECUTION", bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        self.record_btn = ModernButton(controls, text=self.get_btn_text("start_rec"),
-                                       bg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOV,
-                                       command=self.toggle_recording)
-        self.record_btn.pack(fill=tk.X, pady=(9, 7))
-        self.play_btn = ModernButton(controls, text=self.get_btn_text("start_play"),
-                                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
-                                     command=self.toggle_playback)
-        self.play_btn.pack(fill=tk.X, pady=(0, 7))
-        self.pause_btn = ModernButton(controls, text="Pause (F9)",
-                                      bg_color=BG_BORDER, hover_color=BG_HOVER,
-                                      command=self.toggle_pause)
-        self.pause_btn.pack(fill=tk.X)
-        self.pause_btn.set_state("disabled")
-        ModernTooltip(self.record_btn, "Toggle Recording", self.hotkeys["start_rec"]["name"])
-        ModernTooltip(self.play_btn, "Run Active Macro", self.hotkeys["start_play"]["name"])
-        ModernTooltip(self.pause_btn, "Pause or Resume", "F9")
+        # Scroll only the optional transport/reticle controls. The essential
+        # Record / Run / Pause actions remain visible in the pinned header.
+        def scroll_transport(event):
+            if control_canvas.winfo_exists():
+                notches = -int(event.delta / 120) if event.delta else 0
+                if notches:
+                    control_canvas.yview_scroll(notches, "units")
+                return "break"
+
+        def bind_transport_wheel(widget):
+            widget.bind("<MouseWheel>", scroll_transport, add="+")
+            for child in widget.winfo_children():
+                bind_transport_wheel(child)
+
+        bind_transport_wheel(controls)
+        control_canvas.bind("<MouseWheel>", scroll_transport)
 
         self.queue_dock = ModernCard(self.queue_viewport, bg_card=BG_PANEL)
         queue_dock = self.queue_dock
@@ -7687,9 +8245,9 @@ class BuiltInMacroApp:
         self.action_badge.pack(side=tk.RIGHT, padx=(3, 9))
         filebar = tk.Frame(queue_dock, bg=BG_PANEL, padx=11, pady=9)
         filebar.pack(fill=tk.X)
-        self.import_macro_button = sequent_toolbar_button(filebar, "↥  Import", self.load_macro_from_file)
+        self.import_macro_button = sequent_toolbar_button(filebar, "Import", self.load_macro_from_file)
         self.import_macro_button.pack(side=tk.LEFT, padx=(0, 5))
-        sequent_toolbar_button(filebar, "↧  Export", self.save_macro_to_file).pack(side=tk.LEFT)
+        sequent_toolbar_button(filebar, "Export", self.save_macro_to_file).pack(side=tk.LEFT)
         
         # The lengthy instruction consumed more width than the queue could
         # supply at its default size. Keep the help accessible via a tooltip.
@@ -7701,7 +8259,8 @@ class BuiltInMacroApp:
         # --- NEW SEARCH BAR UI ---
         search_frame = tk.Frame(filebar, bg=BG_INPUT, highlightbackground=BG_BORDER, highlightthickness=1)
         search_frame.pack(side=tk.RIGHT, padx=(0, 12))
-        tk.Label(search_frame, text="⌕", bg=BG_INPUT, fg=TEXT_MUTED, font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(6, 2))
+        SequentIcon(search_frame, 'search', bg=BG_INPUT,
+                    color=TEXT_MUTED, size=16).pack(side=tk.LEFT, padx=(6, 2))
         
         self.queue_search_var = tk.StringVar()
         queue_search_entry = tk.Entry(
@@ -7776,7 +8335,7 @@ class BuiltInMacroApp:
         tk.Frame(config, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=18)
         tk.Label(config, text="CHAIN TRANSPORT", bg=BG_PANEL, fg=TEXT_MUTED,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        self.btn_run_chain = ModernButton(config, text="▶ Run Macro Chain (F9)",
+        self.btn_run_chain = ModernButton(config, text="Run Macro Chain (F9)",
                                           bg_color=COLOR_SUCCESS,
                                           hover_color="#278761",
                                           command=self.toggle_chain_run)
@@ -7802,9 +8361,9 @@ class BuiltInMacroApp:
         self.chain_badge.pack(side=tk.RIGHT, padx=(3, 9))
         filebar = tk.Frame(left, bg=BG_PANEL, padx=11, pady=9)
         filebar.pack(fill=tk.X)
-        sequent_toolbar_button(filebar, "↥  Import Chain", self.load_chain_from_file).pack(
+        sequent_toolbar_button(filebar, "Import Chain", self.load_chain_from_file).pack(
             side=tk.LEFT, padx=(0, 6))
-        sequent_toolbar_button(filebar, "↧  Export Chain", self.save_chain_to_file).pack(
+        sequent_toolbar_button(filebar, "Export Chain", self.save_chain_to_file).pack(
             side=tk.LEFT)
         self.chain_scroll = ModernScrollableFrame(left, bg=BG_PANEL)
         self.chain_scroll.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -8022,7 +8581,7 @@ class BuiltInMacroApp:
         self.is_paused = False
         self.current_chain_stage = -1
         self.update_status("Chain Stopped", SYNTAX_ORANGE)
-        self.btn_run_chain.set_state("normal", text="▶ Run Macro Chain (F9)", bg=COLOR_SUCCESS, hover="#1d8a4b")
+        self.btn_run_chain.set_state("normal", text="Run Macro Chain (F9)", bg=COLOR_SUCCESS, hover="#1d8a4b")
         self.pause_btn.set_state("disabled", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
         self.refresh_chain_ui()
 
@@ -8057,46 +8616,32 @@ class BuiltInMacroApp:
             if not actions:
                 continue
 
-            # Run Preset for designated loop repetitions
-            for l_num in range(loops):
-                if not self.chain_running: break
-                if any(a.get('type') in DYNAMIC_ACTION_TYPES for a in actions):
-                    try:
-                        result = self.dynamic_engine.run_program(actions)
-                        if result.get('switch'):
-                            raise MacroExecutionError('Preset switching inside a chain stage is not supported')
-                    except Exception as error:
-                        reason = str(error) if isinstance(error, MacroExecutionError) else type(error).__name__
+            # All stages use the same interpreter and action executor as Play.
+            for _ in range(loops):
+                if not self.chain_running:
+                    break
+                try:
+                    result = self.dynamic_engine.run_program(actions)
+                    if result.get('cancelled'):
                         self.chain_running = False
                         self.playing = False
-                        self.root.after(0, lambda msg=reason: self._finish_chain_failed(msg))
+                        self.root.after(0, self.stop_chain)
                         return
-                    continue
-
-                # Execute individual preset sequence
-                for act in actions:
-                    if not self.chain_running: break
-
-                    while self.is_paused and self.chain_running:
-                        time.sleep(0.04)
-
-                    try:
-                        self.execute_single_action(act)
-                    except Exception as error:
-                        reason = str(error) if isinstance(error, MacroExecutionError) else type(error).__name__
-                        self.chain_running = False
-                        self.playing = False
-                        self.root.after(0, lambda msg=reason: self._finish_chain_failed(msg))
-                        return
-
-                    actual_delay = max(0.01, self.action_delay / self.playback_speed)
-                    steps = max(1, int(actual_delay / 0.02))
-                    step_delay = actual_delay / steps
-                    for _ in range(steps):
-                        while self.is_paused and self.chain_running:
-                            time.sleep(0.04)
-                        if not self.chain_running: break
-                        time.sleep(step_delay)
+                    if result.get('switch'):
+                        raise MacroExecutionError(
+                            'Preset switching inside a chain stage is not supported')
+                except MacroCancelled:
+                    self.chain_running = False
+                    self.playing = False
+                    self.root.after(0, self.stop_chain)
+                    return
+                except Exception as error:
+                    reason = (str(error) if isinstance(error, MacroExecutionError)
+                              else f'{type(error).__name__}: {error}')
+                    self.chain_running = False
+                    self.playing = False
+                    self.root.after(0, lambda msg=reason: self._finish_chain_failed(msg))
+                    return
 
             # Post-stage delay
             if post_delay > 0 and self.chain_running:
@@ -8122,7 +8667,7 @@ class BuiltInMacroApp:
         self.is_paused = False
         self.current_chain_stage = -1
         self.update_status("Chain Complete", COLOR_SUCCESS)
-        self.btn_run_chain.set_state("normal", text="▶ Run Macro Chain (F9)", bg=COLOR_SUCCESS, hover="#1d8a4b")
+        self.btn_run_chain.set_state("normal", text="Run Macro Chain (F9)", bg=COLOR_SUCCESS, hover="#1d8a4b")
         self.pause_btn.set_state("disabled", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
         self.refresh_chain_ui()
 
@@ -8203,15 +8748,15 @@ class BuiltInMacroApp:
             if act_type == 'loop_start': return f"↻ LOOP {action.get('mode','count')} ({action.get('count', '')})"
             if act_type == 'loop_end': return "↻ END LOOP"
             detail = action.get('name') or action.get('match') or action.get('path') or action.get('var_name') or action.get('kind') or ''
-            return f"⚙ {kind}({str(detail)[:34]})"
+            return f"{kind}({str(detail)[:34]})"
         if act_type == "label": 
-            return f"🏷️ flow.label('{action.get('name', '')}')"
+            return f"flow.label('{action.get('name', '')}')"
         elif act_type == "goto": 
-            return f"↪️ flow.goto('{action.get('target', '')}')"
+            return f"flow.goto('{action.get('target', '')}')"
         elif act_type == "disclaimer":
             msg = action.get("message", "")
             preview = (msg[:24] + "..") if len(msg) > 26 else msg
-            return f"⚠️ ui.disclaimer('{preview}')"
+            return f"ui.disclaimer('{preview}')"
         elif act_type == "if_var":
             op = action.get("op", "==")
             v_name = action.get("var_name", "status")
@@ -8219,77 +8764,77 @@ class BuiltInMacroApp:
             t_type = action.get("target_type", "preset")
             tgt = action.get("target", "")
             if t_type == "label":
-                return f"🔀 flow.if('{v_name}' {op} '{v_val}' ➔ goto '{tgt}')"
+                return f"flow.if('{v_name}' {op} '{v_val}' ➔ goto '{tgt}')"
             elif t_type == "preset":
-                return f"🔀 flow.if('{v_name}' {op} '{v_val}' ➔ preset '{tgt}')"
+                return f"flow.if('{v_name}' {op} '{v_val}' ➔ preset '{tgt}')"
             elif t_type == "file":
                 fname = os.path.basename(tgt)
-                return f"🔀 flow.if('{v_name}' {op} '{v_val}' ➔ run '{fname}')"
+                return f"flow.if('{v_name}' {op} '{v_val}' ➔ run '{fname}')"
         elif act_type == "drag": 
-            return f"✋ mouse.drag(({action.get('start_x')},{action.get('start_y')}) ➔ ({action.get('end_x')},{action.get('end_y')}))"
+            return f"mouse.drag(({action.get('start_x')},{action.get('start_y')}) ➔ ({action.get('end_x')},{action.get('end_y')}))"
         elif act_type == "scroll": 
             direction = "▲" if int(action.get('delta', 120)) > 0 else "▼"
-            return f"🖱️ mouse.scroll({direction} delta={action.get('delta', 120)}, at=({action.get('x', 0)},{action.get('y', 0)}))"
+            return f"mouse.scroll({direction} delta={action.get('delta', 120)}, at=({action.get('x', 0)},{action.get('y', 0)}))"
         elif act_type == "wait_pixel": 
-            return f"🎯 condition.wait_pixel(x={action.get('x', 0)}, y={action.get('y', 0)}, color='{action.get('color', '#FFFFFF')}')"
+            return f"condition.wait_pixel(x={action.get('x', 0)}, y={action.get('y', 0)}, color='{action.get('color', '#FFFFFF')}')"
         elif act_type == "wait_text":
-            return f"🔎 ocr.wait_text({action.get('text', '')!r}, {action.get('mode', 'appears')})"
+            return f"ocr.wait_text({action.get('text', '')!r}, {action.get('mode', 'appears')})"
         elif act_type == "read_clipboard": 
             kws = action.get('keywords', [])
             preview = kws[0] if len(kws) == 1 else f"{len(kws)} keywords"
-            return f"📋 clipboard.find('{preview}' ➔ ${action.get('var_name')}='{action.get('value')}')"
+            return f"clipboard.find('{preview}' ➔ ${action.get('var_name')}='{action.get('value')}')"
         elif act_type == "prompt_input": 
-            return f"💬 user.prompt('{action.get('prompt', '')}' ➔ ${action.get('var_name', '')})"
+            return f"user.prompt('{action.get('prompt', '')}' ➔ ${action.get('var_name', '')})"
         elif act_type == "type_variable": 
-            return f"🔤 keyboard.type_var('${action.get('var_name', '')}')"
+            return f"keyboard.type_var('${action.get('var_name', '')}')"
         elif act_type == "move": 
-            return f"↗️ mouse.move(x={action.get('x', 0)}, y={action.get('y', 0)})"
+            return f"mouse.move(x={action.get('x', 0)}, y={action.get('y', 0)})"
         elif act_type == "click": 
-            btn_glyph = "🖱️ [L]" if action.get('btn') == 'left' else "🖱️ [R]"
+            btn_glyph = "[L]" if action.get('btn') == 'left' else "[R]"
             return f"{btn_glyph} mouse.{action.get('btn', 'left')}_click(x={action.get('x', 0)}, y={action.get('y', 0)})"
         elif act_type == "key": 
-            return f"⌨️ keyboard.type('{action.get('key', '')}')"
+            return f"keyboard.type('{action.get('key', '')}')"
         elif act_type == "press": 
-            return f"⌨️ keyboard.press('{action.get('name', '')}')"
+            return f"keyboard.press('{action.get('name', '')}')"
         elif act_type == "combo": 
-            return f"⚡ keyboard.hotkey('{action.get('name', '')}')"
+            return f"keyboard.hotkey('{action.get('name', '')}')"
         elif act_type == "delay": 
-            return f"⏱️ system.delay({float(action.get('seconds', 1.0)):.2f}s)"
+            return f"system.delay({float(action.get('seconds', 1.0)):.2f}s)"
         elif act_type == "search_area":
             if action.get("match_any") or action.get("text") in ("*", "<ANY TEXT DETECTED>"):
-                return "🔍 ocr.search_area(match_any=True)"
-            return f"🔍 ocr.search_area('{action.get('text', '')}')"
+                return "ocr.search_area(match_any=True)"
+            return f"ocr.search_area('{action.get('text', '')}')"
         elif act_type == "find_color":
             sub_action = action.get('action', 'Single Click')
             verb = "move" if sub_action == "Move Only" else ("double_click" if sub_action == "Double Click" else "click")
-            return f"🎯 ocr.find_color('{action.get('color', '')}', offset=({action.get('ox', 0)},{action.get('oy', 0)}), do='{verb}')"
+            return f"ocr.find_color('{action.get('color', '')}', offset=({action.get('ox', 0)},{action.get('oy', 0)}), do='{verb}')"
         elif act_type == "find_text":
             sub_action = action.get("action", "Single Click")
             verb = "move" if sub_action == "Move Only" else ("double_click" if sub_action == "Double Click" else "click")
-            return f"🎯 ocr.find_text('{action.get('text', '')}', offset=({action.get('ox', 0)},{action.get('oy', 0)}), do='{verb}')"
+            return f"ocr.find_text('{action.get('text', '')}', offset=({action.get('ox', 0)},{action.get('oy', 0)}), do='{verb}')"
         elif act_type == "enter": 
-            return "↵ keyboard.press('Enter')"
+            return "keyboard.press('Enter')"
         elif act_type == "backspace": 
-            return "⌫ keyboard.press('Backspace')"
+            return "keyboard.press('Backspace')"
         elif act_type == "select_all": 
-            return "⚡ command.select_all()"
+            return "command.select_all()"
         elif act_type == "copy": 
-            return "📋 command.copy()"
+            return "command.copy()"
         elif act_type == "paste": 
-            return "📌 command.paste()"
+            return "command.paste()"
         elif act_type == "key_action":
             sub = action.get('action', 'Hold')
             key_name = action.get('key_name', '')
             if sub == 'Hold':
-                return f"⬇️ keyboard.hold('{key_name}')"
+                return f"keyboard.hold('{key_name}')"
             elif sub == 'Release':
-                return f"⬆️ keyboard.release('{key_name}')"
+                return f"keyboard.release('{key_name}')"
             else:
-                return f"⌨️ keyboard.press('{key_name}')"
+                return f"keyboard.press('{key_name}')"
         elif act_type == "clip_fallback":
             kws = action.get('keywords', [])
             preview = kws[0] if len(kws) == 1 else f"{len(kws)} keywords"
-            return f"🔀 clipboard.fallback(miss='{preview}' ➔ preset '{action.get('preset', '')}')"
+            return f"clipboard.fallback(miss='{preview}' ➔ preset '{action.get('preset', '')}')"
         return f"{act_type}"
         
 
@@ -8395,77 +8940,67 @@ class BuiltInMacroApp:
             self.update_scrubber_ui()
 
     def run_single_step(self):
-        if (self.recording and not self.recording_paused) or self.playing or not self.recorded_actions: return
+        """Single-step the exact same interpreter used for normal playback."""
+        if ((self.recording and not self.recording_paused) or self.playing or
+                not self.recorded_actions or getattr(self, '_debug_step_running', False)):
+            return
         if self.current_action_idx >= len(self.recorded_actions):
             self.current_action_idx = 0
-
-        action = self.recorded_actions[self.current_action_idx]
         self._prepare_mouse_execution()
-        if any(a.get('type') in DYNAMIC_ACTION_TYPES for a in self.recorded_actions):
+        state = getattr(self, '_dynamic_debug_state', None)
+        if not state or state.get('next_index') != self.current_action_idx:
+            state = {'frames': [], 'next_index': self.current_action_idx}
+        self._debug_step_running = True
+        self._debugger_modal_active = True
+        index = self.current_action_idx
+
+        def worker():
             try:
-                state=getattr(self,'_dynamic_debug_state',None)
-                if not state or state.get('next_index')!=self.current_action_idx:
-                    state={'frames':[],'next_index':self.current_action_idx}
-                result=self.dynamic_engine.run_program(
-                    self.recorded_actions, self.current_action_idx,
-                    idle=True, max_actions=1, frames=state['frames'])
+                result = self.dynamic_engine.run_program(
+                    self.recorded_actions, index, idle=True,
+                    max_actions=1, frames=state['frames'])
                 if result.get('switch'):
-                    self.update_status('Debugger: preset switch requires regular playback',SYNTAX_ORANGE)
+                    def switch_notice():
+                        self._dynamic_debug_state = None
+                        self.update_status('Debugger: preset switch requires regular playback', SYNTAX_ORANGE)
+                    self.root.after(0, switch_notice)
                     return
-                next_idx=result['next_index']
-                self._dynamic_debug_state={'frames':result.get('frames',[]),
-                                           'next_index':next_idx}
-                if next_idx < len(self.recorded_actions):
-                    self.current_action_idx=next_idx
-                    self.update_scrubber_ui()
-                    self.update_status(f'Stepped to action #{next_idx+1}',COLOR_SUCCESS)
-                else:
-                    self.update_status('End of dynamic workflow',COLOR_SUCCESS)
-                    self._dynamic_debug_state=None
-                return
+                if result.get('cancelled'):
+                    self.root.after(0, lambda: self.update_status('Step cancelled', SYNTAX_ORANGE))
+                    return
+                next_idx = result['next_index']
+                new_state = {'frames': result.get('frames', []), 'next_index': next_idx}
+                def finish():
+                    if next_idx < len(self.recorded_actions):
+                        self._dynamic_debug_state = new_state
+                        self.current_action_idx = next_idx
+                        self.update_scrubber_ui()
+                        self.update_status(f'Stepped to action #{next_idx+1}', COLOR_SUCCESS)
+                    else:
+                        self._dynamic_debug_state = None
+                        self.update_status('End of sequence', COLOR_SUCCESS)
+                self.root.after(0, finish)
+            except MacroCancelled:
+                self.root.after(0, lambda: self.update_status('Step cancelled', SYNTAX_ORANGE))
             except Exception as exc:
-                self._dynamic_debug_state=None
-                self.update_status(f'Step Error: {exc}',COLOR_DANGER)
-                return
-        if action.get("type") == "wait_text":
-            index = self.current_action_idx
-            self.update_status(f"Checking text at step #{index + 1}...", COLOR_ACCENT)
-            def worker():
-                try:
-                    matched = self.wait_for_screen_text(action, allow_idle=True)
-                    if not matched:
-                        raise MacroExecutionError(f"Text timeout at step {index + 1}")
-                except Exception as error:
-                    reason = str(error) if isinstance(error, MacroExecutionError) else type(error).__name__
-                    self.root.after(0, lambda msg=reason: self.update_status(f"Step failed: {msg}", COLOR_DANGER))
-                    return
-                self.root.after(0, lambda: self._finish_single_step(index))
-            Thread(target=worker, daemon=True).start()
-            return
+                msg = str(exc)
+                self.root.after(0, lambda m=msg: (
+                    setattr(self, '_dynamic_debug_state', None),
+                    self.update_status(f'Step Error: {m}', COLOR_DANGER)))
+            finally:
+                def done():
+                    self._debug_step_running = False
+                    self._debugger_modal_active = False
+                self.root.after(0, done)
 
-        try:
-            self.execute_single_action(action)
-        except Exception as error:
-            self.update_status(f"Step Error: {error}", COLOR_DANGER)
-            return
-        self._finish_single_step(self.current_action_idx)
+        Thread(target=worker, daemon=True).start()
 
-    def _finish_single_step(self, index):
-        if self.playing or self.recording or index != self.current_action_idx:
-            return
-        if index < len(self.recorded_actions) - 1:
-            self.current_action_idx += 1
-            self.update_scrubber_ui()
-            self.update_status(f"Ran step #{index + 1}", COLOR_SUCCESS)
-        else:
-            self.update_status("End of sequence", COLOR_SUCCESS)
-        
-    def execute_single_action(self, action):
+    def execute_single_action(self, action, *, idle=False):
         act_type = action.get("type")
         def report(message,color):
             self.root.after(0,lambda m=message,c=color:self.update_status(m,c))
         if act_type in DYNAMIC_ACTION_TYPES:
-            return self.dynamic_engine.execute(action, idle=not self.playing)
+            return self.dynamic_engine.execute(action, idle=idle)
         if act_type == "move":
             tx,ty=action.get('x',0),action.get('y',0)
             if action.get('win_title'):
@@ -8475,7 +9010,10 @@ class BuiltInMacroApp:
                 for x,y in calculate_bezier_trajectory(get_mouse_pos(),(tx,ty),18):
                     move_mouse(x,y)
                     time.sleep(max(0.001,0.008/self.playback_speed))
-            else:move_mouse(tx,ty)
+            else:
+                move_mouse(tx, ty)
+                if self.fluid_mouse:
+                    time.sleep(max(0.001, 0.010 / max(0.1, self.playback_speed)))
         elif act_type == "click":
             tx, ty = action.get("x", 0), action.get("y", 0)
             if action.get('win_title'):
@@ -8498,11 +9036,7 @@ class BuiltInMacroApp:
             delta = int(action.get("delta", 120))
             ctypes.windll.user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, ctypes.c_uint32(delta & 0xFFFFFFFF).value, 0)
         elif act_type == "drag":
-            move_mouse(action.get("start_x", 0), action.get("start_y", 0))
-            time.sleep(0.02)
-            ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-            move_mouse(action.get("end_x", 0), action.get("end_y", 0))
-            ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            perform_recorded_drag(action, self.playback_speed, self.human_bezier)
         elif act_type == "delay":
             time.sleep(max(0.05, float(action.get("seconds", 1.0))))
         elif act_type == "disclaimer":
@@ -8510,7 +9044,8 @@ class BuiltInMacroApp:
             d_msg = action.get("message", "Proceed with execution?")
             proceed = self.show_disclaimer_modal(d_title, d_msg)
             if not proceed:
-                report("Disclaimer cancelled", COLOR_DANGER)
+                report("Disclaimer cancelled", SYNTAX_ORANGE)
+                raise MacroCancelled("Disclaimer cancelled by user")
             else:
                 report("Disclaimer accepted", COLOR_SUCCESS)
         elif act_type == "prompt_input":
@@ -8559,7 +9094,10 @@ class BuiltInMacroApp:
         elif act_type == "combo":
             press_key_combo(action.get("mods", []), action.get("vk", 0))
         elif act_type == "wait_text":
-            if not self.wait_for_screen_text(action):
+            matched = self.wait_for_screen_text(action, allow_idle=idle)
+            if not matched:
+                if not idle and not self.playing:
+                    raise MacroCancelled('Playback stopped during text wait')
                 raise MacroExecutionError("Wait Text timed out")
         elif act_type == "wait_pixel":
             tx,ty=action.get('x',0),action.get('y',0)
@@ -8572,7 +9110,7 @@ class BuiltInMacroApp:
                 if get_pixel_color(tx,ty)==expected:break
                 if time.monotonic()>=deadline:
                     raise MacroExecutionError(f'Pixel {expected} timed out at ({tx},{ty})')
-                self.dynamic_engine._pause(0.05,idle=not self.playing)
+                self.dynamic_engine._pause(0.05,idle=idle)
             if self.audio_cues:play_cue('match')
         elif act_type == "find_color":
             area = action.get("area", [0, 0, 100, 100])
@@ -8580,6 +9118,8 @@ class BuiltInMacroApp:
             found_box = self.search_color_in_area(*area, hex_color,
                             tolerance=action.get("tolerance", 8))
 
+            if not idle and not self.playing:
+                raise MacroCancelled('Playback stopped during target search')
             if found_box:
                 mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
                 self.root.after(0, lambda b=found_box:
@@ -8594,6 +9134,8 @@ class BuiltInMacroApp:
             target_text = action.get("text", "")
             found_box = self.find_text_rect(*area, target_text)
 
+            if not idle and not self.playing:
+                raise MacroCancelled('Playback stopped during target search')
             if found_box:
                 mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
                 self.root.after(0, lambda b=found_box: self.draw_highlight_box(*b, COLOR_SUCCESS, 800))
@@ -8728,100 +9270,95 @@ class BuiltInMacroApp:
         snipper.focus_force()
 
     def start_screen_selection(self, callback):
-        self.root.withdraw()
+        """Select exact native Win32 virtual-screen pixels used by GDI/OCR.
 
-        vx = ctypes.windll.user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
-        vy = ctypes.windll.user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
-        vw = ctypes.windll.user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
-        vh = ctypes.windll.user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
-
+        Tk x_root/y_root may be DPI-virtualized on a different monitor. Only
+        use native GetCursorPos for saved selection geometry; draw with local
+        Tk canvas coordinates so the preview is visually stable.
+        """
+        desktop = get_virtual_desktop_bounds()
+        vx, vy, vw, vh = desktop
         if vw <= 0 or vh <= 0:
-            vx, vy = 0, 0
-            vw = self.root.winfo_screenwidth()
-            vh = self.root.winfo_screenheight()
+            raise MacroExecutionError("Cannot determine virtual desktop bounds")
 
-        snipper = tk.Toplevel()
-        snipper.attributes('-topmost', True)
-        snipper.attributes('-alpha', 0.28)
-        snipper.configure(bg="#000000")
-        snipper.overrideredirect(True)
-        
-        # 1. Establish the size explicitly for Tkinter's layout engine
-        snipper.geometry(f"{vw}x{vh}")
-        
-        # 2. Pack the canvas immediately so it expands to the full size
-        canvas = tk.Canvas(snipper, bg="#000000", highlightthickness=0)
-        canvas.pack(fill=tk.BOTH, expand=True)
-
-        snipper.update_idletasks()
-        
-        # Place Tk's *outer wrapper* on the virtual desktop, not its child HWND.
-        position_toplevel_on_screen(snipper, vx, vy, vw, vh, activate=True)
-
-        snipper.config(cursor="cross")
+        self.root.withdraw()
+        try:
+            snipper = tk.Toplevel()
+            snipper.attributes('-topmost', True)
+            snipper.attributes('-alpha', 0.28)
+            snipper.configure(bg="#000000")
+            snipper.overrideredirect(True)
+            snipper.geometry(f"{vw}x{vh}")
+            canvas = tk.Canvas(snipper, bg="#000000", highlightthickness=0)
+            canvas.pack(fill=tk.BOTH, expand=True)
+            snipper.update_idletasks()
+            position_toplevel_on_screen(snipper, vx, vy, vw, vh, activate=True)
+            snipper.config(cursor="cross")
+        except Exception:
+            self.restore_after_desktop_picker()
+            raise
 
         banner_x = vw // 2
         canvas.create_text(
             banner_x, 40,
             text="DRAG TO SELECT SEARCH AREA  |  ESC OR RIGHT-CLICK TO CANCEL",
-            fill="#ffffff", font=("Segoe UI", 12, "bold")
-        )
+            fill="#ffffff", font=("Segoe UI", 12, "bold"))
 
-        state = {"start_root_x": 0, "start_root_y": 0, "rect": None, "closed": False}
+        state = {"start_screen": None, "start_canvas": None,
+                 "rect": None, "closed": False}
+
+        def close_selector():
+            if state["closed"]:
+                return False
+            state["closed"] = True
+            try:
+                snipper.destroy()
+            finally:
+                self.restore_after_desktop_picker()
+            return True
 
         def cancel_snipping(event=None):
-            if not state["closed"]:
-                state["closed"] = True
-                try: snipper.destroy()
-                except Exception: pass
-                self.restore_after_desktop_picker()
+            close_selector()
 
         cancel_badge = tk.Label(
             snipper, text="  ✕ Cancel (Esc / Right-Click)  ",
-            bg=COLOR_DANGER, fg="#ffffff", font=("Segoe UI", 9, "bold"), cursor="hand2"
-        )
+            bg=COLOR_DANGER, fg="#ffffff", font=("Segoe UI", 9, "bold"),
+            cursor="hand2")
         cancel_badge.place(x=banner_x - 120, y=65)
         cancel_badge.bind("<Button-1>", cancel_snipping)
         cancel_badge.bind("<Enter>", lambda e: cancel_badge.config(bg=COLOR_DANGER_HOV))
         cancel_badge.bind("<Leave>", lambda e: cancel_badge.config(bg=COLOR_DANGER))
 
         def on_mouse_down(event):
-            state["start_root_x"] = event.x_root
-            state["start_root_y"] = event.y_root
-            c_x = event.x_root - vx
-            c_y = event.y_root - vy
-            if state["rect"]: canvas.delete(state["rect"])
+            if state["closed"]:
+                return
+            state["start_screen"] = get_mouse_pos()
+            state["start_canvas"] = (event.x, event.y)
+            if state["rect"] is not None:
+                canvas.delete(state["rect"])
             state["rect"] = canvas.create_rectangle(
-                c_x, c_y, c_x, c_y,
-                outline=COLOR_ACCENT, width=2, fill=COLOR_ACCENT, stipple="gray25"
-            )
+                event.x, event.y, event.x, event.y,
+                outline=COLOR_ACCENT, width=2,
+                fill=COLOR_ACCENT, stipple="gray25")
 
         def on_mouse_drag(event):
-            if state["rect"]:
-                start_cx = state["start_root_x"] - vx
-                start_cy = state["start_root_y"] - vy
-                curr_cx = event.x_root - vx
-                curr_cy = event.y_root - vy
-                canvas.coords(state["rect"], start_cx, start_cy, curr_cx, curr_cy)
+            if state["rect"] is not None and not state["closed"]:
+                sx, sy = state["start_canvas"]
+                canvas.coords(state["rect"], sx, sy, event.x, event.y)
 
         def on_mouse_up(event):
-            if state["closed"]: return
-            end_root_x, end_root_y = event.x_root, event.y_root
-            x = min(state["start_root_x"], end_root_x)
-            y = min(state["start_root_y"], end_root_y)
-            w = abs(end_root_x - state["start_root_x"])
-            h = abs(end_root_y - state["start_root_y"])
-
-            state["closed"] = True
-            try: snipper.destroy()
-            except Exception: pass
-            # Let the action editor return to the foreground once Sequent is
-            # finished remapping its main window, regardless of drag size.
-            self.restore_after_desktop_picker()
-            if w > 8 and h > 8:
-                callback([x, y, w, h])
-            else:
-                self.update_status("Search area unchanged (drag a box at least 9px wide and tall)", SYNTAX_ORANGE)
+            if state["closed"] or state["start_screen"] is None:
+                return
+            end_screen = get_mouse_pos()
+            region = screen_selection_rect(state["start_screen"], end_screen, desktop)
+            if close_selector():
+                if region[2] >= 9 and region[3] >= 9:
+                    # Defer until the picker is destroyed and editor refocused.
+                    self.root.after_idle(lambda r=list(region): callback(r))
+                else:
+                    self.update_status(
+                        "Search area unchanged (drag a box at least 9px wide and tall)",
+                        SYNTAX_ORANGE)
 
         canvas.bind("<Button-1>", on_mouse_down)
         canvas.bind("<B1-Motion>", on_mouse_drag)
@@ -8834,12 +9371,21 @@ class BuiltInMacroApp:
 
         def poll_hardware_escape():
             if not state["closed"]:
-                if (ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0:
+                if ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000:
                     cancel_snipping()
-                    return
-                snipper.after(40, poll_hardware_escape)
+                else:
+                    snipper.after(40, poll_hardware_escape)
 
         snipper.after(40, poll_hardware_escape)
+
+    def preview_screen_search_area(self, area):
+        """Show where the search will actually scan, without changing the macro."""
+        x, y, w, h = validated_capture_area(area)
+        self.draw_highlight_box(x, y, x + w, y + h,
+                                outline_color=COLOR_ACCENT, duration_ms=1600)
+        self.update_status(
+            f"Search area: ({x}, {y}) · {w} x {h} native screen pixels",
+            SYNTAX_BLUE)
 
     def capture_screen_area_to_bmp(self, x, y, w, h, filepath):
         """Capture the selected screen rectangle as a BMP for WinRT OCR.
@@ -9470,7 +10016,7 @@ try {{
         tk.Label(tour_row, text="Explore the application with highlighted controls and step-by-step guidance.",
                  bg=BG_PANEL, fg=TEXT_MUTED, font=("Segoe UI", 9),
                  anchor="w").pack(fill=tk.X, pady=(3, 8))
-        sequent_toolbar_button(tour_row, "▶  Start Guided Walkthrough", self.start_walkthrough).pack(anchor="w")
+        sequent_toolbar_button(tour_row, "Start Guided Walkthrough", self.start_walkthrough).pack(anchor="w")
 
         # --- SECTION 2: PLAYBACK & TIMING ---
         tk.Label(scroll_container, text="PLAYBACK & TIMING", font=("Segoe UI", 8, "bold"), bg=BG_APP, fg=TEXT_MUTED).pack(anchor="w", padx=22, pady=(0, 4))
@@ -11487,15 +12033,16 @@ try {{
 
             entry.bind("<Return>", submit)
             dlg.bind("<Escape>", cancel)
+            dlg.protocol("WM_DELETE_WINDOW", cancel)
 
             ok_btn = ModernButton(btn_row, text="Submit", bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV, command=submit)
             ok_btn.pack(side=tk.RIGHT)
 
         self.root.after(0, _show)
-        while not evt.is_set():
-            if not self.playing and not self.recording:
+        while not evt.wait(0.05):
+            if (not self.playing and not self.recording and
+                    not getattr(self, '_debugger_modal_active', False)):
                 break
-            evt.wait(0.05)
 
         return result[0]
         
@@ -11563,7 +12110,7 @@ try {{
             drag_icon = tk.Label(head, text=" ⠇ ", font=("Segoe UI", 9), bg=BG_HEADER, fg=TEXT_MUTED, cursor="fleur")
             drag_icon.pack(side=tk.LEFT, padx=(4, 0))
 
-            lbl_title = tk.Label(head, text=f"⚠️  {title_text.upper()}", font=("Segoe UI", 8, "bold"), bg=BG_HEADER, fg=SYNTAX_ORANGE, cursor="fleur")
+            lbl_title = tk.Label(head, text=title_text.upper(), font=("Segoe UI", 8, "bold"), bg=BG_HEADER, fg=SYNTAX_ORANGE, cursor="fleur")
             lbl_title.pack(side=tk.LEFT, padx=4, pady=5)
 
             drag_data = {"x": 0, "y": 0, "win_x": 0, "win_y": 0}
@@ -11614,24 +12161,28 @@ try {{
 
             dlg.bind("<Return>", on_confirm)
             dlg.bind("<Escape>", on_cancel)
+            dlg.protocol("WM_DELETE_WINDOW", on_cancel)
 
             btn_abort = ModernButton(btn_row, text="Abort Macro", bg_color=BG_BORDER, hover_color=COLOR_DANGER, command=on_cancel)
             btn_abort.pack(side=tk.LEFT)
 
-            btn_proceed = ModernButton(btn_row, text="Proceed ▶", bg_color=COLOR_SUCCESS, hover_color="#1d8a4b", command=on_confirm)
+            btn_proceed = ModernButton(btn_row, text="Proceed", bg_color=COLOR_SUCCESS, hover_color="#1d8a4b", command=on_confirm)
             btn_proceed.pack(side=tk.RIGHT)
 
         self.root.after(0, _show)
-        while not evt.is_set():
-            if not self.playing and not self.recording:
+        while not evt.wait(0.05):
+            # Step-debugging runs while playing=False, so let its modal remain.
+            if (self.playing is False and self.recording is False and
+                    not getattr(self, '_debugger_modal_active', False)):
                 break
-            evt.wait(0.05)
-
         return proceed[0]
 
     def _run_structured_macro(self):
-        """Regular playback using the same interpreter as macro chains."""
+        """The sole playback engine for recordings, workflows and presets."""
         total = len(self.recorded_actions)
+        if total == 0:
+            self.root.after(0, self.finish_macro)
+            return
         self.playback_run_id = time.time()
         self._playback_ui_pending = False
         run_id = self.playback_run_id
@@ -11648,7 +12199,12 @@ try {{
                         self.root.after(0,lambda i=index:self.update_status(f'Breakpoint at step {i+1}',COLOR_DANGER))
                         self.root.after(0,lambda:self.pause_btn.set_state('normal',text='Resume (F9)',bg=COLOR_SUCCESS,hover=COLOR_SUCCESS))
                         while self.is_paused and self.playing:time.sleep(.04)
-                    self.root.after(0,lambda i=index,r=run_id:self._on_playback_step(i,r))
+                    if not self.playing:
+                        raise MacroCancelled('Playback stopped at breakpoint')
+                    if not self._playback_ui_pending or action.get('type') != 'move':
+                        self._playback_ui_pending = True
+                        self.root.after(0, lambda i=index, r=run_id:
+                                        self._on_playback_step(i, r))
                 result = self.dynamic_engine.run_program(self.recorded_actions,start,on_step=on_step)
                 if result.get('switch'):
                     self.switching_preset=True
@@ -11659,7 +12215,11 @@ try {{
                     elif result['switch']=='file':
                         self.root.after(150,lambda t=target:self.switch_to_file_and_start(t))
                     return
-                if result.get('cancelled'):break
+                if result.get('cancelled'):
+                    self.playing = False
+                    break
+        except MacroCancelled:
+            self.playing = False
         except Exception as exc:
             reason = str(exc) if isinstance(exc,MacroExecutionError) else f'Unexpected {type(exc).__name__}: {exc}'
             self.playing=False
@@ -11790,459 +12350,12 @@ try {{
             except tk.TclError:pass
 
     def run_sequence(self):
-        # Structured workflows run through the shared dynamic action interpreter.
-        # Legacy-only recordings retain their existing high-fidelity playback path.
-        if any(a.get('type') in DYNAMIC_ACTION_TYPES for a in self.recorded_actions):
-            return self._run_structured_macro()
-        total_actions = len(self.recorded_actions)
-        if total_actions == 0:
-            self.root.after(0, self.finish_macro)
-            return
+        """Playback always runs the structured engine, regardless of action mix.
 
-        start_idx = self.current_action_idx if (0 <= self.current_action_idx < total_actions) else 0
-        if start_idx >= total_actions - 1:
-            start_idx = 0
-            self.current_action_idx = 0
-
-        self.playback_run_id = time.time()
-        self._playback_ui_pending = False
-        run_id = self.playback_run_id
-
-        self.root.after(0, lambda: self.update_status(f"Running (from #{start_idx + 1})...", COLOR_ACCENT))
-        if self.audio_cues: play_cue("start")
-
-        held_modifiers = set()
-        failure_reason = ""
-        max_loops = float('inf') if self.loop_mode == "∞ Loop" else int(self.loop_mode.replace("x", ""))
-        current_loop = 0
-
-        try:
-            while self.playing and current_loop < max_loops:
-                current_loop += 1
-                loop_start = start_idx if current_loop == 1 else 0
-                step_ptr = loop_start
-
-                while step_ptr < total_actions:
-                    if not self.playing: break
-
-                    while self.is_paused and self.playing:
-                        time.sleep(0.04)
-
-                    if not self.playing: break
-
-                    # --- Breakpoint Hit Check ---
-                    if step_ptr in self.breakpoints:
-                        if self.audio_cues: play_cue("pause")
-                        self.is_paused = True
-                        self.playback_run_id = time.time()
-                        self._playback_ui_pending = False
-                        bp_line = step_ptr + 2
-                        self.root.after(0, lambda l=bp_line: self.update_status(f"Breakpoint hit at Line {l}", COLOR_DANGER))
-                        self.root.after(0, lambda: self.pause_btn.set_state("normal", text="Resume (F9)", bg=COLOR_SUCCESS, hover="#1d8a4b"))
-                        while self.is_paused and self.playing:
-                            time.sleep(0.04)
-                        if not self.playing: break
-
-                    action = self.recorded_actions[step_ptr]
-                    act_type = action.get("type")
-
-                    # Synchronized UI step notification
-                    i = step_ptr
-                    if not self._playback_ui_pending or act_type != "move":
-                        self._playback_ui_pending = True
-                        self.root.after(0, lambda idx=i, rid=run_id: self._on_playback_step(idx, rid))
-
-                    # Flow Labels & Goto Jumps
-                    if act_type == "label":
-                        step_ptr += 1
-                        continue
-
-                    if act_type == "goto":
-                        target = action.get("target", "")
-                        found_idx = next((k for k, a in enumerate(self.recorded_actions) if a.get("type") == "label" and a.get("name") == target), None)
-                        if found_idx is not None:
-                            if self.audio_cues: play_cue("match")
-                            step_ptr = found_idx + 1
-                            continue
-                        else:
-                            step_ptr += 1
-                            continue
-
-                    # --- Disclaimer / Warning Note ---
-                    if act_type == "disclaimer":
-                        d_title = action.get("title", "Disclaimer Note")
-                        d_msg = action.get("message", "Proceed with execution?")
-                        proceed = self.show_disclaimer_modal(d_title, d_msg)
-                        if not proceed:
-                            self.root.after(0, self.stop_macro)
-                            return
-                        step_ptr += 1
-                        continue
-
-                    # --- Conditional Branch (Jump, Switch Preset, or Run File) ---
-                    if act_type == "if_var":
-                        v_name = action.get("var_name", "status")
-                        actual_val = str(self.variables.get(v_name, ""))
-                        op = action.get("op", "==")
-                        exp_val = str(action.get("val", ""))
-
-                        match = False
-                        if op == "==": match = (actual_val.lower() == exp_val.lower())
-                        elif op == "!=": match = (actual_val.lower() != exp_val.lower())
-                        elif op == "contains": match = (exp_val.lower() in actual_val.lower())
-                        elif op == "not empty": match = bool(actual_val.strip())
-
-                        if match:
-                            if self.audio_cues: play_cue("match")
-                            t_type = action.get("target_type", "preset")
-                            target = action.get("target", "")
-
-                            if t_type == "label":
-                                found_idx = next((k for k, a in enumerate(self.recorded_actions) if a.get("type") == "label" and a.get("name") == target), None)
-                                if found_idx is not None:
-                                    step_ptr = found_idx + 1
-                                    continue
-                                else:
-                                    step_ptr += 1
-                                    continue
-                            elif t_type == "preset":
-                                self.switching_preset = True
-                                self.playing = False
-                                self.root.after(150, lambda p=target: self.switch_to_preset_and_start(p))
-                                return
-                            elif t_type == "file":
-                                self.switching_preset = True
-                                self.playing = False
-                                self.root.after(150, lambda f=target: self.switch_to_file_and_start(f))
-                                return
-                        else:
-                            step_ptr += 1
-                            continue
-
-                    # --- Request User Input ---
-                    if act_type == "prompt_input":
-                        prompt_txt = action.get("prompt", "Enter input:")
-                        default_val = action.get("default", "")
-                        var_name = action.get("var_name", "user_data")
-                        entered_val = self.prompt_user_input(prompt_txt, default_val)
-                        if entered_val is not None:
-                            self.variables[var_name] = str(entered_val)
-                            if self.audio_cues: play_cue("match")
-                            self.root.after(0, lambda n=var_name, v=entered_val: self.update_status(f"Var '{n}' = '{v}'", COLOR_SUCCESS))
-                        step_ptr += 1
-                        continue
-
-                    # --- Read Clipboard & Store Variable ---
-                    if act_type == "read_clipboard":
-                        time.sleep(0.05)
-                        clip_content = get_clipboard_text().lower()
-                        keywords = [k.lower() for k in action.get("keywords", [])]
-                        matched = any(kw in clip_content for kw in keywords)
-                        var_name = action.get("var_name", "status")
-
-                        if matched:
-                            val = action.get("value", "")
-                            self.variables[var_name] = val
-                            if self.audio_cues: play_cue("match")
-                            self.root.after(0, lambda n=var_name, v=val: self.update_status(f"Var '{n}' = '{v}'", COLOR_SUCCESS))
-                        else:
-                            self.root.after(0, lambda n=var_name: self.update_status(f"Var '{n}': No match in clipboard", SYNTAX_ORANGE))
-
-                        step_ptr += 1
-                        continue
-
-                    # --- Type Stored Variable ---
-                    if act_type == "type_variable":
-                        var_name = action.get("var_name", "status")
-                        val = str(self.variables.get(var_name, ""))
-                        if val:
-                            type_string(val, self.playback_speed)
-                            self.root.after(0, lambda v=val: self.update_status(f"Typed '{v}'", COLOR_SUCCESS))
-                        else:
-                            self.root.after(0, lambda n=var_name: self.update_status(f"Var '{n}' empty", SYNTAX_ORANGE))
-
-                        raw_delay = max(0.01, self.action_delay / self.playback_speed)
-                        actual_delay = raw_delay * (random.uniform(0.85, 1.15) if self.delay_jitter else 1.0)
-                        time.sleep(actual_delay)
-                        step_ptr += 1
-                        continue
-
-                    # --- Delay Execution with Jitter ---
-                    if act_type == "delay":
-                        raw_sec = float(action.get("seconds", 1.0))
-                        delay_sec = raw_sec * (random.uniform(0.85, 1.15) if self.delay_jitter else 1.0)
-                        steps = max(1, int(delay_sec / 0.02))
-                        step_time = delay_sec / steps
-                        for _ in range(steps):
-                            while self.is_paused and self.playing: time.sleep(0.04)
-                            if not self.playing: break
-                            time.sleep(step_time)
-                        step_ptr += 1
-                        continue
-
-                    # --- Wait for Text ---
-                    if act_type == "wait_text":
-                        matched = self.wait_for_screen_text(action)
-                        if not self.playing:
-                            break
-                        if not matched:
-                            raise MacroExecutionError(f"Wait Text timed out at step {step_ptr + 1}")
-                        if self.audio_cues:
-                            play_cue("match")
-                        step_ptr += 1
-                        continue
-
-                    # --- Wait Pixel Condition ---
-                    if act_type == "wait_pixel":
-                        tx, ty = action.get("x", 0), action.get("y", 0)
-                        if action.get("win_title"):
-                            h = find_window_by_title_substr(action.get("win_title"))
-                            if h: tx, ty = client_to_screen_pos(h, action.get("rel_x", tx), action.get("rel_y", ty))
-
-                        expected_color = action.get("color", "#FFFFFF").upper()
-                        timeout_sec = float(action.get("timeout", 15.0))
-                        start_wait = time.time()
-                        matched = False
-
-                        while self.playing:
-                            while self.is_paused and self.playing: time.sleep(0.04)
-                            if not self.playing: break
-                            if get_pixel_color(tx, ty) == expected_color:
-                                matched = True
-                                break
-                            if time.time() - start_wait >= timeout_sec: break
-                            time.sleep(0.01)
-
-                        if not self.playing:
-                            break
-                        if not matched:
-                            raise MacroExecutionError(f"Pixel timeout at step {step_ptr + 1}")
-                        if self.audio_cues:
-                            play_cue("match")
-
-                        step_ptr += 1
-                        continue
-
-                    # --- Search Selected Area OCR ---
-                    if act_type == "search_area":
-                        target_text = action.get("text", "").strip()
-                        match_any = action.get("match_any", False) or target_text in ("*", "<ANY TEXT DETECTED>")
-                        area = action.get("area", [0, 0, 0, 0])
-                        target_preset = action.get("preset", "")
-
-                        status_label = "any text" if match_any else f"'{target_text}'"
-                        self.root.after(0, lambda l=status_label: self.lbl_active_action.config(text=f"// OCR searching: {l}", fg=SYNTAX_PURPLE))
-                        time.sleep(0.2)
-
-                        x, y, w, h = area
-                        raw_recognized = self.ocr_screen_area(x, y, w, h)
-                        if raw_recognized.startswith("ERR:"): raw_recognized = ""
-
-                        clean_rec = " ".join(re.sub(r'[^\w\s]', ' ', raw_recognized.lower()).split())
-                        found_match = (len(clean_rec.strip()) > 0) if match_any else (target_text.lower() in clean_rec)
-
-                        if found_match:
-                            if self.audio_cues: play_cue("match")
-                            self.switching_preset = True
-                            self.playing = False
-                            self.root.after(150, lambda p=target_preset: self.switch_to_preset_and_start(p))
-                            return
-                        else:
-                            step_ptr += 1
-                            continue
-                            
-                    # --- Find Color & Click (DYNAMIC BOUNDING BOX ANCHOR) ---
-                    if act_type == "find_color":
-                        area = action.get("area", [0, 0, 100, 100])
-                        hex_color = action.get("color", "#FFFFFF").upper()
-                        found_box = self.search_color_in_area(*area, hex_color,
-                                    tolerance=action.get("tolerance", 8))
-
-                        if found_box:
-                            mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
-                            self.root.after(0, lambda b=found_box:
-                                            self.draw_highlight_box(*b, COLOR_SUCCESS, 800))
-                            self.root.after(0, lambda m=mode, x=tx, y=ty:
-                                            self._report_color_execution(m, x, y))
-                            if self.audio_cues: play_cue("match")
-                        else:
-                            raise MacroExecutionError(f"Color {hex_color} not found in search area")
-                            
-                        step_ptr += 1
-                        continue
-
-                    # --- Find Text & Click (WinRT OCR word-box target) ---
-                    if act_type == "find_text":
-                        area = action.get("area", [0, 0, 100, 100])
-                        target_text = action.get("text", "")
-                        found_box = self.find_text_rect(*area, target_text)
-                        if not self.playing:
-                            break  # OCR may finish after a user cancels playback.
-                        if not found_box:
-                            raise MacroExecutionError(f"Text '{target_text}' not found in search area")
-                        mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
-                        self.root.after(0, lambda b=found_box:
-                                        self.draw_highlight_box(*b, COLOR_SUCCESS, 800))
-                        self.root.after(0, lambda m=mode, x=tx, y=ty:
-                                        self._report_text_execution(m, x, y))
-                        if self.audio_cues:
-                            play_cue("match")
-                        step_ptr += 1
-                        continue
-
-                    # --- Dynamic automation action (shared with chain / debugger) ---
-                    if act_type in DYNAMIC_ACTION_TYPES:
-                        self.dynamic_engine.run_action_with_recovery(action)
-                        step_ptr += 1
-                        continue
-
-                    # --- Mouse Movement ---
-                    if act_type == "move":
-                        tx, ty = action.get("x", 0), action.get("y", 0)
-                        if action.get("win_title"):
-                            h = find_window_by_title_substr(action.get("win_title"))
-                            if h: tx, ty = client_to_screen_pos(h, action.get("rel_x", tx), action.get("rel_y", ty))
-
-                        if self.human_bezier:
-                            cur_pos = get_mouse_pos()
-                            pts = calculate_bezier_trajectory(cur_pos, (tx, ty), steps=18)
-                            for bx, by in pts:
-                                move_mouse(bx, by)
-                                time.sleep(max(0.001, 0.008 / self.playback_speed))
-                        elif self.fluid_mouse:
-                            move_mouse(tx, ty)
-                            time.sleep(max(0.0005, 0.010 / self.playback_speed))
-
-                        step_ptr += 1
-                        continue
-
-                    # --- Mouse Drag & Drop ---
-                    if act_type == "drag":
-                        sx, sy = action.get("start_x", 0), action.get("start_y", 0)
-                        ex, ey = action.get("end_x", 0), action.get("end_y", 0)
-                        btn = action.get("btn", "left")
-                        down_flag = MOUSEEVENTF_LEFTDOWN if btn == "left" else MOUSEEVENTF_RIGHTDOWN
-                        up_flag = MOUSEEVENTF_LEFTUP if btn == "left" else MOUSEEVENTF_RIGHTUP
-
-                        move_mouse(sx, sy)
-                        time.sleep(0.04)
-                        ctypes.windll.user32.mouse_event(down_flag, 0, 0, 0, 0)
-                        time.sleep(0.05)
-
-                        pts = calculate_bezier_trajectory((sx, sy), (ex, ey), steps=24)
-                        for bx, by in pts:
-                            move_mouse(bx, by)
-                            time.sleep(max(0.002, 0.012 / self.playback_speed))
-
-                        move_mouse(ex, ey)
-                        time.sleep(0.04)
-                        ctypes.windll.user32.mouse_event(up_flag, 0, 0, 0, 0)
-                        step_ptr += 1
-                        continue
-
-                    # --- Mouse Scroll (Wheel) ---
-                    if act_type == "scroll":
-                        tx, ty = action.get("x", 0), action.get("y", 0)
-                        if action.get("win_title"):
-                            h = find_window_by_title_substr(action.get("win_title"))
-                            if h: tx, ty = client_to_screen_pos(h, action.get("rel_x", tx), action.get("rel_y", ty))
-
-                        if self.human_bezier:
-                            pts = calculate_bezier_trajectory(get_mouse_pos(), (tx, ty), steps=12)
-                            for bx, by in pts: move_mouse(bx, by); time.sleep(0.004)
-                        else:
-                            move_mouse(tx, ty)
-
-                        time.sleep(max(0.001, 0.02 / self.playback_speed))
-                        delta = int(action.get("delta", 120))
-                        ctypes.windll.user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, ctypes.c_uint32(delta & 0xFFFFFFFF).value, 0)
-
-                        raw_delay = max(0.01, self.action_delay / self.playback_speed)
-                        actual_delay = raw_delay * (random.uniform(0.85, 1.15) if self.delay_jitter else 1.0)
-                        steps = max(1, int(actual_delay / 0.02))
-                        step_delay = actual_delay / steps
-                        for _ in range(steps):
-                            while self.is_paused and self.playing: time.sleep(0.04)
-                            if not self.playing: break
-                            time.sleep(step_delay)
-
-                        step_ptr += 1
-                        continue
-
-                    if act_type != "combo":
-                        for m in list(held_modifiers):
-                            m_scan = ctypes.windll.user32.MapVirtualKeyW(m, 0)
-                            ctypes.windll.user32.keybd_event(m, m_scan, KEYEVENTF_KEYUP, 0)
-                        held_modifiers.clear()
-
-                    # --- Mouse Click ---
-                    if act_type == "click":
-                        tx, ty = action.get("x", 0), action.get("y", 0)
-                        if action.get("win_title"):
-                            h = find_window_by_title_substr(action.get("win_title"))
-                            if h: tx, ty = client_to_screen_pos(h, action.get("rel_x", tx), action.get("rel_y", ty))
-
-                        if self.human_bezier:
-                            pts = calculate_bezier_trajectory(get_mouse_pos(), (tx, ty), steps=14)
-                            for bx, by in pts: move_mouse(bx, by); time.sleep(0.005)
-                        else:
-                            move_mouse(tx, ty)
-
-                        wait_for_cursor_settled(tx, ty)
-                        click(action.get("btn", "left"))
-
-                    elif act_type == "key":
-                        type_string(str(action.get("key", "")), self.playback_speed)
-                    elif act_type == "press":
-                        press_virtual_key(action.get("vk", 0))
-                    elif act_type == "enter":
-                        press_virtual_key(VK_RETURN)
-                    elif act_type == "backspace":
-                        press_virtual_key(VK_BACK)
-                    elif act_type == "select_all":
-                        press_key_combo(VK_CONTROL, VK_A)
-                    elif act_type == "copy":
-                        press_key_combo(VK_CONTROL, VK_C)
-                    elif act_type == "paste":
-                        press_key_combo(VK_CONTROL, VK_V)
-                    elif act_type == "combo":
-                        mods = set(action.get("mods", []))
-                        vk = action.get("vk", 0)
-                        for m in (mods - held_modifiers):
-                            m_scan = ctypes.windll.user32.MapVirtualKeyW(m, 0)
-                            ctypes.windll.user32.keybd_event(m, m_scan, 0, 0)
-                        held_modifiers.update(mods)
-                        time.sleep(0.04)
-                        vk_scan = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
-                        ctypes.windll.user32.keybd_event(vk, vk_scan, 0, 0)
-                        time.sleep(0.06)
-                        ctypes.windll.user32.keybd_event(vk, vk_scan, KEYEVENTF_KEYUP, 0)
-
-                    raw_delay = max(0.01, self.action_delay / self.playback_speed)
-                    actual_delay = raw_delay * (random.uniform(0.85, 1.15) if self.delay_jitter else 1.0)
-                    steps = max(1, int(actual_delay / 0.02))
-                    step_delay = actual_delay / steps
-                    for _ in range(steps):
-                        while self.is_paused and self.playing: time.sleep(0.04)
-                        if not self.playing: break
-                        time.sleep(step_delay)
-
-                    step_ptr += 1
-
-        except Exception as error:
-            failure_reason = (str(error) if isinstance(error, MacroExecutionError)
-                              else f"Unexpected {type(error).__name__}")
-            self.playing = False
-            if self.audio_cues:
-                play_cue("error")
-        finally:
-            for m in list(held_modifiers):
-                m_scan = ctypes.windll.user32.MapVirtualKeyW(m, 0)
-                ctypes.windll.user32.keybd_event(m, m_scan, KEYEVENTF_KEYUP, 0)
-            if not self.switching_preset:
-                outcome = ("failed" if failure_reason else
-                           "cancelled" if not self.playing else "completed")
-                self.root.after(0, self.finish_macro, outcome, failure_reason)
+        Shared execute_single_action() preserves recording input behavior for
+        ordinary steps; dynamic_engine.run_program() owns branching/loops.
+        """
+        return self._run_structured_macro()
 
 
     def finish_macro(self, outcome="completed", reason=""):
