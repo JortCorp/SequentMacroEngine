@@ -1523,6 +1523,7 @@ class SequentRoundedAccentBar(tk.Canvas):
         self.thickness = max(2, int(thickness))
         self.inset = max(0, int(inset))
         self.accent = COLOR_ACCENT if accent is None else accent
+        self.gradient_end = None
         bg = background if background is not None else parent.cget('bg')
         super().__init__(parent, width=self.thickness + 4, height=1,
                          bg=bg, borderwidth=0, highlightthickness=0,
@@ -1536,6 +1537,11 @@ class SequentRoundedAccentBar(tk.Canvas):
             self.configure(bg=background)
         self._paint_accent()
 
+    def set_gradient(self, start, end=None):
+        self.accent = start
+        self.gradient_end = end
+        self._paint_accent()
+
     def _paint_accent(self, event=None):
         self.delete('rounded_accent_bar')
         if not self.accent:
@@ -1547,9 +1553,18 @@ class SequentRoundedAccentBar(tk.Canvas):
         r = self.thickness / 2
         y0 = min(h / 2, self.inset + r)
         y1 = max(h / 2, h - self.inset - r)
-        self.create_line(x, y0, x, y1, fill=self.accent,
-                         width=self.thickness, capstyle=tk.ROUND,
-                         tags='rounded_accent_bar')
+        if self.gradient_end:
+            colors = sequent_gradient_colors(self.accent, self.gradient_end, 48)
+            for i, ink in enumerate(colors):
+                a = y0 + (y1-y0)*i/len(colors)
+                b = y0 + (y1-y0)*(i+1)/len(colors)
+                self.create_line(x, a, x, b+1, fill=ink, width=self.thickness,
+                                 capstyle=tk.ROUND if i in (0, len(colors)-1) else tk.BUTT,
+                                 tags='rounded_accent_bar')
+        else:
+            self.create_line(x, y0, x, y1, fill=self.accent,
+                             width=self.thickness, capstyle=tk.ROUND,
+                             tags='rounded_accent_bar')
 
 
 def sequent_dock_header(parent, title, subtitle="", right_text=""):
@@ -3059,8 +3074,20 @@ class SequentAnimatedPillBar(tk.Canvas):
         if sel_bounds is not None:
             highlight_color = blend_hex(self.accent_getter(), self.surface,
                                         max(0.,min(1.,self._visibility)))
-            self._capsule(self, sel_bounds[0], 5, sel_bounds[1],
-                          self.HEIGHT-5, highlight_color, 'pill_art')
+            app = self.winfo_toplevel()
+            if getattr(app, 'gradient_enabled', False):
+                left, right = sel_bounds
+                gradient = sequent_gradient_colors(self.accent_getter(),
+                    app.gradient_second_color, 48)
+                for i, ink in enumerate(gradient):
+                    x0 = left + (right-left)*i/len(gradient)
+                    x1 = left + (right-left)*(i+1)/len(gradient)
+                    shade = blend_hex(ink, self.surface, max(0.,min(1.,self._visibility)))
+                    self.create_rectangle(x0, 5, x1+1, self.HEIGHT-5,
+                                          fill=shade, outline='', tags='pill_art')
+            else:
+                self._capsule(self, sel_bounds[0], 5, sel_bounds[1],
+                              self.HEIGHT-5, highlight_color, 'pill_art')
         fg_normal = TEXT_PRIMARY
         fg_selected = accent_text_color(self.accent_getter())
         for idx,(slot,caption,cmd,tip,fallback) in enumerate(self.items):
@@ -3119,9 +3146,10 @@ class SequentAccentColorDialog:
     SV_HEIGHT = 208
     HUE_WIDTH = 26
 
-    def __init__(self, app):
+    def __init__(self, app, target="primary"):
         self.app = app
-        self.original = app.accent_color
+        self.target = target
+        self.original = app.gradient_second_color if target == "secondary" else app.accent_color
         self.selected = self.original
         self._closing = False
         self._updating_fields = False
@@ -3130,7 +3158,7 @@ class SequentAccentColorDialog:
         self.h, self.s, self.v = self.hex_to_hsv(self.original)
 
         self.window = tk.Toplevel(app.root)
-        self.window.title("Sequent — Custom Accent Color")
+        self.window.title("Sequent — Custom Gradient Color" if target == "secondary" else "Sequent — Custom Accent Color")
         self.window.configure(bg=BG_BORDER)
         self.window.resizable(False, False)
         self.window.transient(app.root)
@@ -3457,7 +3485,7 @@ class SequentAccentColorDialog:
         chosen = self.selected
         if self._close():
             # Finish the modal event before Sequent rebuilds its themed widgets.
-            self.app.root.after_idle(lambda: self.app.set_accent_color(chosen))
+            self.app.root.after_idle(lambda: self.app.set_gradient_second_color(chosen) if self.target == "secondary" else self.app.set_accent_color(chosen))
 
 
 class ModernTooltip:
@@ -12137,8 +12165,11 @@ class SidebarButton(tk.Frame):
         self.configure(bg=color)
         self.label.configure(bg=color, fg=fg_color)
         self.icon.paint(bg=color, color=fg_color)
-        self.indicator.set_accent(COLOR_ACCENT if is_active else '',
-                                  background=color)
+        app = self.winfo_toplevel()
+        gradient = bool(getattr(app, 'gradient_enabled', False))
+        self.indicator.set_gradient(COLOR_ACCENT if is_active else '',
+            getattr(app, 'gradient_second_color', None) if gradient and is_active else None)
+        self.indicator.configure(bg=color)
 
 class GhostReticle:
     def __init__(self, root):
@@ -18364,7 +18395,9 @@ try {{
                  bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
                  relief="flat").pack(side=tk.LEFT, padx=(0, 6), ipady=4)
         sequent_toolbar_button(second_row, "Apply Gradient",
-                               self.apply_gradient_settings).pack(side=tk.LEFT)
+                               self.apply_gradient_settings).pack(side=tk.LEFT, padx=(0, 6))
+        sequent_toolbar_button(second_row, "Customize...",
+                               self.choose_gradient_second_color).pack(side=tk.LEFT)
         self.gradient_preview = SequentGradientStrip(
             parent, self.accent_color, self.gradient_second_color, height=9, bg=BG_PANEL)
         self.gradient_preview.pack(fill=tk.X, pady=(2, 8))
@@ -18455,6 +18488,22 @@ try {{
             existing.window.focus_force()
             return
         self._accent_color_dialog = SequentAccentColorDialog(self)
+
+    def choose_gradient_second_color(self):
+        existing = getattr(self, "_accent_color_dialog", None)
+        if existing is not None and existing.window.winfo_exists():
+            existing.window.lift()
+            return
+        self._accent_color_dialog = SequentAccentColorDialog(self, target="secondary")
+
+    def set_gradient_second_color(self, value):
+        color = normalize_accent_color(value)
+        self.gradient_second_color = color
+        if hasattr(self, 'gradient_second_var'):
+            self.gradient_second_var.set(color)
+        self._persist_appearance()
+        self.apply_theme(self.resolve_theme_mode())
+        self._preview_gradient_settings()
 
     def _preview_gradient_settings(self):
         if not hasattr(self, 'gradient_preview'):
