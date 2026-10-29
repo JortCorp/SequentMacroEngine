@@ -5732,9 +5732,11 @@ class SequentDynamicEngine:
         else:
             area = validated_capture_area(action.get('area'))
             if typ == 'find_color':
-                box = self.app.search_color_in_area(
-                    *area, str(action.get('color', '#FFFFFF')).upper(),
-                    tolerance=action.get('tolerance', 8))
+                color = str(action.get('color', '#FFFFFF')).upper()
+                tolerance = action.get('tolerance', 8)
+                box = self.app.cached_screen_match(action,
+                    lambda region: self.app.search_color_in_area(*region, color, tolerance=tolerance),
+                    signature=(color, tolerance))
             elif typ == 'find_text':
                 opts = {'match_mode': action.get('match_mode', 'Contains'),
                         'scan_mode': action.get('scan_mode', 'Balanced'),
@@ -5747,7 +5749,10 @@ class SequentDynamicEngine:
                 for attempt in range(attempts):
                     if not idle and not self.app.playing:
                         raise MacroCancelled('Text search cancelled')
-                    box = self.app.find_text_rect(*area, resolve_find_text_target(self.app, action), **opts)
+                    target = resolve_find_text_target(self.app, action)
+                    box = self.app.cached_screen_match(action,
+                        lambda region: self.app.find_text_rect(*region, target, **opts),
+                        signature=(target, tuple(sorted(opts.items()))))
                     if box is not None:
                         break
                     if attempt + 1 < attempts:
@@ -5768,7 +5773,15 @@ class SequentDynamicEngine:
                         else:
                             box = second
             else:
-                box = self.find_image(action)
+                path = self.interpolate(action.get('path', ''))
+                try:
+                    stat = os.stat(path)
+                    template_identity = (os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
+                except OSError:
+                    template_identity = (path,)
+                box = self.app.cached_screen_match(action,
+                    lambda region: self.find_image(dict(action, area=list(region))),
+                    signature=(template_identity, action.get('confidence'), action.get('scale_mode')))
             if not idle and not self.app.playing:
                 raise MacroCancelled('Screen search cancelled after detection')
             result = {'type':typ, 'found': bool(box), 'success':True}
@@ -10360,6 +10373,41 @@ class VSCodeQueueViewer(tk.Frame):
                 and self.app.recorded_actions[edit_idx].get("type") == "find_color"
                 else {})
 
+        cache_enabled = tk.BooleanVar(value=bool(curr.get('position_cache', True)))
+        cache_fallback = tk.BooleanVar(value=bool(curr.get('cache_fallback', True)))
+        cache_radius = tk.StringVar(value=str(curr.get('cache_radius', 100)))
+        cache_controls = tk.Frame(body, bg=BG_PANEL)
+        cache_controls.pack(fill=tk.X, pady=(5, 8))
+        tk.Checkbutton(cache_controls, text='Search last known position first',
+                       variable=cache_enabled, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                       selectcolor=BG_INPUT).pack(anchor='w')
+        cache_details = tk.Frame(cache_controls, bg=BG_PANEL)
+        radius_row = tk.Frame(cache_details, bg=BG_PANEL)
+        radius_row.pack(fill=tk.X)
+        tk.Label(radius_row, text='Search padding (pixels):', bg=BG_PANEL,
+                 fg=TEXT_MUTED).pack(side=tk.LEFT)
+        tk.Entry(radius_row, textvariable=cache_radius, width=7, bg=BG_INPUT,
+                 fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY).pack(side=tk.LEFT, padx=7)
+        tk.Checkbutton(cache_details, text='Fall back to full search if not found',
+                       variable=cache_fallback, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                       selectcolor=BG_INPUT).pack(anchor='w')
+        def refresh_cache_controls(*_):
+            cache_details.pack_forget()
+            if cache_enabled.get():
+                cache_details.pack(fill=tk.X)
+        cache_enabled.trace_add('write', refresh_cache_controls)
+        refresh_cache_controls()
+
+        def cache_settings():
+            try:
+                radius = int(cache_radius.get())
+                if not 16 <= radius <= 1000:
+                    raise ValueError()
+            except ValueError:
+                raise MacroExecutionError('Cache padding must be between 16 and 1000 pixels')
+            return {'position_cache': bool(cache_enabled.get()),
+                    'cache_fallback': bool(cache_fallback.get()), 'cache_radius': radius}
+
         def text_label(parent, label):
             return tk.Label(parent, text=label, font=("Segoe UI", 8, "bold"),
                             bg=BG_PANEL, fg=TEXT_MUTED)
@@ -10526,6 +10574,11 @@ class VSCodeQueueViewer(tk.Frame):
             except MacroExecutionError as exc:
                 error_lbl.config(text=str(exc))
                 return
+            try:
+                updated_action.update(cache_settings())
+            except MacroExecutionError as exc:
+                error_lbl.config(text=str(exc))
+                return
             updated_action.update({"type": "find_color", "area": area,
                                    "color": color, "anchor": anchor_var.get(),
                                    "tolerance": tolerance, "ox": ox, "oy": oy,
@@ -10561,6 +10614,41 @@ class VSCodeQueueViewer(tk.Frame):
                 if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
                 and self.app.recorded_actions[edit_idx].get('type') == 'find_image'
                 else {})
+
+        cache_enabled = tk.BooleanVar(value=bool(curr.get('position_cache', True)))
+        cache_fallback = tk.BooleanVar(value=bool(curr.get('cache_fallback', True)))
+        cache_radius = tk.StringVar(value=str(curr.get('cache_radius', 100)))
+        cache_controls = tk.Frame(body, bg=BG_PANEL)
+        cache_controls.pack(fill=tk.X, pady=(5, 8))
+        tk.Checkbutton(cache_controls, text='Search last known position first',
+                       variable=cache_enabled, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                       selectcolor=BG_INPUT).pack(anchor='w')
+        cache_details = tk.Frame(cache_controls, bg=BG_PANEL)
+        radius_row = tk.Frame(cache_details, bg=BG_PANEL)
+        radius_row.pack(fill=tk.X)
+        tk.Label(radius_row, text='Search padding (pixels):', bg=BG_PANEL,
+                 fg=TEXT_MUTED).pack(side=tk.LEFT)
+        tk.Entry(radius_row, textvariable=cache_radius, width=7, bg=BG_INPUT,
+                 fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY).pack(side=tk.LEFT, padx=7)
+        tk.Checkbutton(cache_details, text='Fall back to full search if not found',
+                       variable=cache_fallback, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                       selectcolor=BG_INPUT).pack(anchor='w')
+        def refresh_cache_controls(*_):
+            cache_details.pack_forget()
+            if cache_enabled.get():
+                cache_details.pack(fill=tk.X)
+        cache_enabled.trace_add('write', refresh_cache_controls)
+        refresh_cache_controls()
+
+        def cache_settings():
+            try:
+                radius = int(cache_radius.get())
+                if not 16 <= radius <= 1000:
+                    raise ValueError()
+            except ValueError:
+                raise MacroExecutionError('Cache padding must be between 16 and 1000 pixels')
+            return {'position_cache': bool(cache_enabled.get()),
+                    'cache_fallback': bool(cache_fallback.get()), 'cache_radius': radius}
 
         def heading(text):
             tk.Label(body, text=text, bg=BG_PANEL, fg=TEXT_MUTED,
@@ -10786,6 +10874,7 @@ class VSCodeQueueViewer(tk.Frame):
                 raise MacroExecutionError('Offset X and Y must be whole numbers') from exc
             action = dict(curr)
             action.update(get_outcomes())
+            action.update(cache_settings())
             action.update({'type':'find_image', 'area':area,
                            'path':path_entry.get().strip(),
                            'confidence':confidence_entry.get().strip(),
@@ -10898,6 +10987,41 @@ class VSCodeQueueViewer(tk.Frame):
                 if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
                 and self.app.recorded_actions[edit_idx].get("type") == "find_text"
                 else {})
+
+        cache_enabled = tk.BooleanVar(value=bool(curr.get('position_cache', True)))
+        cache_fallback = tk.BooleanVar(value=bool(curr.get('cache_fallback', True)))
+        cache_radius = tk.StringVar(value=str(curr.get('cache_radius', 100)))
+        cache_controls = tk.Frame(body, bg=BG_PANEL)
+        cache_controls.pack(fill=tk.X, pady=(5, 8))
+        tk.Checkbutton(cache_controls, text='Search last known position first',
+                       variable=cache_enabled, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                       selectcolor=BG_INPUT).pack(anchor='w')
+        cache_details = tk.Frame(cache_controls, bg=BG_PANEL)
+        radius_row = tk.Frame(cache_details, bg=BG_PANEL)
+        radius_row.pack(fill=tk.X)
+        tk.Label(radius_row, text='Search padding (pixels):', bg=BG_PANEL,
+                 fg=TEXT_MUTED).pack(side=tk.LEFT)
+        tk.Entry(radius_row, textvariable=cache_radius, width=7, bg=BG_INPUT,
+                 fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY).pack(side=tk.LEFT, padx=7)
+        tk.Checkbutton(cache_details, text='Fall back to full search if not found',
+                       variable=cache_fallback, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                       selectcolor=BG_INPUT).pack(anchor='w')
+        def refresh_cache_controls(*_):
+            cache_details.pack_forget()
+            if cache_enabled.get():
+                cache_details.pack(fill=tk.X)
+        cache_enabled.trace_add('write', refresh_cache_controls)
+        refresh_cache_controls()
+
+        def cache_settings():
+            try:
+                radius = int(cache_radius.get())
+                if not 16 <= radius <= 1000:
+                    raise ValueError()
+            except ValueError:
+                raise MacroExecutionError('Cache padding must be between 16 and 1000 pixels')
+            return {'position_cache': bool(cache_enabled.get()),
+                    'cache_fallback': bool(cache_fallback.get()), 'cache_radius': radius}
 
         def text_label(parent, label):
             return tk.Label(parent, text=label, font=("Segoe UI", 8, "bold"),
@@ -11129,6 +11253,11 @@ class VSCodeQueueViewer(tk.Frame):
             updated_action = dict(curr)
             try:
                 updated_action.update(get_outcomes())
+            except MacroExecutionError as exc:
+                error_lbl.config(text=str(exc))
+                return
+            try:
+                updated_action.update(cache_settings())
             except MacroExecutionError as exc:
                 error_lbl.config(text=str(exc))
                 return
@@ -16235,8 +16364,10 @@ class BuiltInMacroApp:
         elif act_type == "find_color":
             area = action.get("area", [0, 0, 100, 100])
             hex_color = action.get("color", "#FFFFFF").upper()
-            found_box = self.search_color_in_area(*area, hex_color,
-                            tolerance=action.get("tolerance", 8))
+            found_box = self.cached_screen_match(action,
+                lambda region: self.search_color_in_area(*region, hex_color,
+                    tolerance=action.get('tolerance', 8)),
+                signature=(hex_color, action.get('tolerance', 8)))
 
             if not idle and not self.playing:
                 raise MacroCancelled('Playback stopped during target search')
@@ -16252,11 +16383,12 @@ class BuiltInMacroApp:
         elif act_type == "find_text":
             area = action.get("area", [0, 0, 100, 100])
             target_text = resolve_find_text_target(self, action)
-            found_box = self.find_text_rect(
-                *area, target_text,
-                match_mode=action.get('match_mode','Contains'),
-                scan_mode=action.get('scan_mode','Balanced'),
-                occurrence=action.get('occurrence','First'))
+            opts = {'match_mode':action.get('match_mode','Contains'),
+                    'scan_mode':action.get('scan_mode','Balanced'),
+                    'occurrence':action.get('occurrence','First')}
+            found_box = self.cached_screen_match(action,
+                lambda region: self.find_text_rect(*region, target_text, **opts),
+                signature=(target_text, tuple(sorted(opts.items()))))
 
             if not idle and not self.playing:
                 raise MacroCancelled('Playback stopped during target search')
@@ -16808,6 +16940,50 @@ class BuiltInMacroApp:
             if mem_dc:
                 gdi32.DeleteDC(mem_dc)
             user32.ReleaseDC(None, screen_dc)
+
+    def cached_screen_match(self, action, detector, *, signature=None):
+        """Validate last match locally, then fall back to original search bounds.
+
+        Cache is in memory only; never trust coordinates without a fresh match.
+        """
+        area = validated_capture_area(action.get('area'))
+        if not action.get('position_cache', True) or (action.get('type') == 'find_text' and
+                str(action.get('occurrence', 'First')).lower() != 'first'):
+            return detector(area)
+        cache = getattr(self, '_sequent_position_cache', None)
+        if cache is None:
+            cache = {}
+            self._sequent_position_cache = cache
+        # Action identity persists during playback, while edits create new dictionaries.
+        key = id(action)
+        identity = (action.get('type'), tuple(area), repr(signature))
+        previous = cache.get(key)
+        if previous and previous[0] == identity:
+            bounds = previous[1]
+            try:
+                radius = max(16, min(1000, int(action.get('cache_radius', 100))))
+            except (TypeError, ValueError, OverflowError):
+                radius = 100
+            x,y,w,h = area
+            left = max(x, int(bounds[0]) - radius)
+            top = max(y, int(bounds[1]) - radius)
+            right = min(x+w, int(bounds[2]) + radius)
+            bottom = min(y+h, int(bounds[3]) + radius)
+            if right > left and bottom > top:
+                match = detector((left,top,right-left,bottom-top))
+                if match is not None:
+                    cache[key] = (identity, tuple(match))
+                    return match
+            if not action.get('cache_fallback', True):
+                return None
+        match = detector(area)
+        if match is not None:
+            if len(cache) >= 256:
+                cache.clear()
+            cache[key] = (identity, tuple(match))
+        else:
+            cache.pop(key, None)
+        return match
 
     def find_text_rect(self, x, y, w, h, target_text, match_any=False, *,
                        match_mode="Contains", scan_mode="Balanced", occurrence="First"):
