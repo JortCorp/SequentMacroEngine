@@ -4993,6 +4993,83 @@ def set_variable(app, name, value, scope=None):
 
 
 # Optional Boolean guard for Read Clipboard. Existing actions remain unconditional.
+CLIPBOARD_OUTCOME_OPTIONS = ('Continue', 'Run Saved Macro', 'Jump to Label',
+                             'Stop Macro', 'Stop with Error')
+
+
+def sequent_clipboard_outcome(action, found):
+    key = 'if_found' if found else 'if_not_found'
+    behavior = action.get(key, 'Continue')
+    if behavior not in CLIPBOARD_OUTCOME_OPTIONS:
+        raise MacroExecutionError(f'Read Clipboard: unknown {key} behavior: {behavior!r}')
+    return behavior, str(action.get(key + '_target', '') or '').strip()
+
+
+def sequent_clipboard_outcome_editor(parent, app, current):
+    """Fixed-position controls; preserve target selections when toggling."""
+    current = current or {}
+    section = tk.Frame(parent, bg=BG_PANEL)
+    section.pack(fill=tk.X, pady=(8, 12))
+    tk.Label(section, text='READ CLIPBOARD RESULTS', bg=BG_PANEL,
+             fg=SYNTAX_BLUE, font=('Segoe UI', 8, 'bold')).pack(anchor='w')
+    tk.Label(section, text='Found means clipboard text was captured or a keyword rule matched. '
+             'Not Found means empty clipboard text or no keyword rule matched. '
+             'A false precondition skips the action without branching.',
+             bg=BG_PANEL, fg=TEXT_MUTED, wraplength=430, justify=tk.LEFT).pack(anchor='w', pady=(3, 8))
+    presets = list(app.get_preset_names())
+    labels = [str(a.get('name')) for a in app.recorded_actions
+              if isinstance(a, dict) and a.get('type') == 'label' and a.get('name')]
+    settings = {}
+    for key, caption in (('if_found', 'IF FOUND'), ('if_not_found', 'IF NOT FOUND')):
+        card = tk.Frame(section, bg=BG_PANEL)
+        card.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(card, text=caption, bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 8, 'bold')).pack(anchor='w')
+        choice = tk.StringVar(value=current.get(key, 'Continue'))
+        menu = tk.OptionMenu(card, choice, *CLIPBOARD_OUTCOME_OPTIONS)
+        menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, highlightthickness=1,
+                    highlightbackground=BG_BORDER)
+        menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
+        menu.pack(fill=tk.X)
+        target_container = tk.Frame(card, bg=BG_PANEL)
+        target_container.pack(fill=tk.X)
+        selected = tk.StringVar(value=current.get(key + '_target', ''))
+        def redraw(*_, choice=choice, selected=selected, container=target_container):
+            for widget in container.winfo_children():
+                widget.destroy()
+            mode = choice.get()
+            if mode not in ('Run Saved Macro', 'Jump to Label'):
+                return
+            options = presets if mode == 'Run Saved Macro' else labels
+            tk.Label(container, text='Saved Macro:' if mode == 'Run Saved Macro' else 'Queue Label:',
+                     bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w', pady=(5, 2))
+            values = list(dict.fromkeys(([selected.get()] if selected.get() else []) + options))
+            if not values:
+                values = ['-- None available --']
+            target_menu = tk.OptionMenu(container, selected, *values)
+            target_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0)
+            target_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
+            target_menu.pack(fill=tk.X)
+        choice.trace_add('write', redraw)
+        redraw()
+        settings[key] = (choice, selected)
+    def read():
+        result = {}
+        for key, (choice, selected) in settings.items():
+            mode = choice.get()
+            if mode not in CLIPBOARD_OUTCOME_OPTIONS:
+                raise MacroExecutionError(f'Read Clipboard: invalid {key} option')
+            target = selected.get().strip() if mode in ('Run Saved Macro', 'Jump to Label') else ''
+            if mode in ('Run Saved Macro', 'Jump to Label'):
+                options = presets if mode == 'Run Saved Macro' else labels
+                if target not in options:
+                    raise MacroExecutionError(f'Read Clipboard: select an existing target for {key}')
+            result[key] = mode
+            result[key + '_target'] = target
+        return result
+    return read
+
+
 def sequent_clipboard_condition_passes(app, action):
     if not action.get('condition_enabled', False):
         return True
@@ -6126,6 +6203,57 @@ class SequentDynamicEngine:
                     outcome = 'found' if match['found'] else 'not found'
                     raise MacroExecutionError(f'{name}: {outcome}; configured to stop with error')
                 raise MacroExecutionError(f'Unknown screen branch behavior: {behavior}')
+
+            if typ == 'read_clipboard':
+                # Keep the existing optional variable guard. False means skip,
+                # not an IF NOT FOUND result.
+                if not sequent_clipboard_condition_passes(self.app, action):
+                    index += 1
+                    continue
+                mode = action.get('mode', 'keywords')
+                if mode == 'keywords':
+                    # Read once and pass the exact snapshot to the rule matcher.
+                    clipboard_text = get_clipboard_text()
+                    matches = apply_clipboard_keyword_rules(self.app, action, clipboard_text)
+                    found = bool(matches)
+                elif mode in ('capture', 'file'):
+                    clipboard_text = get_clipboard_text()
+                    found = bool(clipboard_text)
+                    if found:
+                        if mode == 'capture':
+                            # Reuse existing capture logic, but avoid a second clipboard read.
+                            name = action.get('var_name', 'clipboard_text')
+                            variable_identity(name, action.get('var_scope'))
+                            set_variable(self.app, name, clipboard_text, action.get('var_scope'))
+                        else:
+                            # File mode uses the existing safe atomic file writer.
+                            sequent_clipboard_to_file(self.app, action)
+                else:
+                    raise MacroExecutionError(f'Unknown Read Clipboard mode: {mode!r}')
+                if not found and mode in ('capture', 'file') and 'if_not_found' not in action:
+                    raise MacroExecutionError('Clipboard has no text (or is temporarily unavailable)')
+                behavior, target = sequent_clipboard_outcome(action, found)
+                if behavior == 'Continue':
+                    index += 1
+                    continue
+                if behavior == 'Run Saved Macro':
+                    if not target or target not in self.app.get_preset_names():
+                        raise MacroExecutionError(f'Read Clipboard macro {target!r} is missing')
+                    return {'switch': 'preset', 'target': target}
+                if behavior == 'Jump to Label':
+                    destination = next((i for i, item in enumerate(actions)
+                                        if item.get('type') == 'label' and item.get('name') == target), None)
+                    if destination is None:
+                        raise MacroExecutionError(f'Read Clipboard label {target!r} is missing')
+                    frames.clear()
+                    index = destination + 1
+                    continue
+                if behavior == 'Stop Macro':
+                    return {'cancelled': True}
+                if behavior == 'Stop with Error':
+                    raise MacroExecutionError('Read Clipboard: ' + ('found' if found else 'not found') +
+                                              '; configured to stop with error')
+                raise MacroExecutionError(f'Unknown clipboard branch behavior: {behavior}')
 
             if typ=='trigger_start':index+=1;continue
             
@@ -8328,6 +8456,8 @@ class VSCodeQueueViewer(tk.Frame):
         condition_enabled.trace_add('write', refresh_condition)
         refresh_condition()
 
+        read_clipboard_outcomes = sequent_clipboard_outcome_editor(body, self.app, current)
+
         variable_frame = tk.Frame(body, bg=BG_PANEL)
         variable_frame.pack(fill=tk.X)
         tk.Label(variable_frame, text='Default Destination Variable:', font=('Segoe UI', 8, 'bold'),
@@ -8540,6 +8670,11 @@ class VSCodeQueueViewer(tk.Frame):
             scope = scope_var.get().lower()
             mode = next(k for k, v in labels.items() if v == mode_var.get())
             action = {'type': 'read_clipboard', 'mode': mode}
+            try:
+                action.update(read_clipboard_outcomes())
+            except MacroExecutionError as exc:
+                self.app.update_status(str(exc), COLOR_DANGER)
+                return
             if condition_enabled.get():
                 if not condition_rows:
                     self.app.update_status('Add at least one clipboard condition', COLOR_DANGER)
