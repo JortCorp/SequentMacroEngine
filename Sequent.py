@@ -10362,7 +10362,14 @@ class VSCodeQueueViewer(tk.Frame):
         source_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         source_menu.pack(fill=tk.X, pady=(0, 8))
 
-        literal_panel = tk.Frame(body, bg=BG_PANEL)
+        # Keep a permanent layout slot. Repacking the panels directly into body
+        # moved them below later controls, making the fields appear to disappear.
+        target_slot = tk.Frame(body, bg=BG_PANEL)
+        target_slot.pack(fill=tk.X, pady=(0, 8))
+        target_slot.grid_columnconfigure(0, weight=1)
+
+        literal_panel = tk.Frame(target_slot, bg=BG_PANEL)
+        literal_panel.grid(row=0, column=0, sticky="ew")
         text_label(literal_panel, "Target Text:").pack(anchor="w", pady=(0, 2))
         txt_entry = tk.Entry(literal_panel, bg=BG_INPUT, fg=TEXT_PRIMARY,
                              font=("Segoe UI", 9), insertbackground=TEXT_PRIMARY,
@@ -10370,7 +10377,8 @@ class VSCodeQueueViewer(tk.Frame):
         txt_entry.insert(0, curr.get("text", ""))
         txt_entry.pack(fill=tk.X, ipady=3)
 
-        variable_panel = tk.Frame(body, bg=BG_PANEL)
+        variable_panel = tk.Frame(target_slot, bg=BG_PANEL)
+        variable_panel.grid(row=0, column=0, sticky="ew")
         text_label(variable_panel, "Variable Name:").pack(anchor="w", pady=(0, 2))
         variable_entry = tk.Entry(variable_panel, bg=BG_INPUT, fg=SYNTAX_PURPLE,
                                   font=("Consolas", 10, "bold"), insertbackground=TEXT_PRIMARY,
@@ -10382,12 +10390,13 @@ class VSCodeQueueViewer(tk.Frame):
                              "var_scope": "global" if initial_source == "Global" else "local"})
 
         def update_search_source(*_):
-            literal_panel.pack_forget()
-            variable_panel.pack_forget()
+            # grid_remove retains widget contents and geometry metadata.
+            literal_panel.grid_remove()
+            variable_panel.grid_remove()
             if source_var.get() == "Search for variables":
-                variable_panel.pack(fill=tk.X, pady=(0, 8))
+                variable_panel.grid()
             else:
-                literal_panel.pack(fill=tk.X, pady=(0, 8))
+                literal_panel.grid()
         source_var.trace_add("write", update_search_source)
         update_search_source()
 
