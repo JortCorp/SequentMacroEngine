@@ -7,9 +7,11 @@ import re
 import struct
 import base64
 import tempfile
+import hashlib
 import subprocess
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox, simpledialog
+from tkinter import font as tkfont
 from threading import Thread, RLock
 from queue import Queue, Empty
 import math
@@ -17,9 +19,9 @@ import colorsys
 import random
 import difflib
 import unicodedata
+import uuid
 from pathlib import Path
 import winsound
-import uuid
 
 ACTIVE_SOUND_THEME = "Classic"
 CUSTOM_SOUND_PATHS = {
@@ -1269,6 +1271,45 @@ def send_unicode_char(char):
                 raise MacroExecutionError('Windows rejected Unicode keyboard input')
 
 
+
+def type_variable_text(text, speed_multiplier=1.0):
+    """Type saved variable text as Unicode, independent of keyboard layout.
+
+    Values are used verbatim: quotes, apostrophes, backslashes, dollar signs,
+    JSON punctuation, emoji and non-ASCII characters are *data*, not commands.
+    SendInput KEYEVENTF_UNICODE avoids dead keys and Shift/AltGr combinations
+    from VkKeyScanW. CRLF is one Enter; lone CR/LF is one Enter. Tabs are sent
+    using Tab. A NUL can't be typed into a Windows text field; raise an error
+    instead of silently losing part of the stored description.
+
+    No text is ever copied into the Windows clipboard or logged.
+    """
+    text = str(text)
+    if '\x00' in text:
+        raise MacroExecutionError(
+            'Saved variable contains a NUL character, which cannot be '
+            'typed into a Windows text field. The stored value was not changed.'
+        )
+    speed = max(0.1, float(speed_multiplier))
+    # Reasonably paced events for editors that can't handle instantaneous typing.
+    pause = max(0.001, 0.012 / speed)
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if ch == '\r':
+            if index + 1 < len(text) and text[index + 1] == '\n':
+                index += 1
+            press_virtual_key(VK_RETURN)
+        elif ch == '\n':
+            press_virtual_key(VK_RETURN)
+        elif ch == '\t':
+            press_virtual_key(VK_TAB)
+        else:
+            send_unicode_char(ch)
+        index += 1
+        time.sleep(pause)
+
+
 def type_string(text, speed_multiplier=1.0):
     for char in text:
         # VkKeyScanW only accepts one UTF-16 code unit.
@@ -1436,12 +1477,54 @@ def read_windows_app_theme():
         return "dark"
 
 
+class SequentRoundedAccentBar(tk.Canvas):
+    """Reusable, theme-aware vertical accent marker with rounded end caps.
+
+    Tk Frames always have square ends.  A lightweight Canvas line uses Tk's
+    own ROUND cap style, scales with the parent row, and needs no extra assets
+    or dependencies. The bar's background is the surface it sits upon.
+    """
+
+    def __init__(self, parent, *, thickness=4, background=None,
+                 accent=None, inset=5, **kwargs):
+        self.thickness = max(2, int(thickness))
+        self.inset = max(0, int(inset))
+        self.accent = COLOR_ACCENT if accent is None else accent
+        bg = background if background is not None else parent.cget('bg')
+        super().__init__(parent, width=self.thickness + 4, height=1,
+                         bg=bg, borderwidth=0, highlightthickness=0,
+                         takefocus=0, **kwargs)
+        self.bind('<Configure>', self._paint_accent, add='+')
+
+    def set_accent(self, accent, *, background=None):
+        """Recolor a live selection marker without rebuilding its widget."""
+        self.accent = accent
+        if background is not None:
+            self.configure(bg=background)
+        self._paint_accent()
+
+    def _paint_accent(self, event=None):
+        self.delete('rounded_accent_bar')
+        if not self.accent:
+            return
+        h = self.winfo_height()
+        if h <= 1:
+            return  # Configure paints after Tk has assigned the actual row height.
+        x = self.winfo_width() / 2
+        r = self.thickness / 2
+        y0 = min(h / 2, self.inset + r)
+        y1 = max(h / 2, h - self.inset - r)
+        self.create_line(x, y0, x, y1, fill=self.accent,
+                         width=self.thickness, capstyle=tk.ROUND,
+                         tags='rounded_accent_bar')
+
+
 def sequent_dock_header(parent, title, subtitle="", right_text=""):
     """Small consistent dock title bar. No changes to automation behavior."""
     shell = tk.Frame(parent, bg=BG_HEADER, height=39)
     shell.pack(fill=tk.X)
     shell.pack_propagate(False)
-    tk.Frame(shell, bg=COLOR_ACCENT, width=3).pack(side=tk.LEFT, fill=tk.Y)
+    SequentRoundedAccentBar(shell, thickness=3, background=BG_HEADER, inset=6).pack(side=tk.LEFT, fill=tk.Y)
     tk.Label(shell, text=title.upper(), bg=BG_HEADER, fg=TEXT_PRIMARY,
              font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(12, 8))
     if subtitle:
@@ -1462,10 +1545,18 @@ def sequent_icon_for_caption(caption):
     t = str(caption).strip().casefold()
     if not t: return None
     keys = (
+        ('copy action', 'copy'), ('paste action', 'paste'),
+        ('version history', 'history'), ('execution timeline', 'timeline'),
+        ('variable', 'variable'), ('clipboard', 'clipboard'),
+        ('load text file', 'file'), ('find image', 'image'), ('find text', 'text'),
+        ('compare', 'branch'), ('duplicate', 'copy'), ('favorite', 'star'),
+        ('restore', 'history'), ('preview', 'eye'), ('test ', 'eye'),
+        ('remove', 'trash'), ('move up', 'back'), ('move down', 'forward'),
+        ('exit', 'close'), ('reload icons', 'refresh'),
         ('stop recording', 'stop'), ('start recording', 'record'),
         ('stop macro', 'stop'), ('run macro', 'play'), ('run active', 'play'),
         ('run chain', 'play'), ('pause', 'pause'), ('resume', 'play'),
-        ('start guided', 'play'), ('step', 'step'), ('jump', 'first'),
+        ('start guided', 'play'), ('skip to end', 'last'), ('step', 'step'), ('jump', 'first'),
         ('prev', 'back'), ('next', 'forward'), ('import', 'upload'),
         ('export', 'download'), ('refresh', 'refresh'),
         ('clear', 'trash'), ('delete', 'trash'), ('snip', 'target'), ('cancel', 'close'),
@@ -1478,6 +1569,8 @@ def sequent_icon_for_caption(caption):
         ('mini hud', 'layout'), ('guided tour', 'help'),
         ('playback', 'play'), ('sequencer', 'layers'), ('settings', 'settings'),
         ('customize', 'settings'), ('reset', 'refresh'),
+        ('type ', 'keyboard'), ('tag', 'edit'), ('open', 'folder'),
+        ('no click', 'eye'), ('remove all', 'trash'), ('delete', 'trash'),
     )
     for prefix, icon in keys:
         if prefix in t: return icon
@@ -1498,29 +1591,873 @@ def sequent_clean_caption(text):
 
 
 def sequent_icon_for_action(name):
-    """Map action-picker categories to a stable pictogram, not textual sigils."""
+    """Choose distinct, meaningful vector fallback icons for each action."""
     name = str(name).casefold()
+    if 'image' in name or 'icon' in name: return 'image'
+    if 'clipboard' in name: return 'clipboard'
+    if 'text file' in name or 'write file' in name or 'load file' in name: return 'file'
+    if 'csv' in name or 'excel' in name: return 'file'
+    if 'type' in name or 'keyboard' in name or 'hotkey' in name: return 'keyboard'
+    if 'variable' in name or 'process text' in name or 'text transform' in name: return 'variable'
+    if 'loop' in name or 'repeat' in name: return 'loop'
+    if 'if ' in name or 'else' in name or 'gate' in name or 'branch' in name: return 'branch'
     if 'run macro' in name: return 'play'
-    if any(w in name for w in ('delay', 'wait', 'retry')): return 'clock'
-    if any(w in name for w in ('find', 'search', 'ocr', 'pixel', 'smart ui')): return 'target'
-    if any(w in name for w in ('clipboard','copy', 'paste')): return 'layers'
-    if any(w in name for w in ('file', 'csv', 'excel', 'export', 'load ')): return 'folder'
-    if any(w in name for w in ('input','variable', 'key')): return 'edit'
-    if any(w in name for w in ('if ', 'gate','else', 'loop', 'jump', 'label')): return 'layers'
+    if 'mouse' in name or 'drag' in name: return 'drag'
+    if 'label' in name or 'jump' in name: return 'branch'
+    if 'delay' in name or 'wait' in name or 'retry' in name: return 'clock'
+    if 'find text' in name or 'search selected' in name or 'ocr' in name: return 'text'
+    if any(w in name for w in ('find', 'search', 'pixel', 'smart ui', 'color')): return 'target'
+    if 'file' in name or 'export' in name or 'load ' in name: return 'folder'
+    if 'input' in name or 'key' in name: return 'edit'
     if 'warning' in name or 'disclaimer' in name: return 'alert'
     if 'recovery' in name or 'policy' in name: return 'settings'
     if 'trigger' in name: return 'play'
-    return 'layout'
+    return 'list'
+
+
+# --- Named icon slots: scoped per control, with built-in vector fallback ---
+# A custom icon file can override an individual button, sidebar entry, or
+# Action Library item without changing all other controls that use that glyph.
+_SEQUENT_ICON_SLOTS = {}
+
+_SEQUENT_KNOWN_BUTTON_CAPTIONS = ('+ Add Keyword Rule', '+ Add Stage', 'Abort Macro', 'Add Action', 'Apply Accent', 'Back', 'Browse / Choose File...', 'Browse File...', 'Browse...', 'Cancel', 'Capture Image / Icon from Desktop', 'Capture Selector from Recorded Click', 'Copy Action(s)', 'Customize...', 'Debug Tools', 'Delete Action', 'Exit tour', 'Export', 'Export Timeline CSV', 'Find Color & Click', 'Find Image & Click', 'Find Text & Click', 'Import', 'Inspect Desktop Pixel', 'Mini HUD', 'Next', 'Next  →', 'Open Preset', 'Paste Action(s)', 'Pause', 'Pause (F9)', 'Play', 'Preview Actual Search Area', 'Proceed', 'Record', 'Redo', 'Refresh', 'Remove', 'Remove All Mouse Movements', 'Resume', 'Run Macro', 'Run Macro Chain (F9)', 'Sample Color', 'Save', 'Save & Open Live Reticle Editor', 'Save Changes', 'Save Settings as Default', 'Select Search Box', 'Start Recording', 'Stop Recording', 'Submit', 'Test Match (Preview Only — No Click)', 'Test Selector (No Click)', 'Test Text Match (No Click)', 'Undo', '←  Back')
+
+
+def sequent_icon_slug(text):
+    """Stable filename-friendly button/action identifier."""
+    value = re.sub(r'[^a-z0-9]+', '-', str(text).casefold()).strip('-')
+    return value or 'unnamed'
+
+
+def sequent_icon_slot(group, title):
+    return str(group) + '.' + sequent_icon_slug(title)
+
+
+def sequent_register_icon_slot(slot, label, fallback):
+    if isinstance(slot, str) and slot and slot not in _SEQUENT_ICON_SLOTS:
+        _SEQUENT_ICON_SLOTS[slot] = (str(label), str(fallback))
+    return slot
+
+
+def sequent_icon_catalog():
+    """Known icon slots, including controls that are not currently visible."""
+    defaults = {
+        'play':'Run / Playback', 'record':'Record', 'pause':'Pause', 'stop':'Stop',
+        'save':'Save', 'undo':'Undo', 'redo':'Redo', 'search':'Search',
+        'folder':'Browse / Folder', 'download':'Export', 'upload':'Import',
+        'star':'Favorite (outline)', 'star-filled':'Favorite (filled)',
+        'close':'Close', 'refresh':'Refresh', 'settings':'Settings',
+        'alert':'Warning', 'variable':'Variable', 'clipboard':'Clipboard',
+        'image':'Image', 'text':'Text', 'loop':'Loop', 'branch':'Conditional',
+        'copy':'Copy', 'paste':'Paste', 'history':'Version History',
+        'timeline':'Timeline', 'file':'Text File', 'drag':'Drag / Reorder',
+    }
+    slots = {key: (label, key) for key, label in defaults.items()}
+    slots.update(_SEQUENT_ICON_SLOTS)
+    # Transport controls have icon-only captions, so they need persistent,
+    # independent slots even before the Playback workspace is first opened.
+    slots.update({
+        'transport.jump-to-start': ('Transport: Jump to Start', 'first'),
+        'transport.previous': ('Transport: Previous Action', 'back'),
+        'transport.next': ('Transport: Next Action', 'forward'),
+        'transport.skip-to-end': ('Transport: Skip to End', 'last'),
+    })
+    for label in _SEQUENT_KNOWN_BUTTON_CAPTIONS:
+        slot = sequent_icon_slot('button', label)
+        slots.setdefault(slot, (label, sequent_icon_for_caption(label) or 'list'))
+    # All Action Library entries get their own individual image slot.
+    for category, actions in getattr(globals().get('VSCodeQueueViewer'), 'ACTION_PICKER_GROUPS', ()):
+        for name, *_ in actions:
+            slot = sequent_icon_slot('action', name)
+            slots.setdefault(slot, (name, sequent_icon_for_action(name)))
+    return dict(sorted(slots.items()))
+
+
+# --- Sequent dependency-free SVG icon renderer ---
+# Sequent SVG icon decoder; Python standard library only.
+# Handles the SVG shapes/path commands typically used by outline icon packs.
+# Intentionally does not evaluate external files, scripts, CSS, filters or images.
+import base64
+import math
+import re
+import struct
+import zlib
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+_SVG_NUMBER = r'[-+]?(?:(?:\d*\.\d+)|(?:\d+\.?\d*))(?:[eE][-+]?\d+)?'
+_SVG_PATH_TOKENS = re.compile(r'[MmLlHhVvCcSsQqTtAaZz]|' + _SVG_NUMBER)
+_SVG_TRANSFORMS = re.compile(r'([a-zA-Z]+)\s*\(([^)]*)\)')
+_SVG_COLORS = {'black':(0,0,0),'white':(255,255,255),'red':(255,0,0),
+               'blue':(0,0,255),'green':(0,128,0),'gray':(128,128,128),
+               'grey':(128,128,128),'transparent':None}
+_SVG_SUPPORTED = {'svg','g','path','rect','circle','ellipse','line','polygon','polyline',
+                  'title','desc','metadata'}
+
+
+def _svg_num(text, default=0):
+    if text is None:
+        return float(default)
+    m = re.match(r'^\s*(' + _SVG_NUMBER + r')', str(text))
+    if m is None:
+        raise ValueError('Unsupported SVG numeric value: ' + str(text)[:30])
+    value = float(m.group(1))
+    if not math.isfinite(value):
+        raise ValueError('Invalid SVG coordinate')
+    return value
+
+
+def _svg_numbers(s):
+    result = [float(v) for v in re.findall(_SVG_NUMBER, s)]
+    if any(not math.isfinite(v) for v in result):
+        raise ValueError('Invalid SVG coordinate')
+    return result
+
+
+def _svg_matrix_mul(m, n):
+    a,b,c,d,e,f = m
+    A,B,C,D,E,F = n
+    return (a*A+c*B, b*A+d*B, a*C+c*D, b*C+d*D, a*E+c*F+e, b*E+d*F+f)
+
+
+def _svg_transform(s):
+    matrix = (1.,0.,0.,1.,0.,0.)
+    s = s or ''
+    for match in _SVG_TRANSFORMS.finditer(s):
+        kind = match.group(1).lower()
+        vals = _svg_numbers(match.group(2))
+        if kind == 'translate' and 1 <= len(vals) <= 2:
+            t = (1,0,0,1,vals[0],vals[1] if len(vals)>1 else 0)
+        elif kind == 'scale' and 1 <= len(vals) <= 2:
+            t = (vals[0],0,0,vals[1] if len(vals)>1 else vals[0],0,0)
+        elif kind == 'rotate' and len(vals) in (1,3):
+            angle = math.radians(vals[0]); cs=math.cos(angle); sn=math.sin(angle)
+            t = (cs,sn,-sn,cs,0,0)
+            if len(vals)==3:
+                t = _svg_matrix_mul((1,0,0,1,vals[1],vals[2]),
+                        _svg_matrix_mul(t,(1,0,0,1,-vals[1],-vals[2])))
+        elif kind == 'matrix' and len(vals)==6:
+            t = tuple(vals)
+        elif kind == 'skewx' and len(vals)==1:
+            t = (1,0,math.tan(math.radians(vals[0])),1,0,0)
+        elif kind == 'skewy' and len(vals)==1:
+            t = (1,math.tan(math.radians(vals[0])),0,1,0,0)
+        else:
+            raise ValueError('Unsupported SVG transform: '+kind)
+        matrix = _svg_matrix_mul(matrix,t)
+    if s.strip() and not _SVG_TRANSFORMS.sub('',s).strip(' \t\r\n,')=='':
+        raise ValueError('Unsupported SVG transform syntax')
+    return matrix
+
+
+def _svg_color(value, ink):
+    if value is None or str(value).strip().lower() == 'none':
+        return None
+    value = str(value).strip().lower()
+    if value == 'currentcolor':
+        value = ink
+    if value in _SVG_COLORS:
+        return _SVG_COLORS[value]
+    if value.startswith('#'):
+        digits = value[1:]
+        if len(digits) == 3 and all(c in '0123456789abcdef' for c in digits):
+            return tuple(int(c*2,16) for c in digits)
+        if len(digits) in (6,8) and all(c in '0123456789abcdef' for c in digits):
+            return tuple(int(digits[i:i+2],16) for i in (0,2,4))
+    m = re.fullmatch(r'rgba?\(([^)]*)\)', value)
+    if m:
+        nums = _svg_numbers(m.group(1))
+        if len(nums) in (3,4):
+            return tuple(max(0,min(255,round(c))) for c in nums[:3])
+    raise ValueError('Unsupported SVG color: '+value[:32])
+
+
+def _svg_flatten_path(d):
+    # Decode absolute and relative SVG path commands into linear outlines.
+    tokens = _SVG_PATH_TOKENS.findall(d)
+    if len(tokens) > 12000 or re.sub(r'[\s,]+','',_SVG_PATH_TOKENS.sub('',d)):
+        raise ValueError('SVG path is malformed or too complex')
+    outlines=[]; points=[]; pos=(0.,0.); origin=pos; cmd=None; i=0
+    last_cubic=None; last_quad=None; previous=''
+    def curve(p0,p1,p2,p3):
+        distance = math.dist(p0,p1)+math.dist(p1,p2)+math.dist(p2,p3)
+        count = max(6,min(36,int(distance/2.5)+1))
+        for j in range(1,count+1):
+            t=j/count; u=1-t
+            points.append((u*u*u*p0[0]+3*u*u*t*p1[0]+3*u*t*t*p2[0]+t*t*t*p3[0],
+                           u*u*u*p0[1]+3*u*u*t*p1[1]+3*u*t*t*p2[1]+t*t*t*p3[1]))
+    def quad(p0,p1,p2):
+        curve(p0,(p0[0]+2/3*(p1[0]-p0[0]),p0[1]+2/3*(p1[1]-p0[1])),
+              (p2[0]+2/3*(p1[0]-p2[0]),p2[1]+2/3*(p1[1]-p2[1])),p2)
+    def arc(start, rx,ry,angle,large,sweep,end):
+        rx,ry=abs(rx),abs(ry)
+        if rx < 1e-8 or ry < 1e-8 or start==end:
+            points.append(end); return
+        phi=math.radians(angle); co=math.cos(phi); si=math.sin(phi)
+        dx=(start[0]-end[0])/2; dy=(start[1]-end[1])/2
+        x=co*dx+si*dy; y=-si*dx+co*dy
+        val=x*x/(rx*rx)+y*y/(ry*ry)
+        if val > 1:
+            factor=math.sqrt(val);rx*=factor;ry*=factor
+        ratio=max(0,(1-x*x/(rx*rx)-y*y/(ry*ry))/(x*x/(rx*rx)+y*y/(ry*ry)+1e-100))
+        k=(-1 if bool(large)==bool(sweep) else 1)*math.sqrt(ratio)
+        cxp=k*(rx*y/ry); cyp=-k*(ry*x/rx)
+        cx=co*cxp-si*cyp+(start[0]+end[0])/2
+        cy=si*cxp+co*cyp+(start[1]+end[1])/2
+        def theta(u,v): return math.atan2(u[0]*v[1]-u[1]*v[0],u[0]*v[0]+u[1]*v[1])
+        u=((x-cxp)/rx,(y-cyp)/ry);v=((-x-cxp)/rx,(-y-cyp)/ry)
+        a1=math.atan2(u[1],u[0]); delta=theta(u,v)
+        if not sweep and delta>0:delta-=2*math.pi
+        if sweep and delta<0:delta+=2*math.pi
+        count=min(64,max(8,int(abs(delta)*max(rx,ry)/3)+1))
+        for j in range(1,count+1):
+            t=a1+delta*j/count
+            points.append((cx+rx*math.cos(t)*co-ry*math.sin(t)*si,
+                           cy+rx*math.cos(t)*si+ry*math.sin(t)*co))
+        points[-1]=end
+    args={'M':2,'L':2,'H':1,'V':1,'C':6,'S':4,'Q':4,'T':2,'A':7,'Z':0}
+    while i < len(tokens):
+        if tokens[i].isalpha():
+            cmd=tokens[i];i+=1
+        if cmd is None: raise ValueError('SVG path needs a command')
+        op=cmd.upper(); relative=cmd.islower()
+        if op=='Z':
+            if points:
+                outlines.append((points,True)); points=[]
+            pos=origin;last_cubic=last_quad=None;previous=op;cmd=None
+            continue
+        count=args[op]
+        if i+count>len(tokens) or any(t.isalpha() for t in tokens[i:i+count]):
+            raise ValueError('Incomplete SVG path command: '+cmd)
+        a=list(map(float,tokens[i:i+count]));i+=count
+        if any(not math.isfinite(v) for v in a): raise ValueError('Nonfinite SVG path coordinate')
+        def pt(ix=0):
+            return ((a[ix]+pos[0]) if relative else a[ix],
+                    (a[ix+1]+pos[1]) if relative else a[ix+1])
+        start=pos
+        if op=='M':
+            if points:outlines.append((points,False))
+            pos=pt();points=[pos];origin=pos
+            cmd='l' if relative else 'L'
+        elif op=='L': pos=pt();points.append(pos)
+        elif op=='H': pos=(a[0]+pos[0] if relative else a[0],pos[1]);points.append(pos)
+        elif op=='V': pos=(pos[0],a[0]+pos[1] if relative else a[0]);points.append(pos)
+        elif op=='C':
+            cp1=pt(0);cp2=pt(2);end=pt(4);curve(pos,cp1,cp2,end)
+            pos=end;last_cubic=cp2
+        elif op=='S':
+            cp1=(2*pos[0]-last_cubic[0],2*pos[1]-last_cubic[1]) if previous in ('C','S') and last_cubic else pos
+            cp2=pt(0);end=pt(2);curve(pos,cp1,cp2,end)
+            pos=end;last_cubic=cp2
+        elif op=='Q':
+            cp=pt(0);end=pt(2);quad(pos,cp,end);pos=end;last_quad=cp
+        elif op=='T':
+            cp=(2*pos[0]-last_quad[0],2*pos[1]-last_quad[1]) if previous in ('Q','T') and last_quad else pos
+            end=pt();quad(pos,cp,end);pos=end;last_quad=cp
+        elif op=='A':
+            end=pt(5);arc(pos,*a[:5],end);pos=end
+        if op not in ('C','S'):last_cubic=None
+        if op not in ('Q','T'):last_quad=None
+        previous=op
+        if len(points)>2500 or len(outlines)>400:
+            raise ValueError('SVG icon path is too complex')
+    if points:outlines.append((points,False))
+    return outlines
+
+
+def _svg_geometry(tag, attrib):
+    if tag=='path': return _svg_flatten_path(attrib.get('d',''))
+    if tag in ('polygon','polyline'):
+        a=_svg_numbers(attrib.get('points',''))
+        if len(a)%2:raise ValueError('Invalid polygon points')
+        return [([(a[i],a[i+1]) for i in range(0,len(a),2)],tag=='polygon')]
+    if tag=='line':
+        return [([(_svg_num(attrib.get('x1')),_svg_num(attrib.get('y1'))),
+                  (_svg_num(attrib.get('x2')),_svg_num(attrib.get('y2')))],False)]
+    if tag=='rect':
+        x=_svg_num(attrib.get('x'));y=_svg_num(attrib.get('y'))
+        w=_svg_num(attrib.get('width'));h=_svg_num(attrib.get('height'))
+        if w<=0 or h<=0:return []
+        rx=min(max(0,_svg_num(attrib.get('rx'))),w/2)
+        ry=min(max(0,_svg_num(attrib.get('ry'),rx)),h/2)
+        if rx<1e-6 or ry<1e-6:return [([(x,y),(x+w,y),(x+w,y+h),(x,y+h)],True)]
+        pts=[]
+        for cx,cy,start in ((x+w-rx,y+ry,-math.pi/2),(x+w-rx,y+h-ry,0),
+                            (x+rx,y+h-ry,math.pi/2),(x+rx,y+ry,math.pi)):
+            for j in range(9):
+                a=start+j*(math.pi/2)/8
+                pts.append((cx+rx*math.cos(a),cy+ry*math.sin(a)))
+        return [(pts,True)]
+    if tag in ('circle','ellipse'):
+        cx=_svg_num(attrib.get('cx'));cy=_svg_num(attrib.get('cy'))
+        rx=_svg_num(attrib.get('r') if tag=='circle' else attrib.get('rx'))
+        ry=rx if tag=='circle' else _svg_num(attrib.get('ry'))
+        if rx<=0 or ry<=0:return []
+        n=64
+        return [([(cx+rx*math.cos(math.tau*j/n),cy+ry*math.sin(math.tau*j/n))
+                  for j in range(n)],True)]
+    return []
+
+
+def _svg_styles(attrib, parent):
+    styles=parent.copy()
+    local={k:v for k,v in attrib.items() if k in ('fill','stroke','stroke-width',
+            'stroke-linecap','stroke-linejoin','opacity','fill-opacity','stroke-opacity',
+            'display','visibility','color')}
+    for item in attrib.get('style','').split(';'):
+        if ':' in item:
+            k,v=item.split(':',1);local[k.strip()]=v.strip()
+    styles.update(local)
+    return styles
+
+
+def _svg_read(path, ink):
+    path=Path(path)
+    if not path.is_file() or not 0<path.stat().st_size<=2*1024*1024:
+        raise ValueError('SVG must be smaller than 2 MiB')
+    data=path.read_bytes()
+    if any(word in data.lower() for word in (b'<!doctype',b'<!entity',b'<script',b'<foreignobject')):
+        raise ValueError('SVG contains unsupported embedded content')
+    try: root=ET.fromstring(data)
+    except ET.ParseError as e:raise ValueError('Invalid SVG XML: '+str(e)) from e
+    if root.tag.split('}')[-1] != 'svg': raise ValueError('Selected file is not an SVG image')
+    view=root.attrib.get('viewBox') or root.attrib.get('viewbox')
+    if view:
+        nums=_svg_numbers(view)
+        if len(nums)!=4:raise ValueError('Invalid SVG viewBox')
+        minx,miny,width,height=nums
+    else:
+        minx=miny=0.;width=_svg_num(root.attrib.get('width'),24)
+        height=_svg_num(root.attrib.get('height'),24)
+    if not 0 < width <= 100000 or not 0 < height <= 100000:
+        raise ValueError('Invalid SVG viewBox dimensions')
+    shapes=[]
+    ignored={'title','desc','metadata'}
+    def visit(node, matrix, style, depth):
+        if depth>30 or len(shapes)>400:raise ValueError('SVG is too complex')
+        tag=node.tag.split('}')[-1]
+        if tag in ignored:return
+        if tag not in _SVG_SUPPORTED:
+            raise ValueError('Unsupported SVG element <'+tag+'>')
+        newstyle=_svg_styles(node.attrib,style)
+        if newstyle.get('display')=='none' or newstyle.get('visibility')=='hidden':return
+        matrix=_svg_matrix_mul(matrix,_svg_transform(node.attrib.get('transform')))
+        if tag not in ('svg','g'):
+            geom=_svg_geometry(tag,node.attrib)
+            if geom:
+                ink_for_shape = newstyle.get('color',ink)
+                fill=_svg_color(newstyle.get('fill','black'),ink_for_shape)
+                stroke=_svg_color(newstyle.get('stroke','none'),ink_for_shape)
+                opacity=max(0,min(1,_svg_num(newstyle.get('opacity'),1)))
+                fa=opacity*max(0,min(1,_svg_num(newstyle.get('fill-opacity'),1)))
+                sa=opacity*max(0,min(1,_svg_num(newstyle.get('stroke-opacity'),1)))
+                sw=max(0,min(200,_svg_num(newstyle.get('stroke-width'),1)))
+                if fill is not None or stroke is not None:
+                    shapes.append((geom,matrix,fill,stroke,fa,sa,sw))
+        for child in node:visit(child,matrix,newstyle,depth+1)
+    visit(root,(1,0,0,1,0,0),{},0)
+    return (minx,miny,width,height),shapes
+
+
+def sequent_svg_png(path, size, ink='#edf1f6'):
+    """Render common SVG icon paths to transparent PNG bytes, without packages.
+
+    Supports paths (including cubic/quadratic curves and arcs), standard shapes,
+    currentColor, and affine transforms. Not a full browser SVG implementation.
+    Unsupported advanced SVG elements fail clearly instead of rendering incorrectly.
+    """
+    size=int(size)
+    if not 1 <= size <= 128:raise ValueError('Invalid SVG icon size')
+    (vx,vy,vw,vh),shapes=_svg_read(path,ink)
+    pixels=bytearray(size*size*4)
+    scale=min((size-2)/vw,(size-2)/vh) if size>2 else min(size/vw,size/vh)
+    left=(size-vw*scale)/2;top=(size-vh*scale)/2
+    root=(scale,0,0,scale,left-vx*scale,top-vy*scale)
+    def alpha_blend(offset,col,cover):
+        if col is None or cover<=0:return
+        a=max(0,min(255,int(cover*255+0.5)))
+        if not a:return
+        old=pixels[offset+3];old_weight=old*(255-a)//255;combined=a+old_weight
+        if not combined:return
+        for k in range(3):
+            pixels[offset+k]=(col[k]*a+pixels[offset+k]*old_weight)//combined
+        pixels[offset+3]=combined
+    for geom,matrix,fill,stroke,fa,sa,sw in shapes:
+        m=_svg_matrix_mul(root,matrix)
+        paths=[([(m[0]*x+m[2]*y+m[4],m[1]*x+m[3]*y+m[5]) for x,y in points],closed)
+               for points,closed in geom if points]
+        if not paths:continue
+        stroke_width=sw*math.sqrt((m[0]*m[0]+m[1]*m[1]+m[2]*m[2]+m[3]*m[3])/2)
+        bounds=[p for pp,_ in paths for p in pp]
+        buffer=stroke_width/2+1
+        x0=max(0,int(math.floor(min(p[0] for p in bounds)-buffer)))
+        x1=min(size,int(math.ceil(max(p[0] for p in bounds)+buffer)))
+        y0=max(0,int(math.floor(min(p[1] for p in bounds)-buffer)))
+        y1=min(size,int(math.ceil(max(p[1] for p in bounds)+buffer)))
+        segments=[]
+        for pp,closed in paths:
+            segments.extend([(pp[j],pp[j+1]) for j in range(len(pp)-1)])
+            if closed and len(pp)>1:segments.append((pp[-1],pp[0]))
+        for yy in range(y0,y1):
+            for xx in range(x0,x1):
+                nfill=nstroke=0
+                for sy in (.25,.75):
+                    for sx in (.25,.75):
+                        px=xx+sx;py=yy+sy
+                        if fill is not None:
+                            inside=False
+                            for pp,_ in paths:
+                                for j in range(len(pp)):
+                                    ax,ay=pp[j-1];bx,by=pp[j]
+                                    if (ay>py)!=(by>py) and px < (bx-ax)*(py-ay)/(by-ay)+ax:
+                                        inside=not inside
+                            if inside:nfill+=1
+                        if stroke is not None and stroke_width>0:
+                            r2=(stroke_width/2)**2
+                            for (ax,ay),(bx,by) in segments:
+                                dx=bx-ax;dy=by-ay;dd=dx*dx+dy*dy
+                                if dd>0:
+                                    t=max(0,min(1,((px-ax)*dx+(py-ay)*dy)/dd))
+                                    qx=ax+t*dx;qy=ay+t*dy
+                                else:qx,qy=ax,ay
+                                if (px-qx)**2+(py-qy)**2 <=r2:
+                                    nstroke+=1;break
+                index=(yy*size+xx)*4
+                if nfill:alpha_blend(index,fill,fa*nfill/4)
+                if nstroke:alpha_blend(index,stroke,sa*nstroke/4)
+    rows=b''.join(b'\x00'+pixels[y*size*4:(y+1)*size*4] for y in range(size))
+    def chunk(tag,payload):
+        return struct.pack('>I',len(payload))+tag+payload+struct.pack('>I',zlib.crc32(tag+payload)&0xffffffff)
+    return (b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',size,size,8,6,0,0,0))+
+            chunk(b'IDAT',zlib.compress(rows,6))+chunk(b'IEND',b''))
+
+
+# --- Optional image-backed icon overrides (standard-library Tk PhotoImage) ---
+# Put transparent PNG icons in assets/icons, or set SEQUENT_ICON_DIR to test a
+# different folder. All buttons continue using SequentIcon, with the existing
+# vector drawings as fallbacks. Only Tk's UI thread creates PhotoImages.
+_SEQUENT_ICON_IMAGES = {}
+_SEQUENT_ICON_MAP_STATE = (None, None, {})
+
+
+def sequent_icon_directory():
+    override = os.environ.get('SEQUENT_ICON_DIR', '').strip().strip('"')
+    return Path(override).expanduser() if override else (
+        Path(__file__).resolve().parent / 'assets' / 'icons')
+
+
+def sequent_icon_map():
+    """Read filename aliases, refreshing when the JSON mapping changes."""
+    global _SEQUENT_ICON_MAP_STATE
+    folder = sequent_icon_directory()
+    manifest = folder / 'icon_map.json'
+    try:
+        stamp = manifest.stat().st_mtime_ns
+    except OSError:
+        stamp = None
+    key = (str(manifest), stamp)
+    if _SEQUENT_ICON_MAP_STATE[:2] != key:
+        mappings = {}
+        if stamp is not None:
+            try:
+                with manifest.open('r', encoding='utf-8') as stream:
+                    content = json.load(stream)
+                if isinstance(content, dict):
+                    mappings = content
+            except (OSError, ValueError, UnicodeError) as exc:
+                print(f'[Sequent] Invalid icon_map.json; using built-in icons: {exc}')
+        _SEQUENT_ICON_MAP_STATE = (*key, mappings)
+    return _SEQUENT_ICON_MAP_STATE[2]
+
+
+def sequent_icon_path(name):
+    """Resolve an icon by semantic name, confined to the configured folder."""
+    if not name or not isinstance(name, str):
+        return None
+    folder = sequent_icon_directory()
+    mapped = sequent_icon_map().get(name)
+    if isinstance(mapped, dict):
+        # Image files cannot be recolored by Tk as Canvas vectors can, so
+        # optionally select a theme-specific file at render time.
+        is_light = False
+        try:
+            rgb = [int(BG_APP[i:i+2], 16) for i in (1, 3, 5)]
+            is_light = sum(rgb) > 3 * 128
+        except (ValueError, TypeError):
+            pass
+        mapped = mapped.get('light' if is_light else 'dark', mapped.get('default'))
+    candidates = [mapped] if isinstance(mapped, str) and mapped else []
+    candidates.extend((name + '.svg', name + '.png', name + '.gif'))
+    for filename in candidates:
+        if not filename.lower().endswith(('.svg', '.png', '.gif')):
+            continue  # SVG uses Sequent's built-in icon renderer.
+        try:
+            path = (folder / filename).resolve()
+            if os.path.commonpath((str(folder.resolve()), str(path))) != str(folder.resolve()):
+                continue
+            if path.is_file():
+                return path
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def sequent_image_icon(master, name, size, override_key=None, ink=None):
+    """Look for an individual icon slot first, then its generic vector name."""
+    path = (sequent_icon_path(override_key) if override_key else None) or sequent_icon_path(name)
+    if path is None:
+        return None
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    if path.suffix.casefold() == '.svg':
+        # Tk button foregrounds can be system color names, e.g. SystemButtonText.
+        # Convert them to standard RGB so SVG currentColor works in both themes.
+        try:
+            r, g, b = master.winfo_rgb(ink or TEXT_PRIMARY)
+            ink = '#{:02x}{:02x}{:02x}'.format(r >> 8, g >> 8, b >> 8)
+        except (tk.TclError, ValueError, TypeError):
+            ink = TEXT_PRIMARY
+    key = (id(master.tk), str(path), stamp, int(size),
+           (str(ink).lower() if path.suffix.casefold() == '.svg' else ''))
+    if key in _SEQUENT_ICON_IMAGES:
+        return _SEQUENT_ICON_IMAGES[key]
+    try:
+        if path.suffix.casefold() == '.svg':
+            png = sequent_svg_png(path, int(size), ink or TEXT_PRIMARY)
+            image = tk.PhotoImage(master=master, data=base64.b64encode(png).decode('ascii'))
+            for old in list(_SEQUENT_ICON_IMAGES):
+                if old[0] == key[0] and old[1] == key[1] and old[3:] == key[3:]:
+                    del _SEQUENT_ICON_IMAGES[old]
+            _SEQUENT_ICON_IMAGES[key] = image
+            return image
+        source = tk.PhotoImage(master=master, file=str(path))
+        original_w, original_h = source.width(), source.height()
+        if original_w <= 0 or original_h <= 0:
+            return None
+        # Reduce very large sources before the integer-only Tk zoom/subsample.
+        reduction = max(1, (max(original_w, original_h) + size * 2 - 1) // (size * 2))
+        if reduction > 1:
+            source = source.subsample(reduction)
+        w, h = source.width(), source.height()
+        ratio = float(size) / max(w, h)
+        target_w = max(1, min(size, round(w * ratio)))
+        target_h = max(1, min(size, round(h * ratio)))
+        if (w, h) != (target_w, target_h):
+            gx = math.gcd(w, target_w)
+            gy = math.gcd(h, target_h)
+            image = source.zoom(target_w // gx, target_h // gy).subsample(
+                w // gx, h // gy)
+        else:
+            image = source
+        # Evict superseded revisions of the same icon after a file edit.
+        for old in list(_SEQUENT_ICON_IMAGES):
+            if old[0] == key[0] and old[1] == key[1] and old[3:] == key[3:]:
+                del _SEQUENT_ICON_IMAGES[old]
+        _SEQUENT_ICON_IMAGES[key] = image
+        return image
+    except (tk.TclError, OSError, ValueError) as exc:
+        print(f'[Sequent] Could not read custom icon {path.name!r}: {exc}')
+        return None
+
+
+def sequent_assign_icon(slot, source):
+    """Copy a local PNG/GIF/SVG into the icon folder and bind the icon slot."""
+    import shutil
+    source = Path(source)
+    if source.suffix.casefold() not in ('.png', '.gif', '.svg'):
+        raise ValueError('Choose an SVG, PNG, or GIF image.')
+    if source.suffix.casefold() == '.svg':
+        _svg_read(source, TEXT_PRIMARY)
+    if not source.is_file() or source.stat().st_size > 10 * 1024 * 1024:
+        raise ValueError('Image missing or larger than 10 MiB.')
+    # Validate with Tk's decoder before persisting a mapping: prevents a broken icon.
+    # The caller is always on the UI thread. File contents are never executed.
+    folder = sequent_icon_directory()
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / (sequent_icon_slug(slot) + source.suffix.casefold())
+    if source.resolve() != dest.resolve():
+        shutil.copyfile(source, dest)
+    manifest = folder / 'icon_map.json'
+    mapping = sequent_icon_map().copy()
+    mapping[slot] = dest.name
+    temp = manifest.with_suffix('.tmp')
+    try:
+        temp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        os.replace(temp, manifest)
+    finally:
+        try: temp.unlink(missing_ok=True)
+        except OSError: pass
+    global _SEQUENT_ICON_MAP_STATE
+    _SEQUENT_ICON_MAP_STATE = (None, None, {})
+    return dest
+
+
+
+# --- Portable icon library and folder browser ---
+# Browse artwork from any directory, but keep all assigned images inside
+# assets/icons (or SEQUENT_ICON_DIR). Never store personal absolute paths.
+SEQUENT_ICON_EXTENSIONS = ('.png', '.gif', '.svg')
+SEQUENT_ICON_MAX_BYTES = 10 * 1024 * 1024
+
+
+def sequent_icon_library_files(directory):
+    """Return the supported, non-hidden icon files in a folder (and subfolders)."""
+    directory = Path(directory).expanduser()
+    if not directory.is_dir():
+        return []
+    result = []
+    for path in directory.rglob('*'):
+        if any(part.startswith('.') for part in path.relative_to(directory).parts):
+            continue
+        try:
+            if (path.suffix.casefold() in SEQUENT_ICON_EXTENSIONS and
+                    path.is_file() and not path.is_symlink() and
+                    0 < path.stat().st_size <= SEQUENT_ICON_MAX_BYTES):
+                result.append(path)
+        except OSError:
+            continue
+    return sorted(result, key=lambda p: str(p.relative_to(directory)).casefold())
+
+
+def sequent_import_icon_file(source):
+    """Copy external artwork into the project icon library with a stable name.
+
+    If the file is already inside assets/icons, keep its relative path. Imported
+    files use a content hash so identical icons do not create duplicate files,
+    while distinct images with the same original name cannot overwrite each other.
+    """
+    import shutil
+    source = Path(source).expanduser().resolve()
+    if (source.suffix.casefold() not in SEQUENT_ICON_EXTENSIONS or
+            not source.is_file() or source.stat().st_size <= 0 or
+            source.stat().st_size > SEQUENT_ICON_MAX_BYTES):
+        raise ValueError('Choose an SVG, PNG, or GIF smaller than 10 MiB.')
+    if source.suffix.casefold() == '.svg':
+        _svg_read(source, TEXT_PRIMARY)  # Validate XML/geometry before importing.
+    folder = sequent_icon_directory().resolve()
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        source.relative_to(folder)
+        return source
+    except ValueError:
+        pass
+    digest = hashlib.sha256()
+    with source.open('rb') as stream:
+        for block in iter(lambda: stream.read(65536), b''):
+            digest.update(block)
+    filename = (sequent_icon_slug(source.stem)[:50] + '-' +
+                digest.hexdigest()[:16] + source.suffix.casefold())
+    dest = folder / 'imported' / filename
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not dest.is_file():
+        # Copy into a temporary name before publishing the file to the library.
+        temp = dest.with_name(dest.name + '.' + uuid.uuid4().hex + '.tmp')
+        try:
+            shutil.copyfile(source, temp)
+            os.replace(temp, dest)
+        finally:
+            try: temp.unlink(missing_ok=True)
+            except OSError: pass
+    return dest
+
+
+def sequent_assign_library_icon(slot, source):
+    """Bind a slot to portable project-relative artwork, not an absolute path."""
+    if slot not in sequent_icon_catalog():
+        raise ValueError('Unknown Sequent icon slot')
+    dest = sequent_import_icon_file(source)
+    folder = sequent_icon_directory().resolve()
+    relative = dest.relative_to(folder).as_posix()
+    manifest = folder / 'icon_map.json'
+    mapping = sequent_icon_map().copy()
+    mapping[slot] = relative
+    temp = manifest.with_name('icon_map.' + uuid.uuid4().hex + '.tmp')
+    try:
+        temp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + '\n',
+                        encoding='utf-8')
+        os.replace(temp, manifest)
+    finally:
+        try: temp.unlink(missing_ok=True)
+        except OSError: pass
+    global _SEQUENT_ICON_MAP_STATE
+    _SEQUENT_ICON_MAP_STATE = (None, None, {})
+    return dest
+
+
+def sequent_import_icon_folder(source_directory):
+    """Stage all image assets from a folder inside assets/icons for GitHub shipping."""
+    paths = sequent_icon_library_files(source_directory)
+    imported = 0
+    folder = sequent_icon_directory().resolve()
+    for path in paths:
+        try:
+            path.resolve().relative_to(folder)
+            continue  # Already packaged in the repository.
+        except ValueError:
+            pass
+        dest = sequent_import_icon_file(path)
+        if dest.is_file():
+            imported += 1
+    return imported, len(paths)
+
+
+def sequent_icon_thumbnail(master, path, max_size=52):
+    """Render PNG/GIF or dependency-free SVG thumbnail for the Icon Manager."""
+    path = Path(path)
+    if path.suffix.casefold() == '.svg':
+        png = sequent_svg_png(path, min(128, int(max_size)), TEXT_PRIMARY)
+        return tk.PhotoImage(master=master, data=base64.b64encode(png).decode('ascii'))
+    image = tk.PhotoImage(master=master, file=str(path))
+    if image.width() < 1 or image.height() < 1:
+        raise ValueError('Icon has invalid dimensions')
+    reduce_by = max(1, math.ceil(max(image.width(), image.height()) / max_size))
+    return image.subsample(reduce_by) if reduce_by > 1 else image
+
+
+def sequent_reload_icons(root):
+    """Reload icon aliases and repaint every existing icon on the Tk UI thread."""
+    global _SEQUENT_ICON_MAP_STATE
+    _SEQUENT_ICON_MAP_STATE = (None, None, {})
+    _SEQUENT_ICON_IMAGES.clear()
+    updated = 0
+    pending = [root]
+    while pending:
+        widget = pending.pop()
+        try:
+            pending.extend(widget.winfo_children())
+        except tk.TclError:
+            continue
+        if isinstance(widget, SequentIcon):
+            widget.paint()
+            updated += 1
+        elif isinstance(widget, tk.Button) and hasattr(widget, '_sequent_icon_slot'):
+            sequent_style_native_button(widget, widget._sequent_icon_label,
+                                        widget._sequent_icon_fallback)
+    return updated
+
+
+# --- Compact header identity (original SEQUENT lettering + accent marker) ---
+# Keep the full SEQUENT / MACRO ENGINE asset for splash screens and documentation.
+# The toolbar uses only the large lettering, so it stays readable when compact.
+SEQUENT_COMPACT_WORDMARK_WIDTH = 200
+SEQUENT_COMPACT_WORDMARK_HEIGHT = 20
+
+
+def sequent_compact_brand_png(ink="#FFFFFF", asset_path=None):
+    """Recolor the original SEQUENT-only alpha mask to the current theme ink.
+
+    This is a plain PNG encoder using stdlib; no Pillow, SVG renderer or other
+    third-party package is needed by the running application.
+    """
+    mask_path = (asset_path if asset_path is not None else
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "assets", "branding", "sequent_compact.mask"))
+    with open(mask_path, "rb") as stream:
+        packed = stream.read(200000)
+    if not packed.startswith(b"SQCOMPACT1") or len(packed) < 14:
+        raise ValueError("Invalid compact Sequent brand mask")
+    width, height = struct.unpack(">HH", packed[10:14])
+    if not (0 < width <= 1024 and 0 < height <= 128):
+        raise ValueError("Invalid compact Sequent brand dimensions")
+    alpha = zlib.decompress(packed[14:])
+    if len(alpha) != width * height:
+        raise ValueError("Corrupted compact Sequent brand mask")
+    red, green, blue = bytes.fromhex(normalize_accent_color(ink)[1:])
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)  # PNG filter None
+        for opacity in alpha[y * width:(y + 1) * width]:
+            rows.extend((red, green, blue, opacity))
+
+    def chunk(kind, contents):
+        return (struct.pack(">I", len(contents)) + kind + contents +
+                struct.pack(">I", zlib.crc32(kind + contents) & 0xffffffff))
+
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", width, height,
+                                        8, 6, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(bytes(rows), 9)) +
+            chunk(b"IEND", b""))
+
+
+def sequent_compact_brand_photoimage(master, ink="#FFFFFF"):
+    """Create compact wordmark using Tk's PNG support; retain ref in caller."""
+    data = sequent_compact_brand_png(ink)
+    return tk.PhotoImage(master=master,
+                         data=base64.b64encode(data).decode("ascii"), format="png")
+
+
+# --- Sequent wordmark: exact artwork, independently recolorable subtitle ---
+def sequent_brand_png(accent, title_ink="#FFFFFF", asset_path=None):
+    """Recolor the original two-layer logo without Pillow or SVG dependencies.
+
+    Artwork is packaged as a compressed pair of alpha masks. The wordmark is
+    recolored with the current theme text color; only its subtitle takes the
+    user's accent. Returned data is a standard transparent PNG for Tk 8.6+.
+    """
+    mask_path = (asset_path if asset_path is not None else
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "assets", "branding", "sequent_wordmark.mask"))
+    with open(mask_path, "rb") as handle:
+        packed = handle.read(200000)
+    if not packed.startswith(b"SQBRAND1") or len(packed) < 13:
+        raise ValueError("Invalid Sequent brand mask")
+    width, height = struct.unpack(">HH", packed[8:12])
+    if not 0 < width <= 1024 or not 0 < height <= 128:
+        raise ValueError("Invalid Sequent brand dimensions")
+    mask_pair = zlib.decompress(packed[12:])
+    count = width * height
+    if len(mask_pair) != 2 * count:
+        raise ValueError("Corrupted Sequent brand mask")
+    title = bytes.fromhex(normalize_accent_color(title_ink)[1:])
+    secondary = bytes.fromhex(normalize_accent_color(accent)[1:])
+    title_mask = memoryview(mask_pair)[:count]
+    subtitle_mask = memoryview(mask_pair)[count:]
+
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)  # PNG filter type None.
+        for x in range(width):
+            i = y * width + x
+            ta, sa = title_mask[i], subtitle_mask[i]
+            if sa > ta:
+                rows.extend((*secondary, sa))
+            else:
+                rows.extend((*title, ta))
+
+    def png_chunk(kind, data):
+        return (struct.pack('>I', len(data)) + kind + data +
+                struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff))
+
+    return (b"\x89PNG\r\n\x1a\n" +
+            png_chunk(b"IHDR", struct.pack('>IIBBBBB', width, height,
+                                          8, 6, 0, 0, 0)) +
+            png_chunk(b"IDAT", zlib.compress(bytes(rows), 9)) +
+            png_chunk(b"IEND", b""))
+
+
+def sequent_brand_photoimage(master, accent, title_ink="#FFFFFF"):
+    """Create theme-colored Tk artwork; caller retains the PhotoImage ref."""
+    data = sequent_brand_png(accent, title_ink)
+    return tk.PhotoImage(master=master, data=base64.b64encode(data).decode('ascii'),
+                         format='png')
 
 
 class SequentIcon(tk.Canvas):
     """An antialias-independent 20px vector icon, redrawn for hover/theme colors."""
-    def __init__(self, parent, name, color=TEXT_PRIMARY, bg=BG_INPUT, size=19):
+    def __init__(self, parent, name, color=TEXT_PRIMARY, bg=BG_INPUT, size=19,
+                 override_key=None, slot_label=None):
         self.size = size
+        self.override_key = override_key
+        if override_key:
+            sequent_register_icon_slot(override_key, slot_label or override_key, name)
         super().__init__(parent, width=size, height=size, bg=bg, bd=0,
                          highlightthickness=0, takefocus=0, cursor='hand2')
         self.name = name
         self.ink = color
+        self._external_image = None
         self.paint(bg=bg, color=color)
 
     def paint(self, bg=None, color=None, name=None):
@@ -1528,6 +2465,12 @@ class SequentIcon(tk.Canvas):
         if color is not None: self.ink = color
         if name is not None: self.name = name
         self.delete('all')
+        self._external_image = sequent_image_icon(
+            self, self.name, self.size, override_key=self.override_key, ink=self.ink)
+        if self._external_image is not None:
+            self.create_image(self.size // 2, self.size // 2,
+                              image=self._external_image, anchor=tk.CENTER)
+            return
         c = self.ink
         s = self.size / 20.0
         def xy(*v): return [q*s for q in v]
@@ -1548,10 +2491,11 @@ class SequentIcon(tk.Canvas):
         elif n == 'record': oval(5,5,15,15,fill=c)
         elif n == 'pause':
             box(5,4,8,16,fill=c); box(12,4,15,16,fill=c)
-        elif n in ('forward','back','first'):
+        elif n in ('forward','back','first','last'):
             if n == 'back': polygon(15,4,5,10,15,16)
             elif n == 'forward': polygon(5,4,15,10,5,16)
-            else: polygon(16,4,7,10,16,16); line(4,4,4,16)
+            elif n == 'first': polygon(16,4,7,10,16,16); line(4,4,4,16)
+            else: polygon(4,4,13,10,4,16); line(16,4,16,16)
         elif n == 'step':
             line(13,4,13,16); polygon(5,5,12,10,5,15)
         elif n == 'menu':
@@ -1574,6 +2518,16 @@ class SequentIcon(tk.Canvas):
             self.create_arc(*xy(2,5,18,15), start=180, extent=180, style='arc',
                             outline=c, width=1.8*s)
             oval(8,8,12,12,fill=c)
+        elif n in ('undo', 'redo'):
+            # Crisp, mirror-image undo/redo arrows; no icon font required.
+            if n == 'undo':
+                line(8,5,3,10,8,15)
+                self.create_arc(*xy(4,5,18,17), start=280, extent=205,
+                                style='arc', outline=c, width=2*s)
+            else:
+                line(12,5,17,10,12,15)
+                self.create_arc(*xy(2,5,16,17), start=55, extent=205,
+                                style='arc', outline=c, width=2*s)
         elif n == 'refresh':
             self.create_arc(*xy(3,3,17,17), start=55, extent=265, style='arc',
                             outline=c, width=1.9*s)
@@ -1588,6 +2542,18 @@ class SequentIcon(tk.Canvas):
             box(3,3,17,17); box(6,3,13,8); box(6,11,14,17)
         elif n == 'folder':
             polygon(3,5,8,5,10,7,17,7,17,16,3,16)
+        elif n in ('star', 'star-filled'):
+            # First-party Canvas geometry: same scalable vector style as the
+            # rest of Sequent, rather than an emoji or external icon font.
+            points = []
+            for i in range(10):
+                angle = -math.pi / 2 + i * math.pi / 5
+                radius = 8 if i % 2 == 0 else 3.7
+                points.extend((10 + radius * math.cos(angle),
+                               10 + radius * math.sin(angle)))
+            self.create_polygon(*xy(*points),
+                                fill=c if n == 'star-filled' else self.cget('bg'),
+                                outline=c, width=1.7*s, joinstyle=tk.ROUND)
         elif n == 'edit':
             line(4,16,7,16,16,7,13,4,4,13,4,16)
             line(11,6,14,9)
@@ -1618,6 +2584,48 @@ class SequentIcon(tk.Canvas):
                              font=('Segoe UI',round(12*s),'bold'))
         elif n == 'clock':
             oval(3,3,17,17); line(10,6,10,10,13,12)
+        elif n in ('variable', 'code'):
+            line(7,3,4,3,4,17,7,17); line(13,3,16,3,16,17,13,17)
+            line(8,8,12,8); line(8,12,12,12)
+        elif n == 'clipboard':
+            box(4,5,16,18); box(7,2,13,6); line(7,10,13,10); line(7,14,13,14)
+        elif n == 'image':
+            box(2,3,18,17); oval(12,5,15,8)
+            line(3,16,8,10,11,13,14,10,18,16)
+        elif n == 'text':
+            line(3,5,17,5); line(10,5,10,16); line(6,16,14,16)
+        elif n == 'file':
+            polygon(4,2,12,2,17,7,17,18,4,18)
+            line(12,2,12,7,17,7); line(7,11,14,11); line(7,14,14,14)
+        elif n == 'copy':
+            box(7,5,18,18); line(4,14,2,14,2,2,13,2,13,4)
+        elif n == 'paste':
+            box(4,5,16,18); box(7,2,13,6); line(9,11,12,11); line(9,14,13,14)
+        elif n == 'branch':
+            oval(2,3,6,7); oval(14,3,18,7); oval(8,14,12,18)
+            line(4,7,4,10,10,10,10,14); line(16,7,16,10,10,10)
+        elif n == 'loop':
+            self.create_arc(*xy(3,3,17,17), start=30, extent=290,
+                            style='arc', outline=c, width=2*s)
+            polygon(12,2,18,5,12,8)
+        elif n == 'history':
+            self.create_arc(*xy(3,3,17,17), start=30, extent=280,
+                            style='arc', outline=c, width=2*s)
+            line(10,5,10,10,14,12); polygon(2,4,5,9,8,4)
+        elif n == 'timeline':
+            line(4,2,4,18); line(4,5,16,5); line(4,10,13,10); line(4,15,18,15)
+            for px,py in ((4,5),(4,10),(4,15)): oval(px-1,py-1,px+1,py+1,fill=c)
+        elif n == 'drag':
+            line(10,2,10,18); line(2,10,18,10)
+            polygon(10,1,7,5,13,5); polygon(10,19,7,15,13,15)
+            polygon(1,10,5,7,5,13); polygon(19,10,15,7,15,13)
+        elif n in ('up', 'down'):
+            if n == 'up': line(4,13,10,7,16,13)
+            else: line(4,7,10,13,16,7)
+        elif n == 'keyboard':
+            box(2,5,18,15); line(4,8,16,8); line(4,11,16,11)
+        elif n == 'list':
+            for yy in (5,10,15): oval(3,yy-1,5,yy+1,fill=c); line(7,yy,17,yy)
         else: box(4,4,16,16)
 
 
@@ -1638,7 +2646,8 @@ class SequentCaptionLabel(tk.Label):
 
 class SequentToolbarButton(tk.Frame):
     """Compact icon/text toolbar button; keeps .config(text=...) compatibility."""
-    def __init__(self, parent, text, command, accent=False, icon=None):
+    def __init__(self, parent, text, command, accent=False, icon=None,
+                 icon_slot=None):
         base = COLOR_ACCENT if accent else BG_INPUT
         super().__init__(parent, bg=base, cursor='hand2',
                          highlightbackground=BG_BORDER, highlightthickness=0 if accent else 1)
@@ -1646,15 +2655,35 @@ class SequentToolbarButton(tk.Frame):
         self.base = base
         self.hover = COLOR_ACCENT_HOV if accent else BG_HOVER
         self.fg = TEXT_ON_ACCENT if accent else TEXT_PRIMARY
-        self.name = icon or sequent_icon_for_caption(text)
-        self.icon = SequentIcon(self, self.name, color=self.fg, bg=base, size=17) if self.name else None
-        if self.icon is not None: self.icon.pack(side=tk.LEFT, padx=(7,3))
+        self.name = icon or sequent_icon_for_caption(text) or 'list'
+        # Explicit slots distinguish icon-only controls sharing a blank label.
+        self._explicit_icon_slot = icon_slot
+        self.icon_slot = icon_slot or sequent_icon_slot('button', text)
+        sequent_register_icon_slot(self.icon_slot, text or icon_slot or '', self.name)
+        self.icon = SequentIcon(self, self.name, color=self.fg, bg=base, size=17,
+                                override_key=self.icon_slot, slot_label=text)
         label_text = sequent_clean_caption(text)
         self.label = tk.Label(self, text=label_text, bg=base, fg=self.fg,
                               font=('Segoe UI',9,'bold'), cursor='hand2',
                               padx=5 if self.name else 11, pady=6)
-        self.label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Icon-only transport controls were previously offset by an empty,
+        # packed label. A fixed square with a centered Canvas ensures that
+        # custom SVG/PNG artwork is visually centered in its clickable box.
+        self._icon_only = not label_text.strip()
+        self._layout_contents()
         self._attach_events()
+
+    def _layout_contents(self):
+        self.icon.pack_forget()
+        self.label.pack_forget()
+        if self._icon_only:
+            self.pack_propagate(False)
+            tk.Frame.configure(self, width=36, height=34)
+            self.icon.pack(expand=True, anchor=tk.CENTER)
+        else:
+            self.pack_propagate(True)
+            self.icon.pack(side=tk.LEFT, padx=(7, 3))
+            self.label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
     def _attach_events(self):
         for widget in (self, self.label, self.icon):
@@ -1687,20 +2716,362 @@ class SequentToolbarButton(tk.Frame):
         data.update(kw)
         if 'text' in data:
             caption = data.pop('text')
-            self.label.config(text=sequent_clean_caption(caption))
-            icon_name = sequent_icon_for_caption(caption)
-            if icon_name:
-                if self.icon is None:
-                    self.icon = SequentIcon(self, icon_name, color=self.fg, bg=self.base, size=17)
-                    self.icon.pack(side=tk.LEFT, before=self.label, padx=(7,3))
-                    self._attach_events()
-                else: self.icon.paint(name=icon_name)
+            clean_caption = sequent_clean_caption(caption)
+            self.label.config(text=clean_caption)
+            icon_only = not clean_caption.strip()
+            if icon_only != self._icon_only:
+                self._icon_only = icon_only
+                self._layout_contents()
+            icon_name = (self.name if self._explicit_icon_slot else
+                         (sequent_icon_for_caption(caption) or 'list'))
+            self.icon_slot = (self._explicit_icon_slot or
+                              sequent_icon_slot('button', caption))
+            sequent_register_icon_slot(self.icon_slot, caption or self.icon_slot,
+                                       icon_name)
+            self.icon.override_key = self.icon_slot
+            self.icon.paint(name=icon_name)
         return super().configure(cnf if not isinstance(cnf, dict) else None, **data)
     config = configure
 
 
-def sequent_toolbar_button(parent, text, command, accent=False, icon=None):
-    return SequentToolbarButton(parent, text, command, accent=accent, icon=icon)
+
+class SequentAnimatedPillBar(tk.Canvas):
+    """Animated grouped actions built from Tk Canvas and SequentIcon only.
+
+    items: (icon_slot, caption, callback, tooltip, fallback_icon). The existing
+    Icon Manager resolves each slot, including all four transport slots.  An
+    active highlight is *momentary*, not a selected tab: it slides from the
+    previous action, lingers, and fades. Fast subsequent clicks interrupt the
+    previous animation without losing commands. No Python dependencies.
+    """
+    HEIGHT = 42
+    INSET = 5
+    GAP = 3
+    FRAME_MS = 16
+    SLIDE_MS = 205
+    HOLD_MS = 380
+    FADE_MS = 260
+    HOVER_MS = 120
+
+    def __init__(self, parent, items, *, icon_only=False, accent_getter=None,
+                 min_width=None, background=None):
+        if not items:
+            raise ValueError('Pill bar needs at least one action')
+        self.items = list(items)
+        self.icon_only = bool(icon_only)
+        self.accent_getter = accent_getter or (lambda: COLOR_ACCENT)
+        self.surface = BG_INPUT
+        self.outer = background or BG_PANEL
+        self._segment_widths = []
+        caption_font = tkfont.Font(root=parent, family='Segoe UI', size=9, weight='bold')
+        for _slot, caption, _cb, _tip, _fallback in self.items:
+            if self.icon_only:
+                width = 42
+            else:
+                # Natural widths for short command captions; reserve space for
+                # the embedded user-customizable Icon Manager artwork.
+                width = max(78, 35 + caption_font.measure(caption) + 12)
+            self._segment_widths.append(width)
+        self.width = (2*self.INSET + sum(self._segment_widths)
+                      + self.GAP * (len(self.items)-1))
+        if min_width is not None:
+            self.width = max(self.width, int(min_width))
+        super().__init__(parent, width=self.width, height=self.HEIGHT,
+                         bg=self.outer, highlightthickness=0, bd=0,
+                         takefocus=1, cursor='hand2')
+        self._bounds = []
+        current = self.INSET
+        for width in self._segment_widths:
+            self._bounds.append((current, current + width))
+            current += width + self.GAP
+        self.icons = []
+        self._icon_images = []
+        for i,(slot,caption,callback,tooltip,fallback) in enumerate(self.items):
+            sequent_register_icon_slot(slot, caption or tooltip or slot, fallback)
+            glyph = SequentIcon(self, fallback, bg=self.surface,
+                                color=TEXT_PRIMARY, size=17,
+                                override_key=slot, slot_label=caption or tooltip)
+            self.icons.append(glyph)
+            x1,x2 = self._bounds[i]
+            icx = (x1+x2)//2 if icon_only else x1 + 16
+            glyph.place(x=icx, y=self.HEIGHT//2, anchor='center')
+            glyph.bind('<Button-1>', lambda event, idx=i: self.activate(idx), add='+')
+            glyph.bind('<Enter>', lambda event, idx=i: self._enter_segment(idx), add='+')
+            glyph.bind('<Leave>', lambda event: self._on_leave(), add='+')
+        self._anim_id = None
+        self._hover_anim_id = None
+        self._hover_strengths = [0.0] * len(self.items)
+        self._leave_job = None
+        self._start_visibility = 0.0
+        self._generation = 0
+        self._start_time = 0.0
+        self._origin_x = None
+        self._current_x = None
+        self._selected = None
+        self._last_selection_x = None
+        self._visibility = 0.0
+        self._hover = None
+        self._keyboard_index = 0
+        self._anim_trace = []
+        self.tooltip = None
+        # Construct after children so the existing tooltip system follows icon
+        # canvases. Text and shortcuts are changed by segment on hover.
+        self.tooltip = ModernTooltip(self, self.items[0][3], delay_ms=400)
+        self.bind('<Motion>', self._on_motion, add='+')
+        self.bind('<Leave>', self._on_leave, add='+')
+        self.bind('<Button-1>', self._on_press, add='+')
+        self.bind('<Left>', lambda e: self._keyboard_move(-1), add='+')
+        self.bind('<Right>', lambda e: self._keyboard_move(1), add='+')
+        self.bind('<Return>', self._keyboard_activate, add='+')
+        self.bind('<space>', self._keyboard_activate, add='+')
+        self.bind('<Destroy>', self._on_destroy, add='+')
+        self._render()
+
+    @staticmethod
+    def _capsule(canvas, x1, y1, x2, y2, fill, tag):
+        """Native antialias-friendly rounded capsule without image libraries."""
+        radius = min((y2-y1)/2, (x2-x1)/2)
+        if radius <= 0:
+            return
+        canvas.create_rectangle(x1+radius, y1, x2-radius, y2,
+                                fill=fill, outline='', tags=tag)
+        canvas.create_oval(x1, y1, x1+2*radius, y2,
+                           fill=fill, outline='', tags=tag)
+        canvas.create_oval(x2-2*radius, y1, x2, y2,
+                           fill=fill, outline='', tags=tag)
+
+    def _at(self, x):
+        for i,(a,b) in enumerate(self._bounds):
+            if a <= x <= b:
+                return i
+        return None
+
+    def _enter_segment(self, idx):
+        if idx != self._hover:
+            self._hover = idx
+            self.tooltip.text = self.items[idx][3] or self.items[idx][1]
+            self.tooltip._cancel()
+            self.tooltip.hide()
+            self.tooltip._on_enter()
+            self._schedule_hover()
+
+    def _on_motion(self, event):
+        idx = self._at(event.x)
+        if idx is None:
+            if self._hover is not None:
+                self._hover = None
+                self._schedule_hover()
+            self.tooltip._cancel()
+            self.tooltip.hide()
+        else:
+            self._enter_segment(idx)
+
+    def _on_leave(self, event=None):
+        # Moving from this Canvas to an overlaid icon is still inside the bar.
+        if self._leave_job is None:
+            self._leave_job = self.after_idle(self._check_leave)
+
+    def _check_leave(self):
+        self._leave_job = None
+        if not self.winfo_exists():
+            return
+        try:
+            target = self.winfo_containing(*self.winfo_pointerxy())
+            if target is not None and (target == self or
+                    str(target).startswith(str(self)+'.')):
+                return
+        except tk.TclError:
+            pass
+        if self._hover is not None:
+            self._hover = None
+            self._schedule_hover()
+        self.tooltip._cancel()
+        self.tooltip.hide()
+
+    def _on_press(self, event):
+        self.focus_set()
+        idx = self._at(event.x)
+        if idx is not None:
+            self.activate(idx)
+
+    def _keyboard_move(self, direction):
+        self._keyboard_index = (self._keyboard_index + direction) % len(self.items)
+        self._hover = self._keyboard_index
+        self._schedule_hover()
+        return 'break'
+
+    def _keyboard_activate(self, event=None):
+        self.activate(self._keyboard_index)
+        return 'break'
+
+    def activate(self, index):
+        """Start/restart highlight before invoking the original callback."""
+        if not 0 <= index < len(self.items):
+            return
+        self._keyboard_index = index
+        dest = self._bounds[index][0]
+        previous_live = self._selected is not None and self._visibility > 0.03
+        start = (self._current_x if previous_live else self._last_selection_x)
+        self._selected = index
+        self._origin_x = dest if start is None else start
+        self._current_x = self._origin_x
+        self._start_time = time.monotonic()
+        self._start_visibility = self._visibility if previous_live else 0.0
+        self._visibility = self._start_visibility
+        self._generation += 1
+        self._cancel_animation()
+        self._render()
+        self._anim_id = self.after(self.FRAME_MS,
+                                   lambda gen=self._generation: self._tick(gen))
+        # Preserve *all* execution semantics (including dialogs, Undo and
+        # transport selection); UI feedback never waits for callback completion.
+        cmd = self.items[index][2]
+        if cmd:
+            cmd()
+
+    def _tick(self, generation):
+        self._anim_id = None
+        if generation != self._generation or not self.winfo_exists():
+            return
+        elapsed = (time.monotonic() - self._start_time) * 1000.0
+        target = self._bounds[self._selected][0]
+        slide_t = min(1., elapsed / self.SLIDE_MS)
+        eased = 1. - (1. - slide_t) ** 3
+        self._current_x = self._origin_x + (target-self._origin_x)*eased
+        if elapsed <= self.HOLD_MS:
+            fade_in_t = min(1.0, elapsed / 95.0)
+            self._visibility = self._start_visibility + (1.-self._start_visibility)*fade_in_t
+        else:
+            fade_t = min(1., (elapsed-self.HOLD_MS)/self.FADE_MS)
+            self._visibility = (1. - fade_t)**2
+        self._render()
+        if elapsed < self.HOLD_MS + self.FADE_MS:
+            self._anim_id = self.after(self.FRAME_MS,
+                                       lambda gen=generation: self._tick(gen))
+        else:
+            self._last_selection_x = target
+            self._selected = None
+            self._visibility = 0.0
+            self._current_x = None
+            self._render()
+
+    def _cancel_animation(self):
+        if self._anim_id is not None:
+            try: self.after_cancel(self._anim_id)
+            except tk.TclError: pass
+        self._anim_id = None
+
+    def _on_destroy(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        self._generation += 1
+        self._cancel_animation()
+        for name in ('_hover_anim_id', '_leave_job'):
+            job = getattr(self, name, None)
+            if job is not None:
+                try: self.after_cancel(job)
+                except tk.TclError: pass
+                setattr(self, name, None)
+        if self.tooltip is not None:
+            self.tooltip._cancel()
+            self.tooltip.hide()
+
+    def _schedule_hover(self):
+        """Animate the subtle hover shading for each segment independently."""
+        if self._hover_anim_id is None and self.winfo_exists():
+            self._hover_anim_id = self.after(self.FRAME_MS, self._tick_hover)
+
+    def _tick_hover(self):
+        self._hover_anim_id = None
+        if not self.winfo_exists():
+            return
+        unfinished = False
+        step = self.FRAME_MS / self.HOVER_MS
+        for i,value in enumerate(self._hover_strengths):
+            dest = 1. if self._hover == i else 0.
+            if abs(dest-value) > .001:
+                value = min(dest, value+step) if dest > value else max(dest, value-step)
+                self._hover_strengths[i] = value
+            if abs(dest-value) > .001:
+                unfinished = True
+        self._render()
+        if unfinished:
+            self._hover_anim_id = self.after(self.FRAME_MS, self._tick_hover)
+
+    def refresh_accent(self):
+        """Update a live bar without reconstructing buttons or losing icons."""
+        self._render()
+
+    def _render(self):
+        if not self.winfo_exists():
+            return
+        self.delete('pill_art')
+        # Draw shell with a low-contrast rim, keeping all artwork inside it.
+        self._capsule(self, 0, 0, self.width, self.HEIGHT,
+                      BG_BORDER, 'pill_art')
+        self._capsule(self, 1, 1, self.width-1, self.HEIGHT-1,
+                      self.surface, 'pill_art')
+        highlight_color = None
+        sel_bounds = None
+        if self._selected is not None and self._visibility > 0.0:
+            active_width = self._segment_widths[self._selected]
+            sel_bounds = (self._current_x, self._current_x+active_width)
+        # Hover paints underneath active indicator, using the same capsule
+        # geometry. The highlight is a movable pill, never persistent tabs.
+        for idx,strength in enumerate(self._hover_strengths):
+            if strength > 0:
+                lo,hi = self._bounds[idx]
+                hover_ink = blend_hex(BG_HOVER, self.surface, strength)
+                self._capsule(self, lo, 5, hi, self.HEIGHT-5, hover_ink, 'pill_art')
+        if sel_bounds is not None:
+            highlight_color = blend_hex(self.accent_getter(), self.surface,
+                                        max(0.,min(1.,self._visibility)))
+            self._capsule(self, sel_bounds[0], 5, sel_bounds[1],
+                          self.HEIGHT-5, highlight_color, 'pill_art')
+        fg_normal = TEXT_PRIMARY
+        fg_selected = accent_text_color(self.accent_getter())
+        for idx,(slot,caption,cmd,tip,fallback) in enumerate(self.items):
+            lo,hi = self._bounds[idx]
+            icon_x = (lo+hi)/2 if self.icon_only else lo+16
+            inside = bool(sel_bounds and self._visibility > 0.0 and
+                          sel_bounds[0] <= icon_x-8 and sel_bounds[1] >= icon_x+8)
+            ink = fg_selected if inside and self._visibility > .58 else fg_normal
+            surface = (highlight_color if inside and highlight_color else
+                       blend_hex(BG_HOVER,self.surface,self._hover_strengths[idx]))
+            # SVG and image overrides still live in SequentIcon, with stable
+            # keys assigned by the Icon Manager; no extra renderer introduced.
+            ico = self.icons[idx]
+            if ico.ink != ink or ico.cget('bg') != surface:
+                ico.paint(color=ink, bg=surface)
+            if not self.icon_only:
+                self.create_text(lo+35, self.HEIGHT/2,
+                                 text=caption, anchor='w', font=('Segoe UI', 9, 'bold'),
+                                 fill=ink, tags='pill_art')
+        # Canvas children are separate Tk windows and always draw on top.
+
+
+def sequent_style_native_button(button, caption, glyph=None):
+    """Attach configured artwork to a legacy tk.Button without changing behavior."""
+    fallback = glyph or sequent_icon_for_caption(caption) or 'list'
+    slot = sequent_icon_slot('button', caption)
+    sequent_register_icon_slot(slot, caption, fallback)
+    button._sequent_icon_slot = slot
+    button._sequent_icon_label = caption
+    button._sequent_icon_fallback = fallback
+    icon = sequent_image_icon(button, fallback, 16, override_key=slot, ink=button.cget('fg'))
+    if icon is not None:
+        button.configure(image=icon, compound=tk.LEFT)
+        button._sequent_icon_image = icon
+    else:
+        button.configure(image='', compound=tk.NONE)
+        button._sequent_icon_image = None
+    return button
+
+
+def sequent_toolbar_button(parent, text, command, accent=False, icon=None,
+                           icon_slot=None):
+    return SequentToolbarButton(parent, text, command, accent=accent, icon=icon,
+                                icon_slot=icon_slot)
 
 
 # --- Sequent native-looking, dependency-free custom accent color dialog ---
@@ -1791,7 +3162,7 @@ class SequentAccentColorDialog:
         head.pack_propagate(False)
         if os.name == 'nt':
             head.bind('<Button-1>', lambda e: begin_native_window_motion(self.window))
-        tk.Frame(head, bg=COLOR_ACCENT, width=4).pack(side=tk.LEFT, fill=tk.Y)
+        SequentRoundedAccentBar(head, thickness=4, background=BG_HEADER, inset=8).pack(side=tk.LEFT, fill=tk.Y)
         title_box = tk.Frame(head, bg=BG_HEADER)
         title_box.pack(side=tk.LEFT, padx=18, pady=10)
         self._label(title_box, "CUSTOM ACCENT COLOR", size=12, bold=True, bg=BG_HEADER).pack(anchor="w")
@@ -1896,16 +3267,19 @@ class SequentAccentColorDialog:
 
         buttons = tk.Frame(footer, bg=BG_HEADER)
         buttons.pack(side=tk.RIGHT, padx=20, pady=13)
-        tk.Button(buttons, text="Cancel", command=self.cancel, bg=BG_INPUT, fg=TEXT_PRIMARY,
+        cancel_button = tk.Button(buttons, text="Cancel", command=self.cancel, bg=BG_INPUT, fg=TEXT_PRIMARY,
                   activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
                   font=("Segoe UI", 9, "bold"), relief="flat", bd=0, cursor="hand2",
-                  padx=20, pady=8).pack(side=tk.LEFT, padx=(0, 9))
+                  padx=20, pady=8)
+        sequent_style_native_button(cancel_button, 'Cancel', 'close')
+        cancel_button.pack(side=tk.LEFT, padx=(0, 9))
         self.apply_button = tk.Button(buttons, text="Apply Accent", command=self.apply,
                                       bg=self.selected, fg=accent_text_color(self.selected),
                                       activebackground=self.selected,
                                       activeforeground=accent_text_color(self.selected),
                                       font=("Segoe UI", 9, "bold"), relief="flat", bd=0,
                                       cursor="hand2", padx=19, pady=8)
+        sequent_style_native_button(self.apply_button, 'Apply Accent', 'check')
         self.apply_button.pack(side=tk.LEFT)
 
     def _render_sv_image(self):
@@ -2315,7 +3689,26 @@ DYNAMIC_ACTION_SPECS = {
    ('fallback_label','Fallback label if goto','text','')]),
  'Run Macro':('run_macro',[
    ('preset','Saved macro name','text',''),
-   ('mode','After running','choice','Run & Return',['Run & Return','Switch to Macro'])]),
+   ('mode','After running','choice','Run & Return',['Run & Return','Switch to Macro']),
+   ('inputs','Input parameters (JSON list of name/value objects)','json',[]),
+   ('return_var','Save returned value to variable (optional)','text',''),
+   ('return_scope','Return Variable Scope','choice','Local',['Local','Global'])]),
+ 'Text Processing':('text_process',[
+   ('source_var','Read variable','text','defect_description'),
+   ('source_scope','Source Variable Scope','choice','Global',['Local','Global']),
+   ('operation','Operation','choice','Regex Extract',
+      ['Regex Extract','Regex Replace','Replace Literal','Split','Strip Whitespace','Uppercase','Lowercase']),
+   ('pattern','Regex / literal pattern / split delimiter','text','Part[: ]+(\\S+)'),
+   ('replacement','Replacement (for replace operations)','text',''),
+   ('index','Capture group / split item index','int',0),
+   ('var_name','Store result as','text','processed_text'),
+   ('var_scope','Destination Variable Scope','choice','Local',['Local','Global'])]),
+ 'Return From Macro':('macro_return',[
+   ('value','Return text or ${variable}','text','${_last_value}')]),
+ 'Load Text File → Variable':('load_text_variable',[
+   ('path','Text file to read (.txt; relative paths use presets/text_files)','path','defect_description.txt'),
+   ('var_name','Destination variable name','text','defect_description'),
+   ('var_scope','Variable Scope','choice','Global',['Local','Global'])]),
  'Set Variable':('set_variable',[
    ('var_name','Variable name','text','status'),
    ('var_scope','Variable Scope','choice','Local',['Local','Global']),
@@ -3070,11 +4463,169 @@ def sequent_xlsx_write(path,columns,rows):
         book.writestr('xl/_rels/workbook.xml.rels',relationships)
         book.writestr('xl/worksheets/sheet1.xml',_seq_et.tostring(ws,encoding='utf-8',xml_declaration=True))
 
+# --- Compare Text & Branch: standard-library multi-line validation ---
+SEQUENT_COMPARE_MODES = ('Exact Match', 'Contains', 'Line-by-Line', 'Similarity')
+SEQUENT_COMPARE_SOURCES = ('Literal Text', 'Variable', 'Clipboard', 'Text File')
+SEQUENT_COMPARE_OUTCOMES = ('Continue', 'Stop with Error', 'Stop Macro',
+                            'Jump to Label', 'Run Saved Macro', 'Set Variable')
+SEQUENT_COMPARE_LIMIT = 2 * 1024 * 1024  # Bound difflib time/memory on large inputs
+
+
+def sequent_compare_template(app, template):
+    """Resolve ${name} placeholders strictly; absent values are errors, not blank matches."""
+    def replace(match):
+        raw = match.group(1)
+        bare, scope = variable_identity(raw)
+        sentinel = object()
+        if raw.startswith('global.'):
+            value = get_variable(app, bare, 'global', sentinel)
+        else:
+            value = app.variables.get(bare, sentinel)
+            if value is sentinel:
+                value = get_variable(app, bare, 'global', sentinel)
+        if value is sentinel:
+            raise MacroExecutionError(f'Compare Text: variable {raw!r} does not exist')
+        return str(value)
+    return re.sub(r'\$\{([A-Za-z_][\w.]*)\}', replace, str(template))
+
+
+def sequent_compare_resolve(app, action, side, interpolate=None):
+    """Resolve a configured text operand at execution time; report missing inputs as errors."""
+    source = action.get(side + '_source', 'Literal Text')
+    value = str(action.get(side + '_value', ''))
+    if source == 'Literal Text':
+        result = sequent_compare_template(app, value)
+    elif source == 'Variable':
+        name, scope = variable_identity(value.strip(), action.get(side + '_scope', 'local'))
+        sentinel = object()
+        result = get_variable(app, name, scope, default=sentinel)
+        if result is sentinel:
+            raise MacroExecutionError(f'Compare Text: {side} {scope} variable {name!r} does not exist')
+    elif source == 'Clipboard':
+        result = get_clipboard_text()
+        if not isinstance(result, str) or not result:
+            raise MacroExecutionError(f'Compare Text: {side} clipboard is empty or unavailable')
+    elif source == 'Text File':
+        filename = sequent_compare_template(app, value)
+        path = sequent_text_file_path(app, filename)
+        try:
+            if os.path.getsize(path) > SEQUENT_COMPARE_LIMIT:
+                raise MacroExecutionError('Compare Text: text file exceeds the 2 MiB comparison limit')
+            with open(path, 'r', encoding='utf-8-sig', newline='') as stream:
+                result = stream.read(SEQUENT_COMPARE_LIMIT + 1)
+        except (OSError, UnicodeError) as exc:
+            raise MacroExecutionError(f'Compare Text: unable to read {side} text file: {exc}') from exc
+    else:
+        raise MacroExecutionError(f'Compare Text: unknown {side} source {source!r}')
+    result = str(result)
+    if len(result) > SEQUENT_COMPARE_LIMIT:
+        raise MacroExecutionError('Compare Text: input exceeds the 2 MiB comparison limit')
+    return result
+
+
+def sequent_compare_text(expected, actual, *, mode='Exact Match',
+                         ignore_case=False, trim_lines=False,
+                         normalize_whitespace=False, ignore_line_breaks=False,
+                         threshold=95):
+    """Return a structured comparison with bounded, human-readable line differences.
+
+    Normalizations are always opt-in. Exact Match is strict by default.
+    'Contains' means actual contains expected (the expected value is the needle).
+    """
+    if mode not in SEQUENT_COMPARE_MODES:
+        raise MacroExecutionError(f'Compare Text: unsupported mode {mode!r}')
+    expected, actual = str(expected), str(actual)
+    if len(expected) > SEQUENT_COMPARE_LIMIT or len(actual) > SEQUENT_COMPARE_LIMIT:
+        raise MacroExecutionError('Compare Text: input exceeds the 2 MiB comparison limit')
+    try:
+        threshold = float(threshold)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise MacroExecutionError('Compare Text: similarity threshold must be a number') from exc
+    if not 0 <= threshold <= 100 or not math.isfinite(threshold):
+        raise MacroExecutionError('Compare Text: similarity threshold must be 0–100')
+
+    def normalize(text):
+        if ignore_line_breaks:
+            text = re.sub(r'\r\n|\r|\n', ' ', text)
+        # Exact comparison preserves CRLF vs LF unless normalization is requested.
+        if trim_lines:
+            text = '\n'.join(line.strip() for line in text.splitlines())
+        if normalize_whitespace:
+            text = '\n'.join(' '.join(line.split()) for line in text.split('\n'))
+        if ignore_case:
+            text = text.casefold()
+        return text
+
+    left, right = normalize(expected), normalize(actual)
+    left_lines, right_lines = left.split('\n'), right.split('\n')
+    first = next((i for i in range(max(len(left_lines), len(right_lines)))
+                  if (left_lines[i] if i < len(left_lines) else None) !=
+                  (right_lines[i] if i < len(right_lines) else None)), None)
+    different_lines = sum(1 for i in range(max(len(left_lines), len(right_lines)))
+                          if (left_lines[i] if i < len(left_lines) else None) !=
+                          (right_lines[i] if i < len(right_lines) else None))
+    # Similarity can be comparatively expensive. Keep inputs bounded more tightly in this mode.
+    if mode == 'Similarity' and max(len(left), len(right)) > 20000:
+        raise MacroExecutionError('Compare Text: similarity input must be 20,000 characters or fewer')
+    similarity = (difflib.SequenceMatcher(None, left, right, autojunk=True).ratio() * 100
+                  if mode == 'Similarity' else None)
+    if mode in ('Exact Match', 'Line-by-Line'):
+        matched = left == right
+    elif mode == 'Contains':
+        if not left:
+            raise MacroExecutionError('Compare Text: Contains requires nonempty expected text')
+        matched = left in right
+    else:
+        matched = similarity >= threshold
+    diff = '\n'.join(list(difflib.unified_diff(
+        [line[:2000] for line in left_lines[:250]],
+        [line[:2000] for line in right_lines[:250]],
+        fromfile='Expected', tofile='Actual', lineterm='', n=2))[:80])
+    if max(len(left_lines), len(right_lines)) > 250:
+        diff += '\n[Inspector preview limited to first 250 lines; long lines are truncated]'
+    if len(diff) > 20000:
+        diff = diff[:20000] + '\n[Inspector preview truncated]'
+    return {'matched':matched, 'mode':mode, 'difference_count':different_lines,
+            'first_different_line': first + 1 if first is not None else 0,
+            'expected_line':left_lines[first] if first is not None and first < len(left_lines) else '',
+            'actual_line':right_lines[first] if first is not None and first < len(right_lines) else '',
+            'similarity':similarity, 'expected':expected, 'actual':actual,
+            'diff':diff}
+
+
+def sequent_compare_store(app, result, error=''):
+    """Publish values to LOCAL variables; no global disk writes or sensitive trace logs."""
+    values = {
+        '_compare_match': 'true' if result and result['matched'] else 'false',
+        '_compare_status': 'error' if error else ('match' if result and result['matched'] else 'mismatch'),
+        '_compare_error': error,
+        '_compare_difference_count': str(result['difference_count']) if result else '0',
+        '_compare_first_difference': str(result['first_different_line']) if result else '0',
+        '_compare_expected_line': result['expected_line'] if result else '',
+        '_compare_actual_line': result['actual_line'] if result else '',
+        '_compare_similarity': (f"{result['similarity']:.2f}" if result and result['similarity'] is not None else ''),
+    }
+    app.variables.update(values)
+    # Retain full text ONLY in memory for an opt-in Difference Inspector.
+    app._last_text_comparison = dict(result) if result else {'error':error}
+
+
+def sequent_compare_outcome(action, key):
+    mode = action.get(key, 'Continue' if key == 'on_match' else 'Stop with Error')
+    if mode not in SEQUENT_COMPARE_OUTCOMES:
+        raise MacroExecutionError(f'Compare Text: invalid {key}: {mode!r}')
+    target = str(action.get(key + '_target', '')).strip()
+    if mode in ('Run Saved Macro', 'Jump to Label', 'Set Variable') and not target:
+        raise MacroExecutionError(f'Compare Text: {key} requires a target')
+    return mode, target
+
+
 DYNAMIC_ACTION_TYPES = frozenset({
     'ui_element', 'smart_wait', 'ocr_extract', 'if_dynamic', 'else_dynamic',
     'end_if', 'loop_start', 'loop_end', 'find_image', 'recovery',
     'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action', 'set_variable',
-    'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro'
+    'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro', 'text_process', 'macro_return',
+    'load_text_variable', 'compare_text', 'compare_variables'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end'})
 
@@ -3246,6 +4797,58 @@ def dynamic_compare(actual, op, expected):
     raise MacroExecutionError(f'Unsupported comparison operator: {op}')
 
 
+def sequent_if_variable_match(app, action, interpolate):
+    """Evaluate legacy IF-variable conditions and new variable-to-variable ones.
+
+    Literal comparisons retain the original case-insensitive behavior. A new
+    variable reference uses a strict value lookup and case-sensitive == / !=
+    by default, so a missing variable never silently equals an empty string.
+    """
+    lhs = action.get('var_name', '')
+    scope = action.get('var_scope')
+    source = action.get('match_source', 'text')
+    if source == 'variable':
+        rhs_name = str(action.get('match_var_name', '')).strip()
+        if not rhs_name:
+            raise MacroExecutionError('IF Variable: comparison variable name is required')
+        missing = object()
+        actual = get_variable(app, lhs, scope, default=missing)
+        expected = get_variable(app, rhs_name, action.get('match_var_scope', 'local'), default=missing)
+        if actual is missing:
+            raise MacroExecutionError(f'IF Variable: source variable {lhs!r} is not defined')
+        if expected is missing:
+            raise MacroExecutionError(f'IF Variable: comparison variable {rhs_name!r} is not defined')
+        operator = action.get('op', '==')
+        if action.get('case_sensitive', True) and operator in ('==', '!='):
+            return (str(actual) == str(expected)) if operator == '==' else (str(actual) != str(expected))
+        return dynamic_compare(actual, operator, expected)
+    if source != 'text':
+        raise MacroExecutionError(f'IF Variable: unsupported comparison source {source!r}')
+    return dynamic_compare(get_variable(app, lhs, scope),
+                           action.get('op', '=='), interpolate(action.get('val', '')))
+
+
+def sequent_if_set_value(app, action):
+    """Perform a validated, scoped IF-variable assignment with no imports."""
+    destination = str(action.get('target', '')).strip()
+    if not destination:
+        raise MacroExecutionError('IF Variable: Set Variable needs a destination name')
+    source = action.get('set_value_source', 'text')
+    if source == 'variable':
+        variable_name = str(action.get('set_source_name', '')).strip()
+        if not variable_name:
+            raise MacroExecutionError('IF Variable: assignment source name is required')
+        missing = object()
+        value = get_variable(app, variable_name, action.get('set_source_scope', 'local'), default=missing)
+        if value is missing:
+            raise MacroExecutionError(f'IF Variable: assignment source {variable_name!r} is not defined')
+    elif source == 'text':
+        value = action.get('set_value', '')
+    else:
+        raise MacroExecutionError(f'IF Variable: unsupported assignment source {source!r}')
+    set_variable(app, destination, value, action.get('target_scope', 'local'))
+
+
 def dynamic_matching_block(actions, start, opening, closing, middle=None):
     """Locate same-level ELSE/END even with nested blocks."""
     depth = 0
@@ -3327,7 +4930,12 @@ def set_global_var(app, name, value):
             raise MacroExecutionError(f'Unable to prepare global variable file: {exc}') from exc
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-                json.dump(data, stream, indent=2, ensure_ascii=False)
+                # JSON escaping protects embedded double quotes, backslashes,
+                # CR/LF, tabs and all other control characters. Using ASCII
+                # escapes also makes malformed UTF-16 surrogate data from
+                # Windows clipboard input round-trip without a UTF-8 write
+                # error. json.load reconstructs the original Python string.
+                json.dump(data, stream, indent=2, ensure_ascii=True)
                 stream.write('\n')
             os.replace(temporary, path)
         except (OSError, TypeError, ValueError) as exc:
@@ -3373,6 +4981,93 @@ def capture_clipboard_variable(app, action):
         )
     set_variable(app, name, contents, action.get('var_scope'))
     return {'variable': bare, 'scope': scope, 'length': len(contents)}
+
+
+
+# Text files are optional, human-readable companions to globals.json. Relative
+# filenames live beside presets in text_files; absolute paths are explicit.
+SEQUENT_TEXT_FILE_LIMIT = 16 * 1024 * 1024  # 16 MiB, protect the editor and JSON store
+
+
+def sequent_text_file_path(app, filename):
+    value = os.path.expandvars(os.path.expanduser(str(filename or '').strip()))
+    if not value:
+        raise MacroExecutionError('Choose a text file path before running this action')
+    if os.path.isabs(value):
+        path = os.path.abspath(value)
+    else:
+        root = os.path.abspath(os.path.join(app.presets_dir, 'text_files'))
+        path = os.path.abspath(os.path.join(root, value))
+        if os.path.commonpath((root, path)) != root:
+            raise MacroExecutionError('Relative text file paths must stay in the presets/text_files folder')
+    if os.path.normcase(path) == os.path.normcase(_global_variable_path(app)):
+        raise MacroExecutionError('globals.json is reserved for Sequent variables; select a .txt file')
+    return path
+
+
+def sequent_clipboard_to_file(app, action):
+    """Copy current Unicode clipboard text verbatim to a UTF-8 file atomically.
+
+    Unlike JSON, the file is plain readable text. No templating, stripping,
+    keyword matching, newline normalization, or command execution is applied.
+    Optional scoped assignment uses the same text after the file is written.
+    """
+    path = sequent_text_file_path(app, action.get('path', 'defect_description.txt'))
+    assign = bool(action.get('also_set_variable', False))
+    if assign:
+        name, scope = variable_identity(action.get('var_name', 'defect_description'),
+                                        action.get('var_scope', 'global'))
+        # Fail early if global JSON is damaged; do not touch the text file.
+        if scope == 'global':
+            _read_global_values(app)
+    value = get_clipboard_text()
+    if not isinstance(value, str) or not value:
+        raise MacroExecutionError('Clipboard has no text; text file and variables were not changed')
+    try:
+        data = value.encode('utf-8', errors='surrogatepass')
+    except UnicodeError as exc:
+        raise MacroExecutionError('Clipboard text cannot be encoded as UTF-8') from exc
+    if len(data) > SEQUENT_TEXT_FILE_LIMIT:
+        raise MacroExecutionError('Clipboard text exceeds the 16 MiB text-file limit')
+    folder = os.path.dirname(path)
+    temp_path = None
+    try:
+        os.makedirs(folder, exist_ok=True)
+        descriptor, temp_path = tempfile.mkstemp(prefix='.sequent-text-', suffix='.tmp', dir=folder)
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(data)
+        os.replace(temp_path, path)
+    except OSError as exc:
+        raise MacroExecutionError(f'Could not save clipboard to text file: {exc}') from exc
+    finally:
+        if temp_path and os.path.isfile(temp_path):
+            os.unlink(temp_path)
+    if assign:
+        set_variable(app, name, value, scope)
+    return {'path':path, 'length':len(value), 'variable':name if assign else None,
+            'scope':scope if assign else None}
+
+
+def sequent_text_file_to_variable(app, action):
+    """Read a text file verbatim and assign to a Local or Global variable."""
+    path = sequent_text_file_path(app, action.get('path', 'defect_description.txt'))
+    name, scope = variable_identity(action.get('var_name', 'defect_description'),
+                                    action.get('var_scope', 'global'))
+    try:
+        with open(path, 'rb') as stream:
+            data = stream.read(SEQUENT_TEXT_FILE_LIMIT + 1)
+    except OSError as exc:
+        raise MacroExecutionError(f'Unable to open text file {path!r}: {exc}') from exc
+    if len(data) > SEQUENT_TEXT_FILE_LIMIT:
+        raise MacroExecutionError('Text file exceeds the 16 MiB text-file limit')
+    try:
+        value = data.decode('utf-8', errors='surrogatepass')
+    except UnicodeError as exc:
+        raise MacroExecutionError('Text file must contain UTF-8 text') from exc
+    if not value:
+        raise MacroExecutionError('Text file is empty; existing variable was not changed')
+    set_variable(app, name, value, scope)
+    return {'path':path, 'length':len(value), 'variable':name, 'scope':scope}
 
 
 def apply_clipboard_keyword_rules(app, action, clipboard_text=None):
@@ -3515,6 +5210,91 @@ def interpolate_variable(app, name):
     if bare in app.variables:
         return app.variables[bare]
     return get_global_var(app, bare, '')
+
+# --- Sequent IDE tools: version history, text processing and run telemetry ---
+from collections import deque
+from datetime import datetime
+
+
+def sequent_history_directory(presets_dir, preset_path):
+    """Store bounded revisions outside the preset menu, named by path digest."""
+    digest = hashlib.sha256(os.path.normcase(os.path.abspath(preset_path)).encode('utf-8')).hexdigest()[:20]
+    return os.path.join(presets_dir, '.sequent_history', digest)
+
+
+def sequent_save_revision(presets_dir, preset_path, *, limit=30):
+    """Save the PREVIOUS valid JSON preset before replacing it."""
+    with open(preset_path, 'rb') as stream:
+        previous = stream.read()
+    if len(previous) > 16 * 1024 * 1024:
+        raise MacroExecutionError('Preset too large for version history')
+    actions = json.loads(previous.decode('utf-8-sig'))
+    if not isinstance(actions, list):
+        raise MacroExecutionError('Existing preset is not a macro; refusing overwrite')
+    folder = sequent_history_directory(presets_dir, preset_path)
+    os.makedirs(folder, exist_ok=True)
+    signature = hashlib.sha256(previous).hexdigest()[:12]
+    name = datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '_' + signature + '.json'
+    new_name = name
+    fd, temp = tempfile.mkstemp(prefix='.revision-', dir=folder)
+    try:
+        with os.fdopen(fd, 'wb') as destination:
+            destination.write(previous)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temp, os.path.join(folder, name))
+    finally:
+        if os.path.exists(temp): os.unlink(temp)
+    revisions = sorted(x for x in os.listdir(folder) if re.fullmatch(r'\d{8}_\d{6}_\d{6}_[0-9a-f]{12}\.json', x))
+    for name in revisions[:-max(1, int(limit))]:
+        os.unlink(os.path.join(folder, name))
+    return os.path.join(folder, new_name)
+
+
+def sequent_text_transform(text, operation, pattern='', replacement='', index=0):
+    """No external regex engine or arbitrary code execution."""
+    text = str(text)
+    if len(text) > 2_000_000 or len(pattern) > 5000:
+        raise MacroExecutionError('Text processing limit exceeded')
+    if operation == 'Strip Whitespace': return text.strip()
+    if operation == 'Uppercase': return text.upper()
+    if operation == 'Lowercase': return text.lower()
+    if operation == 'Replace Literal':
+        if not pattern: raise MacroExecutionError('Literal replacement needs search text')
+        return text.replace(pattern, replacement)
+    if operation == 'Regex Replace':
+        try: return re.sub(pattern, replacement, text)
+        except re.error as exc: raise MacroExecutionError(f'Regex replace: {exc}') from exc
+    if operation == 'Regex Extract':
+        try:
+            match = re.search(pattern, text, flags=re.MULTILINE)
+            if match is None: raise MacroExecutionError('Text extraction pattern not found')
+            return match.group(int(index))
+        except (re.error, IndexError, ValueError) as exc:
+            raise MacroExecutionError(f'Regex extract: {exc}') from exc
+    if operation == 'Split':
+        if not pattern: raise MacroExecutionError('Split requires delimiter')
+        chunks = text.split(pattern)
+        i = int(index)
+        if not -len(chunks) <= i < len(chunks):
+            raise MacroExecutionError('Split index is outside the available fields')
+        return chunks[i]
+    raise MacroExecutionError(f'Unknown text operation: {operation}')
+
+
+def sequent_parameter_inputs(items, interpolate):
+    if not isinstance(items, list) or len(items) > 40:
+        raise MacroExecutionError('Macro inputs must be a JSON list (max 40)')
+    values = {}
+    for item in items:
+        if not isinstance(item, dict): raise MacroExecutionError('Macro input must be an object')
+        name = str(item.get('name', '')).strip()
+        if not re.fullmatch(r'[A-Za-z_][\w]{0,79}', name) or name.startswith('_'):
+            raise MacroExecutionError(f'Invalid macro parameter name {name!r}')
+        if name in values: raise MacroExecutionError('Duplicate macro parameter: ' + name)
+        values[name] = str(interpolate(str(item.get('value', ''))))
+    return values
+
 
 class SequentDynamicEngine:
     """Structured action execution and conditions; no independent Tk GUI state."""
@@ -3830,8 +5610,20 @@ class SequentDynamicEngine:
             name = action.get('var_name','ocr_value')
             self._assign_variable(name, extracted, action.get('var_scope'))
             result = {'value':extracted,'variable':name}
-        elif typ == 'run_macro':
-            raise MacroExecutionError('Run Macro must be executed by the workflow interpreter')
+        elif typ in ('run_macro', 'macro_return', 'compare_text', 'compare_variables'):
+            raise MacroExecutionError('Macro call/return and Compare Text & Branch require the workflow interpreter')
+        elif typ == 'text_process':
+            source = get_variable(self.app, action.get('source_var', ''), action.get('source_scope', 'local'))
+            transformed = sequent_text_transform(
+                source, action.get('operation', 'Strip Whitespace'),
+                self.interpolate(action.get('pattern', '')),
+                self.interpolate(action.get('replacement', '')),
+                action.get('index', 0))
+            destination = action.get('var_name', '')
+            self._assign_variable(destination, transformed, action.get('var_scope'))
+            result = {'variable':destination, 'value':transformed}
+        elif typ == 'load_text_variable':
+            result = sequent_text_file_to_variable(self.app, action)
         elif typ == 'set_variable':
             name = action.get('var_name', '')
             variable_identity(name, action.get('var_scope'))
@@ -3913,19 +5705,30 @@ class SequentDynamicEngine:
         return self.last_result
     
     def run_action_with_recovery(self, action, *, idle=False):
+        began = time.perf_counter()
         mode = action.get('on_error',self.policy['on_error'])
         retries = max(0,min(20,int(action.get('retry_count',self.policy['retry_count']))))
         retry_delay = float(action.get('retry_delay',self.policy['retry_delay']))
         for attempt in range(retries+1):
             try:
                 if action.get('type') in DYNAMIC_ACTION_TYPES:
-                    return self.execute(action,idle=idle)
-                self.app.execute_single_action(action, idle=idle)
-                return {'success':True}
+                    result = self.execute(action,idle=idle)
+                else:
+                    self.app.execute_single_action(action, idle=idle)
+                    result = {'success':True}
+                if hasattr(self.app, 'trace_action'):
+                    self.app.trace_action(action.get('type','?'), 'OK',
+                                          time.perf_counter() - began)
+                return result
             except MacroCancelled:
-                # User abort is not a retryable/recoverable failure.
+                if hasattr(self.app,'trace_action'):
+                    self.app.trace_action(action.get('type','?'), 'CANCEL',
+                                          time.perf_counter()-began)
                 raise
             except Exception as exc:
+                if hasattr(self.app,'trace_action'):
+                    self.app.trace_action(action.get('type','?'), 'ERROR',
+                                          time.perf_counter()-began, str(exc))
                 self.app.variables['_last_success'] = 'false'
                 self.app.variables['_last_error'] = str(exc)
                 if attempt < retries:
@@ -3978,9 +5781,73 @@ class SequentDynamicEngine:
             executed += 1
             if executed > max_steps: raise MacroExecutionError('Workflow exceeded 50,000 steps')
             if on_step: on_step(index, action)
+            if typ in ('compare_text', 'compare_variables'):
+                if typ == 'compare_variables' and (
+                    action.get('left_source', 'Variable') != 'Variable' or
+                    action.get('right_source', 'Variable') != 'Variable'):
+                    raise MacroExecutionError('Compare Variables requires two variable sources')
+                result = None
+                compare_error = ''
+                retries = max(0, min(10, int(action.get('retry_count', 0))))
+                for attempt in range(retries + 1):
+                    try:
+                        expected = sequent_compare_resolve(self.app, action, 'left', self.interpolate)
+                        actual = sequent_compare_resolve(self.app, action, 'right', self.interpolate)
+                        result = sequent_compare_text(
+                            expected, actual, mode=action.get('mode', 'Exact Match'),
+                            ignore_case=bool(action.get('ignore_case', False)),
+                            trim_lines=bool(action.get('trim_lines', False)),
+                            normalize_whitespace=bool(action.get('normalize_whitespace', False)),
+                            ignore_line_breaks=bool(action.get('ignore_line_breaks', False)),
+                            threshold=action.get('threshold', 95))
+                        compare_error = ''
+                        break
+                    except MacroCancelled:
+                        raise
+                    except (MacroExecutionError, ValueError, TypeError, OSError, UnicodeError) as exc:
+                        compare_error = str(exc) or type(exc).__name__
+                        if attempt < retries:
+                            self._pause(float(action.get('retry_delay', 0.25)), idle=idle)
+                sequent_compare_store(self.app, result, compare_error)
+                outcome_key = ('on_error' if compare_error else
+                               'on_match' if result['matched'] else 'on_mismatch')
+                behavior, target = sequent_compare_outcome(action, outcome_key)
+                if hasattr(self.app, 'trace_action'):
+                    self.app.trace_action('compare_text',
+                        'ERROR' if compare_error else 'MATCH' if result['matched'] else 'MISMATCH')
+                if behavior == 'Continue':
+                    index += 1
+                    continue
+                if behavior == 'Set Variable':
+                    set_variable(self.app, target,
+                        str(action.get(outcome_key + '_value', 'true')).replace('${result}',
+                        'error' if compare_error else 'match' if result['matched'] else 'mismatch'),
+                        action.get(outcome_key + '_scope', 'local'))
+                    index += 1
+                    continue
+                if behavior == 'Jump to Label':
+                    destination = next((i for i, item in enumerate(actions)
+                        if item.get('type') == 'label' and item.get('name') == target), None)
+                    if destination is None:
+                        raise MacroExecutionError(f'Compare Text: label {target!r} not found')
+                    frames.clear()
+                    index = destination + 1
+                    continue
+                if behavior == 'Run Saved Macro':
+                    if target not in self.app.get_preset_names():
+                        raise MacroExecutionError(f'Compare Text: macro {target!r} not found')
+                    return {'switch':'preset', 'target':target}
+                if behavior == 'Stop Macro':
+                    return {'cancelled':True}
+                if behavior == 'Stop with Error':
+                    reason = compare_error if compare_error else 'text matched' if result['matched'] else 'text mismatch'
+                    raise MacroExecutionError(f'Compare Text: {reason}; stopped by {outcome_key}')
+                raise MacroExecutionError('Compare Text: unknown branch behavior')
             if typ == 'if_dynamic':
                 branch,end = dynamic_matching_block(actions,index,'if_dynamic','end_if','else_dynamic')
-                if self.evaluate(action): index += 1
+                condition = self.evaluate(action)
+                if hasattr(self.app,'trace_action'): self.app.trace_action('if_dynamic','TRUE' if condition else 'FALSE')
+                if condition: index += 1
                 else: index = branch+1 if branch is not None else end+1
                 continue
             if typ == 'else_dynamic':
@@ -4017,6 +5884,7 @@ class SequentDynamicEngine:
                         for col,value in rows[pos].items():
                             self.app.variables['row.'+str(col)]=str(value)
                 else: raise MacroExecutionError(f'Unknown loop mode: {mode}')
+                if hasattr(self.app,'trace_action'): self.app.trace_action('loop_start','ENTER' if run else 'EXIT')
                 if not run:
                     frames.pop()
                     index=end+1
@@ -4043,28 +5911,60 @@ class SequentDynamicEngine:
                 # by the current macro rather than silently switching to nothing.
                 nested_actions = self._load_called_macro(preset)
                 if mode == 'Switch to Macro':
+                    if action.get('inputs') or action.get('return_var'):
+                        raise MacroExecutionError('Run Macro inputs/outputs require Run & Return')
                     return {'switch':'preset', 'target':preset}
                 if preset in macro_stack:
                     raise MacroExecutionError('Run Macro: recursive macro call: ' +
                                               ' -> '.join(macro_stack + (preset,)))
                 if len(macro_stack) >= 12:
                     raise MacroExecutionError('Run Macro: maximum nested call depth (12) reached')
-                # Execute inside the same engine: variables, recovery policy,
-                # loop timing and stop/pause state remain shared. The child does
-                # not replace the parent queue or alter its selected preset.
-                child = self.run_program(nested_actions, idle=idle,
-                                         macro_stack=macro_stack + (preset,))
+                # Inputs are child-local variables, temporarily shadowing matching
+                # caller variables. Restore them even when a nested macro errors.
+                if action.get('return_var'):
+                    variable_identity(action['return_var'],action.get('return_scope','local'))
+                parameters = sequent_parameter_inputs(action.get('inputs', []), self.interpolate)
+                missing = object()
+                prior = {name:self.app.variables.get(name, missing) for name in parameters}
+                try:
+                    self.app.variables.update(parameters)
+                    child = self.run_program(nested_actions, idle=idle,
+                                             macro_stack=macro_stack + (preset,))
+                finally:
+                    for name, old_value in prior.items():
+                        if old_value is missing: self.app.variables.pop(name, None)
+                        else: self.app.variables[name] = old_value
                 if child.get('cancelled') or child.get('switch'):
                     return child
                 if not child.get('completed'):
                     raise MacroExecutionError(f'Run Macro: {preset!r} did not finish')
+                if action.get('return_var') and 'return_value' not in child:
+                    raise MacroExecutionError(f'Run Macro: {preset!r} did not return a value')
+                if 'return_value' in child:
+                    value = child['return_value']
+                    self.app.variables['_last_macro_return'] = value
+                    dest = str(action.get('return_var', '')).strip()
+                    if dest:
+                        set_variable(self.app, dest, value, action.get('return_scope','local'))
                 index += 1
                 continue
+            if typ == 'macro_return':
+                value = self.interpolate(str(action.get('value','')))
+                return {'completed':True, 'return_value':value,
+                        'next_index':index + 1}
             if typ=='if_var':
-                actual=str(get_variable(self.app, action.get('var_name',''), action.get('var_scope')))
-                if dynamic_compare(actual,action.get('op','=='),self.interpolate(action.get('val',''))):
-                    # Old macros and the editor both default to preset routing.
+                if sequent_if_variable_match(self.app, action, self.interpolate):
+                    # Preserve legacy actions, whose default outcome is a preset switch.
                     target_type=action.get('target_type','preset')
+                    if target_type=='continue':
+                        index+=1;continue
+                    if target_type=='set_variable':
+                        sequent_if_set_value(self.app, action)
+                        index+=1;continue
+                    if target_type=='stop':
+                        return {'cancelled':True}
+                    if target_type=='error':
+                        raise MacroExecutionError('IF Variable condition matched; configured to stop with error')
                     if target_type=='label':
                         target=next((i for i,a in enumerate(actions) if a.get('type')=='label' and a.get('name')==action.get('target')),None)
                         if target is None:raise MacroExecutionError('IF Variable label not found')
@@ -4185,6 +6085,9 @@ class SequentDynamicEngine:
 
 # --- VS Code-Style Playback Queue Viewer ---
 class VSCodeQueueViewer(tk.Frame):
+    # Reorder only with Ctrl + left mouse drag. A small movement threshold
+    # distinguishes dragging from an ordinary Ctrl-click; no hold timer.
+    QUEUE_DRAG_SLOP_PX = 5
     # Categorized action catalog. Existing action type names are unchanged,
     # so recorded macros and all existing action editors remain compatible.
     ACTION_PICKER_GROUPS = (
@@ -4200,15 +6103,19 @@ class VSCodeQueueViewer(tk.Frame):
         )),
         ("Variables & Inputs", (
             ("Set Variable", "Create or update a local/global variable.", "SV"),
-            ("Read Clipboard", "Capture text or route clipboard keywords to scoped variables.", "RC"),
+            ("Read Clipboard", "Capture text, save to a text file, or route clipboard keywords.", "RC"),
+            ("Load Text File → Variable", "Read a UTF-8 text file into a Local or Global variable.", "LF"),
             ("Clipboard Branch / Fallback", "On a keyword miss, set a Local/Global variable and/or run a macro.", "CB"),
             ("Request Input", "Ask the user for a value at runtime.", "IN"),
             ("Type Variable", "Type the value of a saved variable.", "VR"),
+            ("Text Processing", "Regex extract, replace, split, or format text variables.", "TX"),
             ("Advanced Key", "Press, hold, or release a specific key.", "AK"),
         )),
         ("Logic & Flow", (
             ("Run Macro", "Run a saved macro and return, or switch to it.", "RM"),
-            ("If Variable Condition", "Branch based on a variable comparison.", "IF"),
+            ("Return From Macro", "Return a text value to the calling macro.", "RM"),
+            ("If Variable Condition", "Compare a variable to text or another variable; then run an action.", "IF"),
+            ("Compare Text & Branch", "Validate words or paragraphs, show differences, and route results.", "CT"),
             ("Gate Check", "Stop, switch, or continue based on variable status.", "GC"),
             ("Label Marker", "Create a named location in the queue.", "LM"),
             ("Jump to Label", "Continue execution at a named label.", "JL"),
@@ -4246,6 +6153,14 @@ class VSCodeQueueViewer(tk.Frame):
         self.hovered_line = None
         self.interactive_enabled = True
         self.sub_menu = None
+        # Queue gestures are independent of the OS input recorder.
+        # Mouse-down must begin with Ctrl held; no asynchronous hold timer.
+        self._dnd_pressed = False
+        self._dnd_active = False
+        self._dnd_start_idx = None
+        self._dnd_hover_idx = None
+        self._dnd_press_screen_xy = None
+        self._dnd_action_identity = None
 
         self._sub_drag_start_x = 0
         self._sub_drag_start_y = 0
@@ -4320,6 +6235,9 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.bind("<<Selection>>", self._on_text_selection_changed)
         self.code_text.bind("<B1-Motion>", self._on_dnd_motion)
         self.code_text.bind("<ButtonRelease-1>", self._on_code_release)
+        # If Ctrl is released while dragging, cancel before mouse-up.
+        self.code_text.bind("<KeyRelease-Control_L>", self._on_queue_ctrl_release)
+        self.code_text.bind("<KeyRelease-Control_R>", self._on_queue_ctrl_release)
 
         self.code_text.tag_configure("active_line", background="#36394a")
         self.code_text.tag_lower("active_line")
@@ -4456,6 +6374,7 @@ class VSCodeQueueViewer(tk.Frame):
 
 
     def clear(self):
+        self._cancel_queue_drag()
         self.close_sub_menu()
         self.plus_btn.place_forget()
         self.code_text.tag_remove("sel", "1.0", "end")  # Forcibly clear selections
@@ -4510,10 +6429,36 @@ class VSCodeQueueViewer(tk.Frame):
     def set_interactive(self, enabled):
         self.interactive_enabled = enabled
         if not enabled:
+            self._cancel_queue_drag()
+            self.code_text.tag_remove("dnd_target", "1.0", "end")
             self.plus_btn.place_forget()
             self.close_sub_menu()
 
     def _on_key_press(self, event):
+        # The read-only queue consumes normal keystrokes; intercept undo first.
+        ctrl = bool(event.state & 0x0004 or event.state & 0x0080)
+        if ctrl and event.keysym.lower() == 'z':
+            if bool(event.state & 0x0001):
+                self.app.redo_deleted_actions()
+            else:
+                self.app.undo_deleted_actions()
+            return 'break'
+        if ctrl and event.keysym.lower() == 'y':
+            self.app.redo_deleted_actions()
+            return 'break'
+        if ctrl and event.keysym.lower() == 's':
+            self.app.save_current_preset()
+            return 'break'
+        if ctrl and event.keysym.lower() == 'c':
+            self.app.copy_queue_actions()
+            return 'break'
+        if ctrl and event.keysym.lower() == 'v':
+            self.app.paste_queue_actions()
+            return 'break'
+        if ctrl and event.keysym.lower() == 'a':
+            self.select_all_actions()
+            return 'break'
+
         # 1. Feature 5: In-Place Coordinate Nudge via Alt / Alt+Shift
         alt_pressed = bool(event.state & 0x20000) or bool(ctypes.windll.user32.GetAsyncKeyState(VK_MENU) & 0x8000)
         shift_pressed = bool(event.state & 0x0001) or bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
@@ -4546,9 +6491,7 @@ class VSCodeQueueViewer(tk.Frame):
             return "break"
 
         # 3. Standard Text Shortcuts
-        ctrl = bool(event.state & 0x0004 or event.state & 0x0080)
-        if ctrl and event.keysym.lower() in ("c", "a"): 
-            return None
+        # Ctrl+A/C/V above operate on actual action objects, not displayed text.
             
         if event.keysym in ("Up", "Down", "Prior", "Next"): 
             return None
@@ -4560,6 +6503,46 @@ class VSCodeQueueViewer(tk.Frame):
 
         return "break"
     
+    def selected_action_indices(self):
+        """Return all action rows touched by Tk's selection, never the header.
+
+        When there is no text selection use the playhead, so a normal click
+        followed by Ctrl+C or Ctrl+V always has a predictable target.
+        """
+        actions = self.app.recorded_actions
+        if not actions:
+            return []
+        try:
+            first, last = self.code_text.tag_ranges('sel')[:2]
+            start_line = int(self.code_text.index(first).split('.')[0])
+            end_index = self.code_text.index(last)
+            end_line, end_column = map(int, end_index.split('.'))
+            if end_column == 0 and end_line > start_line:
+                end_line -= 1
+            start = max(0, start_line - 2)
+            end = min(len(actions) - 1, end_line - 2)
+            if start <= end:
+                return list(range(start, end + 1))
+        except (tk.TclError, IndexError, ValueError):
+            pass
+        return [max(0, min(self.app.current_action_idx, len(actions) - 1))]
+
+    def select_action_range(self, first_index, last_index):
+        """Make pasted actions visible and selected without selecting the header."""
+        if first_index > last_index:
+            return
+        self.code_text.tag_remove('sel', '1.0', 'end')
+        self.code_text.tag_add('sel', f'{first_index + 2}.0',
+                               f'{last_index + 3}.0')
+        self.code_text.mark_set('insert', f'{first_index + 2}.0')
+        self.code_text.see(f'{first_index + 2}.0')
+
+    def select_all_actions(self):
+        if self.app.recorded_actions:
+            self.select_action_range(0, len(self.app.recorded_actions) - 1)
+            return True
+        return False
+
     def _handle_delete_key(self):
         if not self.interactive_enabled or not self.app.recorded_actions:
             return
@@ -4583,7 +6566,10 @@ class VSCodeQueueViewer(tk.Frame):
             self.app.delete_action_range(start_idx, end_idx)
 
     def _on_right_click(self, event):
-        if not self.interactive_enabled or not self.app.recorded_actions:
+        if not self.interactive_enabled:
+            return
+        if (not self.app.recorded_actions and not self.app._queue_undo_history
+                and not self.app._queue_action_clipboard):
             return
 
         rel_y = event.y_root - self.gutter.winfo_rooty()
@@ -4597,6 +6583,9 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.mark_set("insert", f"{line_num}.0")
         menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, activeforeground=TEXT_PRIMARY, bd=1, relief="flat", font=("Segoe UI", 9))
 
+        if self.app._queue_undo_history:
+            menu.add_command(label="Undo Last Queue Edit (Ctrl+Z)", command=self.app.undo_deleted_actions)
+            menu.add_separator()
         if line_num >= 2 and (line_num - 2) < len(self.app.recorded_actions):
             act_idx = line_num - 2
             act = self.app.recorded_actions[act_idx]
@@ -4604,6 +6593,15 @@ class VSCodeQueueViewer(tk.Frame):
             is_bp = act_idx in self.app.breakpoints
             bp_label = f"Remove Breakpoint (Line {line_num})" if is_bp else f"Toggle Breakpoint (Line {line_num})"
 
+            # Copy the full highlighted range when the context row is selected.
+            selected = self.selected_action_indices()
+            to_copy = selected if act_idx in selected else [act_idx]
+            menu.add_command(label="Copy Action(s) (Ctrl+C)",
+                             command=lambda indices=to_copy: self.app.copy_queue_actions(indices))
+            if self.app._queue_action_clipboard:
+                menu.add_command(label="Paste After This Action (Ctrl+V)",
+                                 command=lambda idx=act_idx + 1: self.app.paste_queue_actions(idx))
+            menu.add_separator()
             # Direct edit option
             menu.add_command(label=f"Edit Action '{act_type}' (Line {line_num})...", command=lambda: self.open_action_submenu(line_num, event, edit_idx=act_idx))
             menu.add_command(label=bp_label, command=lambda: self.app.toggle_breakpoint(act_idx))
@@ -4612,6 +6610,10 @@ class VSCodeQueueViewer(tk.Frame):
                 menu.add_command(label="Delete All Mouse Movements", command=self.app.remove_all_mouse_moves)
             menu.add_separator()
 
+        if self.app._queue_action_clipboard and not self.app.recorded_actions:
+            menu.add_command(label="Paste Actions Here (Ctrl+V)",
+                             command=lambda: self.app.paste_queue_actions(0))
+            menu.add_separator()
         menu.add_command(label=f"Insert Action at Line {line_num}...", command=lambda: self.open_action_submenu(line_num, event))
         if any(a.get("type") == "move" for a in self.app.recorded_actions):
             menu.add_command(label="Remove All Mouse Movements", command=self.app.remove_all_mouse_moves)
@@ -4696,96 +6698,127 @@ class VSCodeQueueViewer(tk.Frame):
                 self.open_action_submenu(line_num, event)
         except Exception: pass
 
-    def _on_code_click(self, event):
-        if self.sub_menu and self.sub_menu.winfo_exists():
-            self.close_sub_menu()
-
-        self._dnd_start_idx = None
-        self._dnd_active = False
-
-        # Synchronize playhead & reticle to the clicked queue line
-        try:
-            clicked_pos = self.code_text.index(f"@{event.x},{event.y}")
-            line_num = int(clicked_pos.split(".")[0])
-            if line_num >= 2:
-                act_idx = line_num - 2
-                if 0 <= act_idx < len(self.app.recorded_actions):
-                    self.app.set_active_action_index(act_idx)
-                    # Prime the drag-and-drop state
-                    self._dnd_start_idx = act_idx
-                    self._dnd_start_y = event.y
-        except Exception:
-            pass
-
-    def _on_dnd_motion(self, event):
-        if not self.interactive_enabled or not self.app.recorded_actions:
-            return
-        start_idx = getattr(self, "_dnd_start_idx", None)
-        if start_idx is None:
-            return
-        
-        # Only activate drag mode if the mouse moves vertically by a few pixels
-        if not getattr(self, "_dnd_active", False):
-            if abs(event.y - getattr(self, "_dnd_start_y", event.y)) > 5:
-                self._dnd_active = True
-                self.code_text.tag_remove("sel", "1.0", "end") # Clear text selection
-            else:
-                return
-
-        try:
-            hover_pos = self.code_text.index(f"@{event.x},{event.y}")
-            line_num = int(hover_pos.split(".")[0])
-            hover_idx = line_num - 2
-            
-            # Cap the index to valid bounds so it can be dragged to the very bottom
-            max_idx = len(self.app.recorded_actions)
-            hover_idx = max(0, min(hover_idx, max_idx))
-            
-            self._dnd_hover_idx = hover_idx
-            self.code_text.tag_remove("dnd_target", "1.0", "end")
-            
-            target_line = hover_idx + 2
-            if target_line <= self.line_count + 1:
-                # Add a visual underline to the slot it will drop into
-                self.code_text.tag_add("dnd_target", f"{target_line}.0", f"{target_line}.end+1c")
-        except Exception:
-            pass
-
-        return "break" # Overrides standard text highlighting while dragging
-
-    def _on_code_release(self, event):
-        self.code_text.tag_remove("dnd_target", "1.0", "end")
-        
-        if getattr(self, "_dnd_active", False):
-            start = getattr(self, "_dnd_start_idx", None)
-            end = getattr(self, "_dnd_hover_idx", None)
-            
-            if start is not None and end is not None and start != end:
-                # Perform the list reorder
-                act = self.app.recorded_actions.pop(start)
-                self.app.recorded_actions.insert(end, act)
-                
-                # Update the playhead index if it was affected by the shift
-                if self.app.current_action_idx == start:
-                    self.app.current_action_idx = end
-                elif start < self.app.current_action_idx <= end:
-                    self.app.current_action_idx -= 1
-                elif end <= self.app.current_action_idx < start:
-                    self.app.current_action_idx += 1
-                    
-                # Redraw the queue and re-sync the playhead
-                self.app.display_actions_in_queue(self.app.recorded_actions)
-                self.app.set_active_action_index(self.app.current_action_idx)
-        
-        # Reset drag state
+    def _cancel_queue_drag(self):
+        """Forget the gesture, target highlight and cursor without touching actions."""
+        self._dnd_pressed = False
         self._dnd_active = False
         self._dnd_start_idx = None
         self._dnd_hover_idx = None
-        
-        # Call the selection handler to resume ghost-reticle multi-select trails
+        self._dnd_press_screen_xy = None
+        self._dnd_action_identity = None
+        try:
+            self.code_text.tag_remove("dnd_target", "1.0", "end")
+            self.code_text.config(cursor="xterm")
+        except tk.TclError:
+            pass
+
+    def _on_queue_ctrl_release(self, event):
+        """Disarm drag if the user releases either Ctrl key mid-gesture."""
+        if self._dnd_pressed:
+            self._cancel_queue_drag()
+            return "break"
+
+    def _on_code_click(self, event):
+        if self.sub_menu and self.sub_menu.winfo_exists():
+            self.close_sub_menu()
+        self._cancel_queue_drag()
+        if not self.interactive_enabled:
+            return
+        try:
+            clicked_pos = self.code_text.index(f"@{event.x},{event.y}")
+            line_num = int(clicked_pos.split(".")[0])
+            act_idx = line_num - 2
+            if not 0 <= act_idx < len(self.app.recorded_actions):
+                return
+            # A click still selects immediately; reorder is never implicit.
+            self.app.set_active_action_index(act_idx)
+            if self.app.recording or self.app.playing or self.app.chain_running:
+                return
+            # Ctrl must already be down on mouse press, and Shift+click still
+            # performs its normal text/range selection behavior.
+            if not (event.state & 0x0004) or (event.state & 0x0001):
+                return
+            self._dnd_start_idx = act_idx
+            self._dnd_press_screen_xy = (event.x_root, event.y_root)
+            self._dnd_action_identity = self.app.recorded_actions[act_idx]
+            self._dnd_pressed = True
+            self.code_text.focus_set()
+            self.code_text.config(cursor="fleur")
+            # Prevent the Text widget from treating Ctrl+drag as text selection.
+            return "break"
+        except (tk.TclError, ValueError, IndexError):
+            self._cancel_queue_drag()
+
+    def _on_dnd_motion(self, event):
+        if not self._dnd_pressed:
+            return  # Ordinary mouse drags still select text; never reorder.
+        start = self._dnd_start_idx
+        if (not self.interactive_enabled or not (event.state & 0x0004) or
+                self.app.recording or self.app.playing or self.app.chain_running or
+                start is None or not 0 <= start < len(self.app.recorded_actions) or
+                self.app.recorded_actions[start] is not self._dnd_action_identity):
+            self._cancel_queue_drag()
+            return "break"
+        if not self._dnd_active:
+            sx, sy = self._dnd_press_screen_xy
+            if (abs(event.x_root - sx) <= self.QUEUE_DRAG_SLOP_PX and
+                    abs(event.y_root - sy) <= self.QUEUE_DRAG_SLOP_PX):
+                return "break"
+            self._dnd_active = True
+            self.code_text.tag_remove("sel", "1.0", "end")
+        try:
+            hover_pos = self.code_text.index(f"@{event.x},{event.y}")
+            line_num = int(hover_pos.split(".")[0])
+            self._dnd_hover_idx = max(0, min(line_num - 2, len(self.app.recorded_actions) - 1))
+            target_line = self._dnd_hover_idx + 2
+            self.code_text.tag_remove("dnd_target", "1.0", "end")
+            self.code_text.tag_add(
+                "dnd_target", f"{target_line}.0", f"{target_line}.end+1c")
+        except tk.TclError:
+            self._cancel_queue_drag()
+        return "break"
+
+    def _on_code_release(self, event):
+        had_gesture = self._dnd_pressed
+        start = self._dnd_start_idx
+        end = self._dnd_hover_idx
+        original_action = self._dnd_action_identity
+        should_reorder = (
+            had_gesture and self._dnd_active and (event.state & 0x0004) and
+            start is not None and end is not None and start != end and
+            self.interactive_enabled and
+            not (self.app.playing or self.app.recording or self.app.chain_running) and
+            0 <= start < len(self.app.recorded_actions) and
+            0 <= end < len(self.app.recorded_actions) and
+            self.app.recorded_actions[start] is original_action
+        )
+        self._cancel_queue_drag()
+        if should_reorder:
+            before = self.app._begin_queue_deletion()  # Ctrl+Z preserves undo.
+            action = self.app.recorded_actions.pop(start)
+            self.app.recorded_actions.insert(end, action)
+            # Move breakpoints and the playhead *with* their respective actions.
+            def shifted(idx):
+                if idx == start:
+                    return end
+                if start < idx <= end:
+                    return idx - 1
+                if end <= idx < start:
+                    return idx + 1
+                return idx
+            self.app.breakpoints = {shifted(i) for i in self.app.breakpoints}
+            self.app.current_action_idx = shifted(self.app.current_action_idx)
+            self.app._finish_queue_deletion(before, "Reordered Action")
+            self.app.set_active_action_index(self.app.current_action_idx)
         self._on_text_selection_changed()
-    
+        # Suppress Text's default mouse-up selection handling after Ctrl+drag.
+        if had_gesture:
+            return "break"
+
     def _on_double_click(self, event):
+        # A double-click is always edit, never the start of a long-press drag.
+        self._cancel_queue_drag()
+        self._dnd_start_idx = None
         if not self.interactive_enabled or not self.app.recorded_actions:
             return "break"
         try:
@@ -4817,6 +6850,8 @@ class VSCodeQueueViewer(tk.Frame):
             "delay": "Delay",
             "disclaimer": "Disclaimer / Warning",
             "if_var": "If Variable Condition",
+            "compare_text": "Compare Text & Branch",
+            "compare_variables": "Compare Variables",
             "read_clipboard": "Read Clipboard",
             "clip_fallback": "Clipboard Branch / Fallback",
             "gate_check": "Gate Check",
@@ -5132,12 +7167,14 @@ class VSCodeQueueViewer(tk.Frame):
                 tile = tk.Frame(self._action_picker_inner, bg=row_color,
                                 cursor="hand2", padx=9, pady=8)
                 tile.pack(fill=tk.X, padx=(4, 8), pady=2)
-                accent = tk.Frame(tile, width=3,
-                                  bg=COLOR_ACCENT if selected else row_color)
+                accent = SequentRoundedAccentBar(
+                    tile, thickness=3, background=row_color,
+                    accent=COLOR_ACCENT if selected else '', inset=4)
                 accent.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 9))
-                accent.pack_propagate(False)
                 tag = SequentIcon(tile, sequent_icon_for_action(name),
-                                  color=SYNTAX_BLUE, bg=BG_INPUT, size=24)
+                                  color=SYNTAX_BLUE, bg=BG_INPUT, size=24,
+                                  override_key=sequent_icon_slot('action', name),
+                                  slot_label=name)
                 tag.pack(side=tk.LEFT, padx=(0, 8))
                 names = tk.Frame(tile, bg=row_color)
                 names.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -5189,6 +7226,8 @@ class VSCodeQueueViewer(tk.Frame):
             "Delay": self._render_delay_view,
             "Disclaimer / Warning": self._render_disclaimer_view,
             "If Variable Condition": self._render_if_var_view,
+            "Compare Text & Branch": self._render_compare_text_view,
+            "Compare Variables": self._render_compare_variables_view,
             "Read Clipboard": self._render_read_clipboard_view,
             "Clipboard Branch / Fallback": self._render_clipboard_fallback_view,
             "Request Input": self._render_request_input_view,
@@ -5224,6 +7263,516 @@ class VSCodeQueueViewer(tk.Frame):
         tk.Label(row, text='Local: this session   |   Global: saved for other macros',
                  font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
         return var
+
+    def _render_compare_variables_view(self, line_num, edit_idx=None):
+        """Compact IF / THEN / ELSE editor for variable-to-variable comparisons.
+
+        Stored actions intentionally reuse the existing compare_variables JSON
+        fields and execution engine. Advanced/legacy branches remain editable.
+        """
+        body = self.action_content_frame
+        old = (self.app.recorded_actions[edit_idx] if edit_idx is not None
+               and 0 <= edit_idx < len(self.app.recorded_actions) else {})
+        if old.get('type') != 'compare_variables':
+            old = {}
+
+        def title(parent, name, *, muted=False):
+            tk.Label(parent, text=name, bg=BG_PANEL,
+                     fg=TEXT_MUTED if muted else TEXT_PRIMARY,
+                     font=('Segoe UI', 9, 'bold'), anchor='w').pack(fill=tk.X, pady=(8, 3))
+
+        def note(parent, message):
+            tk.Label(parent, text=message, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8), justify='left', anchor='w',
+                     wraplength=425).pack(fill=tk.X, pady=(0, 4))
+
+        def dropdown(parent, state, values):
+            widget = tk.OptionMenu(parent, state, *values)
+            widget.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
+                          highlightthickness=1, highlightbackground=BG_BORDER)
+            widget['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                  activebackground=COLOR_ACCENT)
+            widget.pack(fill=tk.X, pady=(0, 4))
+            return widget
+
+        def textfield(parent, value=''):
+            widget = tk.Entry(parent, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                              font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                              highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
+            widget.insert(0, str(value))
+            widget.pack(fill=tk.X, ipady=5, pady=(0, 4))
+            return widget
+
+        title(body, 'IF  ·  Compare these variables')
+        note(body, 'Enter variable names, not their values. Sequent reads both when this action runs.')
+        sources = {}
+        for side, label in (('left', 'Variable A'), ('right', 'Variable B')):
+            row = tk.Frame(body, bg=BG_PANEL)
+            row.pack(fill=tk.X, pady=(1, 2))
+            name_box = tk.Frame(row, bg=BG_PANEL)
+            name_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+            tk.Label(name_box, text=label, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8, 'bold'), anchor='w').pack(fill=tk.X)
+            name = textfield(name_box, old.get(side + '_value', ''))
+            scope_box = tk.Frame(row, bg=BG_PANEL, width=100, height=58)
+            scope_box.pack(side=tk.RIGHT)
+            scope_box.pack_propagate(False)
+            tk.Label(scope_box, text='Scope', bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8), anchor='w').pack(fill=tk.X)
+            scope = tk.StringVar(master=body, value=str(old.get(side + '_scope', 'local')).title())
+            dropdown(scope_box, scope, ('Local', 'Global'))
+            sources[side] = (name, scope)
+            if side == 'left':
+                tk.Label(body, text='equals', bg=BG_PANEL, fg=COLOR_ACCENT,
+                         font=('Segoe UI', 9, 'bold'), anchor='center').pack(fill=tk.X, pady=(0, 2))
+
+        ACTION_CHOICES = ('Set Variable', 'Continue', 'Jump to Label',
+                          'Run Saved Macro', 'Stop Macro', 'Stop with Error')
+
+        def outcome_editor(parent, key, default):
+            """Only display inputs relevant to the chosen branch behavior."""
+            chosen = tk.StringVar(master=body, value=old.get(key, default))
+            if chosen.get() not in ACTION_CHOICES:
+                chosen.set(default)
+            dropdown(parent, chosen, ACTION_CHOICES)
+            dynamic = tk.Frame(parent, bg=BG_PANEL)
+            dynamic.pack(fill=tk.X)
+            previous_target = str(old.get(key + '_target', ''))
+            previous_scope = str(old.get(key + '_scope', 'local')).lower()
+            right_name = str(old.get('right_value', ''))
+            left_name = str(old.get('left_value', ''))
+            initial_choice = ('Variable B' if not previous_target or
+                              (previous_target == right_name and previous_scope ==
+                               str(old.get('right_scope', 'local')).lower()) else
+                              'Variable A' if previous_target == left_name and
+                              previous_scope == str(old.get('left_scope', 'local')).lower() else
+                              'Other variable')
+            target_choice = tk.StringVar(master=body, value=initial_choice)
+            value_from_old = str(old.get(key + '_value', ' ' if key == 'on_match' else '${result}'))
+            value_kind = tk.StringVar(master=body, value=('One space' if value_from_old == ' ' else
+                                              'Empty text' if value_from_old == '' else
+                                              'Custom text'))
+            custom_value = value_from_old if value_kind.get() == 'Custom text' else ''
+            other_target = previous_target if initial_choice == 'Other variable' else ''
+            other_scope = tk.StringVar(master=body, value=previous_scope.title())
+            state = {'target':None, 'value':None}
+
+            def render(*_):
+                # Keep custom text when switching between value representations.
+                if state['value'] is not None:
+                    nonlocal_custom[0] = state['value'].get()
+                if state['target'] is not None:
+                    nonlocal_target[0] = state['target'].get()
+                for item in dynamic.winfo_children(): item.destroy()
+                state['target'] = None
+                state['value'] = None
+                behavior = chosen.get()
+                if behavior == 'Set Variable':
+                    tk.Label(dynamic, text='Change', bg=BG_PANEL, fg=TEXT_MUTED,
+                             font=('Segoe UI', 8)).pack(anchor='w')
+                    dropdown(dynamic, target_choice, ('Variable B', 'Variable A', 'Other variable'))
+                    if target_choice.get() == 'Other variable':
+                        state['target'] = textfield(dynamic, nonlocal_target[0])
+                        tk.Label(dynamic, text='Destination scope', bg=BG_PANEL,
+                                 fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+                        dropdown(dynamic, other_scope, ('Local', 'Global'))
+                    tk.Label(dynamic, text='To', bg=BG_PANEL, fg=TEXT_MUTED,
+                             font=('Segoe UI', 8)).pack(anchor='w')
+                    dropdown(dynamic, value_kind, ('One space', 'Empty text', 'Custom text'))
+                    if value_kind.get() == 'Custom text':
+                        state['value'] = textfield(dynamic, nonlocal_custom[0])
+                    else:
+                        note(dynamic, ('Stores one literal space character (" ").' if
+                              value_kind.get() == 'One space' else
+                              'Clears the variable completely (empty string).'))
+                elif behavior in ('Jump to Label', 'Run Saved Macro'):
+                    tk.Label(dynamic, text='Label name' if behavior == 'Jump to Label'
+                             else 'Saved macro name', bg=BG_PANEL, fg=TEXT_MUTED,
+                             font=('Segoe UI', 8)).pack(anchor='w')
+                    state['target'] = textfield(dynamic, nonlocal_target[0])
+                # Continue/Stop/Stop with Error require no extra fields.
+
+            nonlocal_custom = [custom_value]
+            nonlocal_target = [other_target if chosen.get() == 'Set Variable' else previous_target]
+            chosen.trace_add('write', render)
+            target_choice.trace_add('write', render)
+            value_kind.trace_add('write', render)
+            render()
+
+            def read():
+                behavior = chosen.get()
+                target = ''
+                scope = 'local'
+                value = ''
+                if behavior == 'Set Variable':
+                    selection = target_choice.get()
+                    if selection in ('Variable A', 'Variable B'):
+                        side = 'left' if selection == 'Variable A' else 'right'
+                        target = sources[side][0].get().strip()
+                        scope = sources[side][1].get().lower()
+                    else:
+                        target = state['target'].get().strip() if state['target'] else ''
+                        scope = other_scope.get().lower()
+                    value = (' ' if value_kind.get() == 'One space' else
+                             '' if value_kind.get() == 'Empty text' else
+                             state['value'].get() if state['value'] else nonlocal_custom[0])
+                elif behavior in ('Jump to Label', 'Run Saved Macro'):
+                    target = state['target'].get().strip() if state['target'] else ''
+                return behavior, target, value, scope
+            return read, chosen
+
+        title(body, 'THEN  ·  When they match')
+        note(body, 'What should happen when Variable A equals Variable B?')
+        on_match, match_kind = outcome_editor(body, 'on_match', 'Set Variable')
+        title(body, 'ELSE  ·  When they do not match')
+        note(body, 'Continue leaves both variables unchanged.')
+        on_mismatch, mismatch_kind = outcome_editor(body, 'on_mismatch', 'Continue')
+
+        advanced = tk.Frame(body, bg=BG_PANEL)
+        def toggle_advanced():
+            if advanced.winfo_manager(): advanced.pack_forget()
+            else: advanced.pack(fill=tk.X, pady=(5, 8), after=advanced_button)
+        advanced_button = ModernButton(body, text='▸ Advanced options (optional)',
+                                        bg_color=BG_BORDER, hover_color=BG_HOVER,
+                                        command=toggle_advanced)
+        advanced_button.pack(fill=tk.X, pady=(9, 4))
+        title(advanced, 'How to compare')
+        note(advanced, 'Exact Match checks every character, including spaces and capitalization.')
+        mode = tk.StringVar(master=body, value=old.get('mode', 'Exact Match'))
+        dropdown(advanced, mode, SEQUENT_COMPARE_MODES)
+        title(advanced, 'If the variable cannot be read')
+        note(advanced, 'Missing variables are errors, not mismatches.')
+        on_error, error_kind = outcome_editor(advanced, 'on_error', 'Stop with Error')
+        title(advanced, 'Optional text adjustments')
+        flags = {}
+        for key, caption in (('ignore_case', 'Ignore capitalization'),
+                             ('trim_lines', 'Trim start/end of each line'),
+                             ('normalize_whitespace', 'Collapse repeated spaces'),
+                             ('ignore_line_breaks', 'Ignore line breaks')):
+            state = tk.BooleanVar(master=body, value=bool(old.get(key, False)))
+            tk.Checkbutton(advanced, text=caption, variable=state, bg=BG_PANEL,
+                           fg=TEXT_PRIMARY, selectcolor=BG_INPUT,
+                           activebackground=BG_PANEL, activeforeground=TEXT_PRIMARY,
+                           font=('Segoe UI', 9)).pack(anchor='w')
+            flags[key] = state
+        tk.Label(advanced, text='Similarity percentage (only for Similarity mode)',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+        threshold = textfield(advanced, old.get('threshold', 95))
+        tk.Label(advanced, text='Retry missing/invalid inputs (0–10 attempts)',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+        retries = textfield(advanced, old.get('retry_count', 0))
+        tk.Label(advanced, text='Seconds between retries (0–60)',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+        retry_delay = textfield(advanced, old.get('retry_delay', 0.25))
+        if (mode.get() != 'Exact Match' or
+            error_kind.get() != 'Stop with Error' or
+            int(old.get('retry_count', 0) or 0) or
+            any(bool(old.get(k)) for k in flags)):
+            advanced.pack(fill=tk.X, pady=(5, 8), after=advanced_button)
+
+        message = tk.Label(body, text='', bg=BG_PANEL, fg=COLOR_DANGER,
+                           font=('Segoe UI', 8), wraplength=425, justify='left')
+        message.pack(fill=tk.X, pady=(4, 5))
+
+        def collect():
+            # Editing must preserve any other fields saved by older versions.
+            action = dict(old)
+            action.update(type='compare_variables', mode=mode.get(),
+                          threshold=float(threshold.get()), retry_count=int(retries.get()),
+                          retry_delay=float(retry_delay.get()))
+            if not 0 <= action['retry_count'] <= 10 or not 0 <= action['retry_delay'] <= 60:
+                raise MacroExecutionError('Retry count must be 0–10 and retry delay 0–60 seconds')
+            for side, (name, scope) in sources.items():
+                bare, actual_scope = variable_identity(name.get().strip(), scope.get())
+                action[side + '_source'] = 'Variable'
+                action[side + '_value'] = bare
+                action[side + '_scope'] = actual_scope
+            for key, state in flags.items(): action[key] = state.get()
+            for branch, reader in (('on_match', on_match),
+                                   ('on_mismatch', on_mismatch), ('on_error', on_error)):
+                behavior, target, value, scope = reader()
+                action[branch] = behavior
+                action[branch + '_target'] = target
+                action[branch + '_value'] = value
+                action[branch + '_scope'] = scope
+                sequent_compare_outcome(action, branch)
+            sequent_compare_text('test', 'test', mode=action['mode'],
+                                 threshold=action['threshold'])
+            return action
+
+        def preview():
+            try:
+                action = collect()
+                a = sequent_compare_resolve(self.app, action, 'left')
+                b = sequent_compare_resolve(self.app, action, 'right')
+                result = sequent_compare_text(a, b, mode=action['mode'],
+                           threshold=action['threshold'],
+                           **{key: flag.get() for key, flag in flags.items()})
+                matched = result['matched']
+                response = action['on_match'] if matched else action['on_mismatch']
+                message.config(text=('MATCH — ' if matched else 'NO MATCH — ') +
+                               response + ' would run. Preview makes no changes.',
+                               fg=COLOR_SUCCESS if matched else COLOR_DANGER)
+            except (MacroExecutionError, ValueError, TypeError, OSError) as exc:
+                message.config(text='Cannot preview: ' + str(exc), fg=COLOR_DANGER)
+
+        ModernButton(body, text='Check current values (preview only)',
+                     bg_color=BG_BORDER, hover_color=BG_HOVER,
+                     command=preview).pack(fill=tk.X, pady=(4, 5))
+        if edit_idx is None:
+            title(body, 'Insert action')
+            position = tk.StringVar(master=body, value=f'Before Line {line_num}')
+            dropdown(body, position, (f'Before Line {line_num}', f'After Line {line_num}'))
+
+        def save():
+            try:
+                action = collect()
+            except (MacroExecutionError, ValueError, TypeError, OSError) as exc:
+                message.config(text=str(exc), fg=COLOR_DANGER)
+                return
+            if edit_idx is not None:
+                idx = edit_idx
+                self.app.recorded_actions[idx] = action
+            else:
+                after = position.get().startswith('After')
+                idx = 0 if line_num <= 1 else (line_num - 1 if after else line_num - 2)
+                idx = max(0, min(idx, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(idx, action)
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.set_active_action_index(idx)
+            self.app.update_status('Compare Variables saved', COLOR_SUCCESS)
+            self.close_sub_menu()
+        ModernButton(body, text='Save Changes' if edit_idx is not None else 'Add Compare Variables',
+                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                     command=save).pack(fill=tk.X, pady=(3, 12))
+
+    def _render_compare_text_view(self, line_num, edit_idx=None, variables_only=False):
+        """Editable, paragraph-friendly Compare Text & Branch action."""
+        body = self.action_content_frame
+        old = (self.app.recorded_actions[edit_idx] if edit_idx is not None
+               and 0 <= edit_idx < len(self.app.recorded_actions) else {})
+        if old.get('type') != ('compare_variables' if variables_only else 'compare_text'):
+            old = {}
+        controls = {}
+        label_font = ('Segoe UI', 8, 'bold')
+
+        def heading(text):
+            tk.Label(body, text=text, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=label_font, anchor='w').pack(fill=tk.X, pady=(10, 3))
+
+        def menu(parent, variable, values):
+            widget = tk.OptionMenu(parent, variable, *values)
+            widget.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
+                          highlightthickness=1, highlightbackground=BG_BORDER)
+            widget['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            widget.pack(fill=tk.X, pady=(0, 4))
+            return widget
+
+        def entry(parent, value=''):
+            widget = tk.Entry(parent, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                              font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                              highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
+            widget.insert(0, str(value))
+            widget.pack(fill=tk.X, ipady=4, pady=(0, 4))
+            return widget
+
+        def operand(side, title):
+            heading(title)
+            source = tk.StringVar(value=('Variable' if variables_only else
+                                         old.get(side + '_source', 'Literal Text')))
+            if not variables_only:
+                menu(body, source, SEQUENT_COMPARE_SOURCES)
+            group = tk.Frame(body, bg=BG_PANEL)
+            group.pack(fill=tk.X)
+            value = str(old.get(side + '_value', ''))
+            scope = tk.StringVar(value=str(old.get(side + '_scope','local')).title())
+            state = {'widget':None, 'value':value}
+            def render(*_):
+                prior_widget = state['widget']
+                if isinstance(prior_widget, tk.Text):
+                    state['value'] = prior_widget.get('1.0', 'end-1c')
+                elif prior_widget is not None:
+                    state['value'] = prior_widget.get()
+                previous = state['value']
+                for child in group.winfo_children(): child.destroy()
+                kind = source.get()
+                if kind == 'Literal Text':
+                    widget = tk.Text(group, height=4, wrap='word', bg=BG_INPUT,
+                                     fg=TEXT_PRIMARY, font=('Consolas', 9),
+                                     insertbackground=TEXT_PRIMARY, bd=0,
+                                     highlightthickness=1, highlightbackground=BG_BORDER)
+                    widget.insert('1.0', previous)
+                    widget.pack(fill=tk.X)
+                elif kind == 'Variable':
+                    tk.Label(group, text='Variable name:', bg=BG_PANEL,
+                             fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+                    widget = entry(group, previous)
+                    menu(group, scope, ('Local', 'Global'))
+                elif kind == 'Text File':
+                    widget = entry(group, previous)
+                    def browse():
+                        chosen = filedialog.askopenfilename(parent=self.sub_menu,
+                                  title='Select UTF-8 text to compare')
+                        if chosen:
+                            widget.delete(0, tk.END)
+                            widget.insert(0, chosen)
+                    ModernButton(group, text='Browse Text File', bg_color=BG_BORDER,
+                                 hover_color=BG_HOVER, command=browse).pack(fill=tk.X)
+                else:
+                    widget = None
+                    tk.Label(group, text='Reads the clipboard at playback time.',
+                        bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+                state['widget'] = widget
+            source.trace_add('write', render)
+            render()
+            controls[side] = (source, scope, state)
+
+        operand('left', 'VARIABLE A (EXPECTED)' if variables_only else 'EXPECTED TEXT / SOURCE A')
+        operand('right', 'VARIABLE B (ACTUAL)' if variables_only else 'ACTUAL TEXT / SOURCE B')
+        heading('Comparison mode')
+        mode = tk.StringVar(value=old.get('mode', 'Exact Match'))
+        menu(body, mode, SEQUENT_COMPARE_MODES)
+        advanced = tk.Frame(body, bg=BG_PANEL)
+        def toggle_advanced():
+            if advanced.winfo_manager():
+                advanced.pack_forget()
+            else:
+                advanced.pack(fill=tk.X, pady=(4, 7), after=advanced_button)
+        advanced_button = ModernButton(body, text='Advanced Comparison Options',
+                                       bg_color=BG_BORDER, hover_color=BG_HOVER,
+                                       command=toggle_advanced)
+        advanced_button.pack(fill=tk.X, pady=(3, 5))
+        tk.Label(advanced, text='SIMILARITY THRESHOLD (0–100%)', bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=label_font, anchor='w').pack(fill=tk.X, pady=(10, 3))
+        threshold = entry(advanced, old.get('threshold', 95))
+        tk.Label(advanced, text='NORMALIZATION — OFF BY DEFAULT', bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=label_font, anchor='w').pack(fill=tk.X, pady=(10,3))
+        flags = {}
+        for key, title in (('ignore_case','Ignore capitalization'),
+                           ('trim_lines','Trim beginning/end of each line'),
+                           ('normalize_whitespace','Collapse repeated whitespace'),
+                           ('ignore_line_breaks','Treat line breaks as spaces')):
+            v = tk.BooleanVar(value=bool(old.get(key, False)))
+            tk.Checkbutton(advanced, text=title, variable=v, bg=BG_PANEL,
+                           fg=TEXT_PRIMARY, selectcolor=BG_INPUT,
+                           activebackground=BG_PANEL, activeforeground=TEXT_PRIMARY,
+                           font=('Segoe UI', 9)).pack(anchor='w')
+            flags[key] = v
+        heading('ON MATCH / ON MISMATCH / ON INPUT ERROR')
+        tk.Label(body, text='Errors include missing variables, unreadable files and invalid settings. '
+                 'Run Saved Macro switches to the selected macro (no return).',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 wraplength=440, justify='left').pack(anchor='w')
+        outcomes = {}
+        for key, title, default in (('on_match','ON MATCH','Continue'),
+                                    ('on_mismatch','ON MISMATCH','Stop with Error'),
+                                    ('on_error','ON ERROR','Stop with Error')):
+            heading(title)
+            kind = tk.StringVar(value=old.get(key, default))
+            menu(body, kind, SEQUENT_COMPARE_OUTCOMES)
+            target = entry(body, old.get(key + '_target', ''))
+            tk.Label(body, text='Target: label, saved macro, or variable name when applicable',
+                     bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+            new_value = entry(body, old.get(key + '_value', '${result}'))
+            scope = tk.StringVar(value=str(old.get(key + '_scope','local')).title())
+            menu(body, scope, ('Local','Global'))
+            outcomes[key] = (kind, target, new_value, scope)
+
+        tk.Label(advanced, text='Retry comparison errors (0–10)', bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=label_font).pack(anchor='w', pady=(10,3))
+        retries = entry(advanced, old.get('retry_count', 0))
+        tk.Label(advanced, text='Seconds between retries (0–60)', bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=label_font).pack(anchor='w', pady=(6,3))
+        retry_delay = entry(advanced, old.get('retry_delay', 0.25))
+        if (old.get('mode') == 'Similarity' or old.get('retry_count',0) or
+            any(bool(old.get(key,False)) for key in ('ignore_case','trim_lines',
+                'normalize_whitespace','ignore_line_breaks'))):
+            advanced.pack(fill=tk.X, pady=(4,7), after=advanced_button)
+        mode.trace_add('write', lambda *_: advanced.pack(fill=tk.X, pady=(4,7), after=advanced_button)
+                       if mode.get() == 'Similarity' and not advanced.winfo_manager() else None)
+        info = tk.Label(body, text='', bg=BG_PANEL, fg=COLOR_DANGER,
+                        wraplength=430, justify='left', font=('Segoe UI', 8))
+        info.pack(fill=tk.X, pady=(8, 3))
+
+        def collect():
+            action = {'type': 'compare_variables' if variables_only else 'compare_text',
+                      'mode':mode.get(), 'threshold':float(threshold.get()),
+                      'retry_count':int(retries.get()), 'retry_delay':float(retry_delay.get())}
+            if not 0 <= action['retry_count'] <= 10 or not 0 <= action['retry_delay'] <= 60:
+                raise MacroExecutionError('Retry count must be 0–10, delay 0–60 seconds')
+            for side, (kind, scope, state) in controls.items():
+                widget = state['widget']
+                action[side + '_source'] = 'Variable' if variables_only else kind.get()
+                action[side + '_scope'] = scope.get().lower()
+                action[side + '_value'] = (widget.get('1.0','end-1c') if isinstance(widget, tk.Text)
+                                          else widget.get() if widget is not None else '')
+            for key, v in flags.items(): action[key] = v.get()
+            for key, (kind, target, new_value, scope) in outcomes.items():
+                action[key] = kind.get()
+                action[key + '_target'] = target.get().strip()
+                action[key + '_value'] = new_value.get()
+                action[key + '_scope'] = scope.get().lower()
+                sequent_compare_outcome(action, key)
+            # Validate options before saving or showing a preview.
+            sequent_compare_text('test', 'test', mode=action['mode'], threshold=action['threshold'])
+            return action
+
+        def preview():
+            try:
+                action = collect()
+                left = sequent_compare_resolve(self.app, action, 'left', self.app.dynamic_engine.interpolate)
+                right = sequent_compare_resolve(self.app, action, 'right', self.app.dynamic_engine.interpolate)
+                result = sequent_compare_text(left, right, mode=action['mode'],
+                    threshold=action['threshold'], **{k:v.get() for k,v in flags.items()})
+                # Preview does not set variables or execute branches.
+                inspector.config(state=tk.NORMAL)
+                inspector.delete('1.0',tk.END)
+                inspector.insert('1.0',result['diff'] or '(No line differences to show)')
+                inspector.config(state='disabled')
+                status.config(text=('MATCH' if result['matched'] else 'MISMATCH') +
+                    f"  |  {result['difference_count']} differing lines" +
+                    (f"  |  {result['similarity']:.1f}% similar" if result['similarity'] is not None else ''),
+                    fg=COLOR_SUCCESS if result['matched'] else COLOR_DANGER)
+                info.config(text='')
+            except (MacroExecutionError, ValueError, TypeError, OSError) as exc:
+                info.config(text=str(exc),fg=COLOR_DANGER)
+        ModernButton(body, text='Preview Difference (no macro execution)',
+                     bg_color=BG_BORDER, hover_color=BG_HOVER,
+                     command=preview).pack(fill=tk.X, pady=(8, 3))
+        status = tk.Label(body,text='',bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',9,'bold'))
+        status.pack(anchor='w')
+        inspector = tk.Text(body, height=7, wrap='none', bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            font=('Consolas', 8), bd=0, highlightthickness=1,
+                            highlightbackground=BG_BORDER)
+        inspector.pack(fill=tk.X,pady=(4,8))
+        inspector.config(state='disabled')
+        if edit_idx is None:
+            heading('Insert position')
+            pos = tk.StringVar(value=f'Before Line {line_num}')
+            menu(body,pos,(f'Before Line {line_num}',f'After Line {line_num}'))
+
+        def save():
+            try:
+                action = collect()
+            except (MacroExecutionError, ValueError, TypeError, OSError) as exc:
+                info.config(text=str(exc),fg=COLOR_DANGER)
+                return
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = action
+                idx = edit_idx
+            else:
+                after = pos.get().startswith('After')
+                idx = 0 if line_num <= 1 else (line_num - 1 if after else line_num - 2)
+                idx = max(0, min(idx, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(idx, action)
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.set_active_action_index(idx)
+            self.app.update_status(('Compare Variables' if variables_only else 'Compare Text') + ' & Branch saved', COLOR_SUCCESS)
+            self.close_sub_menu()
+        ModernButton(body,text='Save Changes' if edit_idx is not None else
+                     ('Add Compare Variables & Branch' if variables_only else 'Add Compare Text & Branch'),
+                     bg_color=COLOR_ACCENT,hover_color=COLOR_ACCENT_HOV,
+                     command=save).pack(fill=tk.X,pady=(3,12))
 
     def _render_gate_check_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
@@ -5539,10 +8088,11 @@ class VSCodeQueueViewer(tk.Frame):
                    if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
                    else None)
         initial_mode = current.get('mode', 'keywords') if current else 'capture'
-        if initial_mode not in ('capture', 'keywords'):
+        if initial_mode not in ('capture', 'keywords', 'file'):
             initial_mode = 'keywords'
         labels = {'capture': 'Save Entire Clipboard Text',
-                  'keywords': 'Check Keywords (Rules)'}
+                  'keywords': 'Check Keywords (Rules)',
+                  'file': 'Save Clipboard Text to File'}
         tk.Label(body, text='Clipboard Operation:', font=('Segoe UI', 8, 'bold'),
                  bg=BG_PANEL, fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
         mode_var = tk.StringVar(value=labels[initial_mode])
@@ -5553,22 +8103,58 @@ class VSCodeQueueViewer(tk.Frame):
                                  activebackground=COLOR_ACCENT)
         mode_menu.pack(fill=tk.X, pady=(0, 10))
 
-        tk.Label(body, text='Default Destination Variable:', font=('Segoe UI', 8, 'bold'),
+        variable_frame = tk.Frame(body, bg=BG_PANEL)
+        variable_frame.pack(fill=tk.X)
+        tk.Label(variable_frame, text='Default Destination Variable:', font=('Segoe UI', 8, 'bold'),
                  bg=BG_PANEL, fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
-        var_entry = tk.Entry(body, bg=BG_INPUT, fg=SYNTAX_PURPLE,
+        var_entry = tk.Entry(variable_frame, bg=BG_INPUT, fg=SYNTAX_PURPLE,
                              font=('Consolas', 9, 'bold'),
                              insertbackground=TEXT_PRIMARY, bd=0,
                              highlightbackground=BG_BORDER, highlightthickness=1)
         var_entry.pack(fill=tk.X, ipady=3)
-        default_new = 'status' if initial_mode == 'keywords' else 'clipboard_text'
+        default_new = 'status' if initial_mode == 'keywords' else ('defect_description' if initial_mode == 'file' else 'clipboard_text')
         existing_name = current.get('var_name', default_new) if current else default_new
         var_entry.insert(0, variable_identity(existing_name,
                               current.get('var_scope') if current else None)[0])
-        scope_var = self._add_variable_scope_picker(body, current)
+        scope_var = self._add_variable_scope_picker(variable_frame, current or
+                                                    {'var_name': 'defect_description',
+                                                     'var_scope': 'Global'} if initial_mode == 'file' else current)
 
         help_label = tk.Label(body, font=('Segoe UI', 8), bg=BG_PANEL,
                               fg=TEXT_MUTED, wraplength=450, justify=tk.LEFT)
         help_label.pack(fill=tk.X, pady=(0, 8))
+
+        file_frame = tk.Frame(body, bg=BG_PANEL)
+        tk.Label(file_frame, text='Text File to Write:', font=('Segoe UI', 8, 'bold'),
+                 bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w', pady=(0, 3))
+        file_path_entry = tk.Entry(file_frame, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                   insertbackground=TEXT_PRIMARY, font=('Consolas', 9),
+                                   bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        file_path_entry.pack(fill=tk.X, ipady=4)
+        file_path_entry.insert(0, current.get('path', 'defect_description.txt')
+                               if current else 'defect_description.txt')
+
+        def choose_save_file():
+            candidate = filedialog.asksaveasfilename(parent=self.sub_menu,
+                defaultextension='.txt', filetypes=[('Text files', '*.txt'), ('All files', '*.*')],
+                title='Choose file to overwrite with clipboard text')
+            if candidate:
+                file_path_entry.delete(0, tk.END)
+                file_path_entry.insert(0, candidate)
+
+        ModernButton(file_frame, text='Browse / Choose File...', bg_color=BG_BORDER,
+                     hover_color=BG_HOVER, command=choose_save_file).pack(fill=tk.X, pady=(4, 4))
+        tk.Label(file_frame,
+                 text='Relative names save under presets/text_files. The file is replaced '
+                      'on each run; the original clipboard text is preserved.',
+                 font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED,
+                 wraplength=440, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 7))
+        also_set_var = tk.BooleanVar(value=bool(current.get('also_set_variable', False))
+                                     if current else False)
+        tk.Checkbutton(file_frame, text='Also save clipboard as a variable now',
+                       variable=also_set_var, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                       selectcolor=BG_INPUT, activebackground=BG_PANEL,
+                       command=lambda: update_mode()).pack(anchor='w', pady=(0, 6))
 
         # The action editor already has a vertical scroll area. Dynamic rule
         # cards live inside that scrollable body; Add/Remove works at any size.
@@ -5617,9 +8203,11 @@ class VSCodeQueueViewer(tk.Frame):
                 card.destroy()
                 for idx, item in enumerate(rule_rows, 1):
                     item['title'].config(text=f'Rule {idx}')
-            tk.Button(heading, text='Remove', command=remove, bg=BG_PANEL,
+            remove_button = tk.Button(heading, text='Remove', command=remove, bg=BG_PANEL,
                       fg=COLOR_DANGER, bd=0, font=('Segoe UI', 8),
-                      cursor='hand2').pack(side=tk.RIGHT)
+                      cursor='hand2')
+            sequent_style_native_button(remove_button, 'Remove', 'trash')
+            remove_button.pack(side=tk.RIGHT)
 
             def field(label, initial, color):
                 tk.Label(card, text=label, font=('Segoe UI', 8), bg=BG_INPUT,
@@ -5672,20 +8260,39 @@ class VSCodeQueueViewer(tk.Frame):
                  font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED,
                  wraplength=430, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 6))
 
+        file_first_selected = [False]
         def update_mode(*_):
             is_keywords = mode_var.get() == labels['keywords']
+            is_file = mode_var.get() == labels['file']
+            if is_file and not current and not file_first_selected[0]:
+                # Global is the useful default for reusing a defect description
+                # between separately saved macros; the user may choose Local.
+                if scope_var.get() == 'Local':
+                    scope_var.set('Global')
+                file_first_selected[0] = True
             if not current:
-                previous_default = 'clipboard_text' if is_keywords else 'status'
-                next_default = 'status' if is_keywords else 'clipboard_text'
+                defaults = {'capture': 'clipboard_text', 'keywords': 'status',
+                            'file': 'defect_description'}
+                next_default = defaults['keywords' if is_keywords else 'file' if is_file else 'capture']
+                previous_default = next((v for v in defaults.values()
+                                         if v != next_default and var_entry.get() == v), None)
                 if var_entry.get() == previous_default:
                     var_entry.delete(0, tk.END)
                     var_entry.insert(0, next_default)
-            help_label.config(text=('Check all keyword-to-value rules against the clipboard '
-                                    'when this action runs. Choose Local/Global for each '
-                                    'destination or use the default scope.' if is_keywords else
-                                    'Save the entire Unicode clipboard text, including '
-                                    'spaces and line breaks. Empty clipboard text will '
-                                    'not overwrite a saved value.'))
+            help_label.config(text=('Check keyword-to-value rules; choose Local/Global for each '
+                                    'destination.' if is_keywords else
+                                    'Write the full Unicode clipboard text into a UTF-8 file '
+                                    'without changing punctuation or line breaks.' if is_file else
+                                    'Save all clipboard text, including spaces and line breaks, '
+                                    'as a Local or Global variable.'))
+            if is_file:
+                file_frame.pack(fill=tk.X, pady=(2, 10), before=keyword_anchor)
+            else:
+                file_frame.pack_forget()
+            if is_file and not also_set_var.get():
+                variable_frame.pack_forget()
+            else:
+                variable_frame.pack(fill=tk.X, before=help_label)
             if is_keywords:
                 keyword_frame.pack(fill=tk.X, pady=(6, 8), before=keyword_anchor)
             else:
@@ -5706,14 +8313,23 @@ class VSCodeQueueViewer(tk.Frame):
         def submit():
             name = var_entry.get().strip()
             scope = scope_var.get().lower()
-            try:
-                variable_identity(name, scope)
-            except MacroExecutionError as exc:
-                self.app.update_status(str(exc), COLOR_DANGER)
-                return
-            mode = 'capture' if mode_var.get() == labels['capture'] else 'keywords'
-            action = {'type': 'read_clipboard', 'mode': mode,
-                      'var_name': name, 'var_scope': scope}
+            mode = next(k for k, v in labels.items() if v == mode_var.get())
+            action = {'type': 'read_clipboard', 'mode': mode}
+            if mode != 'file' or also_set_var.get():
+                try:
+                    variable_identity(name, scope)
+                except MacroExecutionError as exc:
+                    self.app.update_status(str(exc), COLOR_DANGER)
+                    return
+                action.update(var_name=name, var_scope=scope)
+            if mode == 'file':
+                filename = file_path_entry.get().strip()
+                try:
+                    sequent_text_file_path(self.app, filename)
+                except (MacroExecutionError, ValueError) as exc:
+                    self.app.update_status(str(exc), COLOR_DANGER)
+                    return
+                action.update(path=filename, also_set_variable=also_set_var.get())
             if mode == 'keywords':
                 rules = []
                 reverse_scope = {'Use Default Scope': None, 'Local': 'local', 'Global': 'global'}
@@ -5989,170 +8605,247 @@ class VSCodeQueueViewer(tk.Frame):
 
 
     def _render_if_var_view(self, line_num, edit_idx=None):
+        """Unified IF / THEN form for literal and variable comparisons.
+
+        Old if_var actions retain their JSON keys (var_name/op/val/target*) and
+        additional keys are added only for new features. Legacy compare_variables
+        actions remain editable through their original dedicated editor.
+        """
         body = self.action_content_frame
-        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
+        old = (self.app.recorded_actions[edit_idx].copy() if edit_idx is not None
+               and 0 <= edit_idx < len(self.app.recorded_actions) else {})
+        if old.get('type') != 'if_var':
+            old = {}
 
-        cond_row = tk.Frame(body, bg=BG_PANEL)
-        cond_row.pack(fill=tk.X, pady=(0, 4))
+        def label(parent, text):
+            tk.Label(parent, text=text, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8, 'bold'), anchor='w').pack(fill=tk.X, pady=(4, 2))
 
-        v_left = tk.Frame(cond_row, bg=BG_PANEL)
-        v_left.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        tk.Label(v_left, text="Variable:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        var_entry = tk.Entry(v_left, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        var_entry.pack(fill=tk.X, ipady=2)
-        var_entry.insert(0, variable_identity(curr_act.get("var_name", "status"), curr_act.get("var_scope"))[0] if curr_act else "status")
-        scope_var = self._add_variable_scope_picker(body, curr_act)
+        def note(parent, text):
+            tk.Label(parent, text=text, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8), anchor='w', justify='left', wraplength=425).pack(fill=tk.X, pady=(0, 4))
 
-        v_mid = tk.Frame(cond_row, bg=BG_PANEL)
-        v_mid.pack(side=tk.LEFT, padx=2)
-        tk.Label(v_mid, text="Condition:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        op_var = tk.StringVar(value=curr_act.get("op", "==") if (curr_act and curr_act.get("type") == "if_var") else "==")
-        op_menu = tk.OptionMenu(v_mid, op_var, "==", "!=", "contains", "startswith", "endswith", "regex", "not empty")
-        op_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-        op_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
-        op_menu.pack(fill=tk.X)
+        def entry(parent, value=''):
+            e = tk.Entry(parent, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                         font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                         bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+            e.insert(0, str(value))
+            e.pack(fill=tk.X, ipady=4, pady=(0, 4))
+            return e
 
-        v_right = tk.Frame(cond_row, bg=BG_PANEL)
-        v_right.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
-        tk.Label(v_right, text="Match Value:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        val_entry = tk.Entry(v_right, bg=BG_INPUT, fg=SYNTAX_GREEN, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        val_entry.pack(fill=tk.X, ipady=2)
-        val_entry.insert(0, curr_act.get("val", "RTS") if (curr_act and curr_act.get("type") == "if_var") else "RTS")
+        def pick(parent, state, values):
+            dropdown = tk.OptionMenu(parent, state, *values)
+            dropdown.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Segoe UI', 9),
+                            bd=0, highlightbackground=BG_BORDER,
+                            highlightthickness=1, cursor='hand2')
+            dropdown['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                    activebackground=COLOR_ACCENT)
+            dropdown.pack(fill=tk.X, pady=(0, 4))
+            return dropdown
 
-        tk.Label(body, text="If Condition is Met, Perform Action:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(6, 2))
+        def scope_picker(parent, name, default='local'):
+            box = tk.Frame(parent, bg=BG_PANEL, width=106)
+            box.pack(side=tk.RIGHT, padx=(5, 0))
+            label(box, 'Scope')
+            state = tk.StringVar(master=body, value=str(default).title())
+            pick(box, state, ('Local', 'Global'))
+            return state
 
-        init_tgt_type = curr_act.get("target_type", "preset") if (curr_act and curr_act.get("type") == "if_var") else "preset"
-        init_mode = "Jump to Label" if init_tgt_type == "label" else ("Browse & Run File" if init_tgt_type == "file" else "Switch to Preset")
+        def name_and_scope(parent, caption, value, scope='local'):
+            row = tk.Frame(parent, bg=BG_PANEL)
+            row.pack(fill=tk.X, pady=(0, 4))
+            scope_var = scope_picker(row, caption, scope)
+            field = tk.Frame(row, bg=BG_PANEL)
+            field.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            label(field, caption)
+            name = entry(field, value)
+            return name, scope_var
 
-        action_mode_var = tk.StringVar(value=init_mode)
-        mode_menu = tk.OptionMenu(body, action_mode_var, "Switch to Preset", "Browse & Run File", "Jump to Label", command=lambda m: render_target_input(m))
-        mode_menu.config(bg=BG_INPUT, fg=SYNTAX_BLUE, font=("Segoe UI", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-        mode_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
-        mode_menu.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(body, text='IF  ·  Compare', bg=BG_PANEL, fg=TEXT_PRIMARY,
+                 font=('Segoe UI', 10, 'bold'), anchor='w').pack(fill=tk.X, pady=(0, 4))
+        initial_lhs, initial_lhs_scope = variable_identity(
+            old.get('var_name') or 'status', old.get('var_scope'))
+        lhs, lhs_scope = name_and_scope(body, 'Variable A',
+                                        old.get('var_name', '') if not old else initial_lhs,
+                                        initial_lhs_scope)
 
+        operators = ('==', '!=', 'contains', 'startswith', 'endswith', 'regex', 'not empty')
+        compare_row = tk.Frame(body, bg=BG_PANEL)
+        compare_row.pack(fill=tk.X)
+        op_box = tk.Frame(compare_row, bg=BG_PANEL)
+        op_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        label(op_box, 'Condition')
+        op = tk.StringVar(master=body, value=old.get('op', '=='))
+        pick(op_box, op, operators)
+        mode_box = tk.Frame(compare_row, bg=BG_PANEL)
+        mode_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        label(mode_box, 'Compare against')
+        source = tk.StringVar(master=body, value=('Another Variable' if
+                    old.get('match_source') == 'variable' else 'Text'))
+        pick(mode_box, source, ('Text', 'Another Variable'))
+
+        compare_target = tk.Frame(body, bg=BG_PANEL)
+        compare_target.pack(fill=tk.X)
+        compare_controls = {}
+        def render_comparison(*_):
+            for child in compare_target.winfo_children(): child.destroy()
+            if source.get() == 'Another Variable':
+                v, sc = name_and_scope(compare_target, 'Variable B',
+                    old.get('match_var_name', ''), old.get('match_var_scope', 'local'))
+                compare_controls['variable'] = (v, sc)
+                note(compare_target, 'Both values are read when the macro runs. Missing variables cause an error.')
+            else:
+                label(compare_target, 'Match text')
+                v = entry(compare_target, old.get('val', ''))
+                compare_controls['text'] = v
+            # Keep the inactive inputs untouched if the user changes modes.
+        source.trace_add('write', render_comparison)
+        render_comparison()
+
+        tk.Label(body, text='THEN  ·  If the condition matches', bg=BG_PANEL,
+                 fg=TEXT_PRIMARY, font=('Segoe UI', 10, 'bold'),
+                 anchor='w').pack(fill=tk.X, pady=(10, 4))
+        target_names = {
+            'preset':'Switch to Preset', 'file':'Browse & Run File',
+            'label':'Jump to Label', 'set_variable':'Set Variable',
+            'continue':'Continue', 'stop':'Stop Macro', 'error':'Stop with Error'}
+        reverse_names = {v:k for k,v in target_names.items()}
+        current_type = old.get('target_type', 'continue')
+        chosen = tk.StringVar(master=body, value=target_names.get(current_type, 'Continue'))
+        pick(body, chosen, tuple(target_names.values()))
         target_container = tk.Frame(body, bg=BG_PANEL)
-        target_container.pack(fill=tk.X, pady=(0, 6))
+        target_container.pack(fill=tk.X, pady=(0, 4))
+        controls = {}
+        current_target = str(old.get('target', ''))
+        current_value = str(old.get('set_value', ' '))
 
-        target_state = {
-            "type": init_tgt_type, 
-            "target": curr_act.get("target", "") if (curr_act and curr_act.get("type") == "if_var") else ""
-        }
-
-        def render_target_input(mode):
-            for child in target_container.winfo_children():
-                child.destroy()
-
-            if mode == "Switch to Preset":
-                target_state["type"] = "preset"
-                presets = self.app.get_preset_names()
-                curr_target = target_state["target"] if target_state["target"] in presets else (presets[0] if presets else "-- No Presets Found --")
-                p_var = tk.StringVar(value=curr_target)
-                target_state["target"] = curr_target
-
-                def on_p_select(val): target_state["target"] = val
-                p_menu = tk.OptionMenu(target_container, p_var, *(presets if presets else ["-- No Presets Found --"]), command=on_p_select)
-                p_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-                p_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
-                p_menu.pack(fill=tk.X)
-
-            elif mode == "Browse & Run File":
-                target_state["type"] = "file"
-                f_row = tk.Frame(target_container, bg=BG_PANEL)
-                f_row.pack(fill=tk.X)
-
-                file_display = os.path.basename(target_state["target"]) if target_state["target"] else "Select macro file..."
-                lbl_file = tk.Label(f_row, text=file_display, font=("Consolas", 8), bg=BG_INPUT, fg=SYNTAX_GREEN if target_state["target"] else TEXT_MUTED, anchor="w", padx=6, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
-                lbl_file.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-
-                def browse_file():
-                    self.app.root.attributes('-topmost', False)
-                    try:
-                        chosen = filedialog.askopenfilename(
-                            parent=self.sub_menu, title="Select Macro to Execute", initialdir=self.app.presets_dir,
-                            filetypes=[("JSON Macro", "*.json"), ("All Files", "*.*")]
-                        )
-                    finally:
-                        self.app.root.attributes('-topmost', True)
-                    if chosen:
-                        target_state["target"] = os.path.abspath(chosen)
-                        lbl_file.config(text=os.path.basename(chosen), fg=SYNTAX_GREEN)
-
-                btn_b = tk.Label(f_row, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=8, pady=3)
-                btn_b.pack(side=tk.RIGHT)
-                btn_b.bind("<Button-1>", lambda e: browse_file())
-
-            elif mode == "Jump to Label":
-                target_state["type"] = "label"
-                labels = [a.get("name", "").strip() for a in self.app.recorded_actions if a.get("type") == "label" and a.get("name")]
-                if labels:
-                    curr_lbl = target_state["target"] if target_state["target"] in labels else labels[0]
-                    l_var = tk.StringVar(value=curr_lbl)
-                    target_state["target"] = curr_lbl
-                    def on_l_select(val): target_state["target"] = val
-                    l_menu = tk.OptionMenu(target_container, l_var, *labels, command=on_l_select)
-                    l_menu.config(bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-                    l_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
-                    l_menu.pack(fill=tk.X)
-                else:
-                    l_entry = tk.Entry(target_container, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-                    l_entry.insert(0, target_state["target"] or "checkpoint_1")
-                    l_entry.pack(fill=tk.X, ipady=3)
-                    def update_tgt(e=None): target_state["target"] = l_entry.get().strip()
-                    l_entry.bind("<KeyRelease>", update_tgt)
-                    target_state["target"] = target_state["target"] or "checkpoint_1"
-
-        render_target_input(init_mode)
+        def render_target(*_):
+            for child in target_container.winfo_children(): child.destroy()
+            controls.clear()
+            kind = reverse_names.get(chosen.get(), 'continue')
+            if kind == 'set_variable':
+                initial_name = current_target or (compare_controls.get('variable', (None,))[0].get()
+                                    if source.get() == 'Another Variable' else '')
+                dest, sc = name_and_scope(target_container, 'Variable to update',
+                              initial_name, old.get('target_scope', 'local'))
+                controls['dest'] = (dest, sc)
+                label(target_container, 'Set value to')
+                initial_value = ('Another Variable' if old.get('set_value_source') == 'variable'
+                    else 'One space' if current_value == ' ' else
+                    'Empty text' if current_value == '' else 'Custom text')
+                value_mode = tk.StringVar(master=body, value=initial_value)
+                controls['value_mode'] = value_mode
+                pick(target_container, value_mode,
+                     ('One space', 'Empty text', 'Custom text', 'Another Variable'))
+                value_box = tk.Frame(target_container, bg=BG_PANEL)
+                value_box.pack(fill=tk.X)
+                def render_value(*_):
+                    for child in value_box.winfo_children(): child.destroy()
+                    if value_mode.get() == 'Custom text':
+                        label(value_box, 'New text')
+                        controls['set_text'] = entry(value_box,
+                            current_value if current_value not in (' ', '') else '')
+                    elif value_mode.get() == 'Another Variable':
+                        nv, ns = name_and_scope(value_box, 'Read value from',
+                            old.get('set_source_name', ''), old.get('set_source_scope','local'))
+                        controls['set_source'] = (nv, ns)
+                value_mode.trace_add('write', render_value)
+                render_value()
+            elif kind == 'label':
+                label(target_container, 'Label name')
+                controls['target'] = entry(target_container, current_target)
+            elif kind == 'preset':
+                label(target_container, 'Saved macro')
+                names = list(self.app.get_preset_names())
+                state = tk.StringVar(master=body, value=current_target or
+                                     (names[0] if names else ''))
+                if names: pick(target_container, state, tuple(names))
+                else: controls['target_entry'] = entry(target_container, state.get())
+                controls['target_state'] = state
+            elif kind == 'file':
+                label(target_container, 'Macro JSON file')
+                path = entry(target_container, current_target)
+                controls['target'] = path
+                def browse():
+                    file_path = filedialog.askopenfilename(
+                        parent=self.sub_menu, title='Select Macro to Execute',
+                        initialdir=self.app.presets_dir,
+                        filetypes=[('JSON Macro','*.json'), ('All Files','*.*')])
+                    if file_path:
+                        path.delete(0, tk.END); path.insert(0, file_path)
+                ModernButton(target_container, text='Browse…',
+                             bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                             command=browse).pack(anchor='w', pady=(1, 4))
+        chosen.trace_add('write', render_target)
+        render_target()
+        note(body, 'If the condition is false, Sequent continues to the next action.')
 
         if edit_idx is None:
-            pos_var = tk.StringVar(value=f"Before Line {line_num}")
-            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-            pos_menu.pack(fill=tk.X, pady=(2, 8))
+            pos_var = tk.StringVar(master=body, value=f'Before Line {line_num}')
+            label(body, 'Insert position')
+            pick(body, pos_var, (f'Before Line {line_num}', f'After Line {line_num}'))
 
         def submit():
-            v_name = var_entry.get().strip()
-            op = op_var.get()
-            val = val_entry.get().strip()
-            t_type = target_state["type"]
-            t_val = target_state["target"]
-
-            if not v_name or not t_val or t_val == "-- No Presets Found --":
+            variable_a = lhs.get().strip()
+            if not variable_a:
+                messagebox.showerror('IF Variable', 'Enter Variable A.', parent=self.sub_menu)
                 return
-
+            result = old.copy()
+            result.update(type='if_var', var_name=variable_a,
+                          var_scope=lhs_scope.get().lower(), op=op.get())
+            if source.get() == 'Another Variable':
+                reference, reference_scope = compare_controls['variable']
+                if not reference.get().strip():
+                    messagebox.showerror('IF Variable', 'Enter Variable B.', parent=self.sub_menu)
+                    return
+                result.update(match_source='variable', match_var_name=reference.get().strip(),
+                              match_var_scope=reference_scope.get().lower(), case_sensitive=True)
+            else:
+                result.update(match_source='text', val=compare_controls['text'].get())
+            mode = reverse_names[chosen.get()]
+            result['target_type'] = mode
+            if mode == 'set_variable':
+                name, scope_state = controls['dest']
+                destination = name.get().strip()
+                if not destination:
+                    messagebox.showerror('IF Variable', 'Enter the variable to update.', parent=self.sub_menu)
+                    return
+                result.update(target=destination, target_scope=scope_state.get().lower())
+                vmode = controls['value_mode'].get()
+                result['set_value_source'] = 'variable' if vmode == 'Another Variable' else 'text'
+                if vmode == 'Another Variable':
+                    other, other_scope = controls['set_source']
+                    if not other.get().strip():
+                        messagebox.showerror('IF Variable', 'Enter the value source variable.', parent=self.sub_menu)
+                        return
+                    result.update(set_source_name=other.get().strip(),
+                                  set_source_scope=other_scope.get().lower())
+                else:
+                    result['set_value'] = (' ' if vmode == 'One space' else '' if vmode == 'Empty text'
+                        else controls['set_text'].get())
+            elif mode in ('preset', 'file', 'label'):
+                tgt = controls['target_state'].get() if mode == 'preset' and 'target_state' in controls else controls['target'].get()
+                if not tgt.strip():
+                    messagebox.showerror('IF Variable', 'Select a target for this action.', parent=self.sub_menu)
+                    return
+                result['target'] = tgt.strip()
             if edit_idx is not None:
-                self.app.recorded_actions[edit_idx] = {
-                    "type": "if_var",
-                    "var_name": v_name,
-                    "var_scope": scope_var.get().lower(),
-                    "op": op,
-                    "val": val,
-                    "target_type": t_type,
-                    "target": t_val
-                }
+                self.app.recorded_actions[edit_idx] = result
                 self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.app.set_active_action_index(edit_idx)
-                self.app.update_status(f"Updated Branch for '{v_name}'", COLOR_SUCCESS)
+                self.app.update_status('Updated IF Variable Condition', COLOR_SUCCESS)
             else:
-                is_after = "After" in pos_var.get()
-                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
-                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
-
-                self.app.recorded_actions.insert(insert_idx, {
-                    "type": "if_var",
-                    "var_name": v_name,
-                    "var_scope": scope_var.get().lower(),
-                    "op": op,
-                    "val": val,
-                    "target_type": t_type,
-                    "target": t_val
-                })
+                after = 'After' in pos_var.get()
+                ix = 0 if line_num <= 1 else (line_num - 1 if after else line_num - 2)
+                ix = max(0, min(ix, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(ix, result)
                 self.app.display_actions_in_queue(self.app.recorded_actions)
-                self.app.update_status(f"Added Conditional Branch for '{v_name}'", COLOR_SUCCESS)
+                self.app.update_status('Added IF Variable Condition', COLOR_SUCCESS)
             self.close_sub_menu()
 
-        btn_txt = "Save Changes" if edit_idx is not None else "Add Conditional Branch"
-        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+        ModernButton(body, text=('Save Changes' if edit_idx is not None else 'Add IF Variable Condition'),
+                     bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT,
+                     hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X, pady=(8, 0))
 
 
     def _render_request_input_view(self, line_num, edit_idx=None):
@@ -6334,6 +9027,26 @@ class VSCodeQueueViewer(tk.Frame):
                                    'The original macro will not resume automatically.')
         mode.trace_add('write', refresh_mode)
         refresh_mode()
+        tk.Label(body, text='INPUT PARAMETERS (JSON LIST)', bg=BG_PANEL,
+                 fg=SYNTAX_BLUE, font=('Segoe UI',8,'bold')).pack(anchor='w')
+        tk.Label(body, text='Example: [{"name":"part","value":"${part_number}"}]. '
+                 'Available as local variables while the child macro runs.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, wraplength=445,
+                 justify='left').pack(anchor='w', pady=(2,4))
+        inputs_widget = tk.Text(body, height=4, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                font=('Consolas',9), insertbackground=TEXT_PRIMARY)
+        inputs_widget.insert('1.0', json.dumps(old.get('inputs', []), indent=2))
+        inputs_widget.pack(fill=tk.X, pady=(0,7))
+        tk.Label(body, text='STORE RETURN IN VARIABLE (OPTIONAL)', bg=BG_PANEL,
+                 fg=SYNTAX_BLUE, font=('Segoe UI',8,'bold')).pack(anchor='w')
+        return_name = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                               insertbackground=TEXT_PRIMARY)
+        return_name.insert(0, old.get('return_var',''))
+        return_name.pack(fill=tk.X,pady=(3,5))
+        return_scope = tk.StringVar(value=old.get('return_scope','Local').title())
+        return_menu = tk.OptionMenu(body,return_scope,'Local','Global')
+        return_menu.configure(bg=BG_INPUT,fg=TEXT_PRIMARY,highlightthickness=0)
+        return_menu.pack(fill=tk.X,pady=(0,7))
         error = tk.Label(body, text='', bg=BG_PANEL, fg=COLOR_DANGER,
                          font=('Segoe UI', 8), wraplength=445, justify='left')
         error.pack(fill=tk.X, pady=(2, 5))
@@ -6355,7 +9068,19 @@ class VSCodeQueueViewer(tk.Frame):
             if mode.get() not in ('Run & Return', 'Switch to Macro'):
                 error.config(text='Select a valid run mode.')
                 return
-            action = {'type':'run_macro', 'preset':target, 'mode':mode.get()}
+            try:
+                input_values = json.loads(inputs_widget.get('1.0','end-1c'))
+                sequent_parameter_inputs(input_values, lambda value: value)
+                if mode.get() == 'Switch to Macro' and (input_values or return_name.get().strip()):
+                    raise ValueError('Inputs and return values require Run & Return')
+                if return_name.get().strip():
+                    variable_identity(return_name.get(),return_scope.get())
+            except (ValueError,TypeError,MacroExecutionError) as exc:
+                error.config(text=f'Invalid macro parameters: {exc}')
+                return
+            action = {'type':'run_macro', 'preset':target, 'mode':mode.get(),
+                      'inputs':input_values,'return_var':return_name.get().strip(),
+                      'return_scope':return_scope.get().lower()}
             if edit_idx is not None:
                 idx = edit_idx
                 self.app.recorded_actions[idx] = action
@@ -6387,7 +9112,7 @@ class VSCodeQueueViewer(tk.Frame):
             tk.Label(body, text=label, font=('Segoe UI',8,'bold'),
                      bg=BG_PANEL,fg=TEXT_MUTED,anchor='w').pack(fill=tk.X,pady=(7,2))
             if kind=='choice':
-                val = tk.StringVar(value=str(variable_identity(old.get('var_name') or 'status', old.get('var_scope'))[1].title() if key=='var_scope' else old.get(key,default)))
+                val = tk.StringVar(value=str(variable_identity(old.get('var_name') or 'status', old.get('var_scope', default))[1].title() if key=='var_scope' else old.get(key,default)))
                 menu = tk.OptionMenu(body,val,*(options or []))
                 menu.config(bg=BG_INPUT,fg=TEXT_PRIMARY,font=('Consolas',9),
                             highlightbackground=BG_BORDER, highlightthickness=1,bd=0)
@@ -6524,6 +9249,13 @@ class VSCodeQueueViewer(tk.Frame):
                          'Use the queue to order your IF / ELSE / END IF and LOOP / END LOOP actions.',
                      bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',9),wraplength=450,
                      justify='left').pack(fill=tk.X,pady=(4,8))
+        if type_name=='load_text_variable':
+            tk.Label(body, text='Reads the complete UTF-8 file on every run and stores its '
+                         'text unchanged in the selected Local or Global variable. '
+                         'Relative filenames refer to presets/text_files. A missing, '
+                         'empty, or invalid file leaves the variable unchanged.',
+                     bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                     wraplength=460, justify='left').pack(fill=tk.X, pady=4)
         if type_name=='trigger_start':
             tk.Label(body,text='Place this as the FIRST action in the sequence to arm auto-start. '
                          'Sequent checks for a new window, changed clipboard, or a new/modified file '
@@ -7828,8 +10560,10 @@ class ModernButton(tk.Frame):
         self._fade_job = None
 
         fg_color = self._get_contrast_fg(bg_color)
-        self.icon = SequentIcon(self, sequent_icon_for_caption(text) or 'check',
-                                color=fg_color, bg=bg_color, size=19)
+        self.icon = SequentIcon(self, sequent_icon_for_caption(text) or 'list',
+                                color=fg_color, bg=bg_color, size=19,
+                                override_key=sequent_icon_slot('button', text),
+                                slot_label=text)
         self.icon.pack(side=tk.LEFT, padx=(15, 6))
         self.label = SequentCaptionLabel(
             self, text=sequent_clean_caption(text), bg=bg_color, fg=fg_color,
@@ -7844,7 +10578,10 @@ class ModernButton(tk.Frame):
 
 
     def _on_caption_change(self, caption):
-        self.icon.paint(name=sequent_icon_for_caption(caption) or 'check')
+        self.icon.override_key = sequent_icon_slot('button', caption)
+        sequent_register_icon_slot(self.icon.override_key, caption,
+                                   sequent_icon_for_caption(caption) or 'list')
+        self.icon.paint(name=sequent_icon_for_caption(caption) or 'list')
         # Strip decorative glyphs when a legacy setter updates a caption.
         clean = sequent_clean_caption(caption)
         if clean != caption:
@@ -8283,11 +11020,14 @@ class SidebarButton(tk.Frame):
         self.command = command
         self.active = False
         
-        self.indicator = tk.Frame(self, bg=BG_SIDEBAR, width=4)
+        self.indicator = SequentRoundedAccentBar(
+            self, thickness=4, background=BG_SIDEBAR, accent='', inset=5)
         self.indicator.pack(side=tk.LEFT, fill=tk.Y)
         
         name = sequent_icon_for_caption(text) or 'layout'
-        self.icon = SequentIcon(self, name, color=TEXT_MUTED, bg=BG_SIDEBAR, size=19)
+        self.icon = SequentIcon(self, name, color=TEXT_MUTED, bg=BG_SIDEBAR, size=19,
+                                override_key=sequent_icon_slot('sidebar', text),
+                                slot_label=text)
         self.icon.pack(side=tk.LEFT, padx=(11, 2))
         nav_text = sequent_clean_caption(text).title()
         self.label = tk.Label(self, text=nav_text, bg=BG_SIDEBAR, fg=TEXT_MUTED,
@@ -8322,7 +11062,8 @@ class SidebarButton(tk.Frame):
         self.configure(bg=color)
         self.label.configure(bg=color, fg=fg_color)
         self.icon.paint(bg=color, color=fg_color)
-        self.indicator.configure(bg=ind_color)
+        self.indicator.set_accent(COLOR_ACCENT if is_active else '',
+                                  background=color)
 
 class GhostReticle:
     def __init__(self, root):
@@ -8879,12 +11620,14 @@ class SequentWalkthrough:
         ("playback", "Inspect and debug",
          "Use the playhead, Back/Next, Step, and breakpoints in the queue "
          "to inspect or execute individual actions while troubleshooting.", "scrub_card"),
-        ("sequencer", "Build a macro chain",
-         "The Sequencer combines saved macro presets into a sequence of stages. "
-         "Import, export, and review the stage order in the Macro Chain panel.", "seq_timeline_viewport"),
-        ("sequencer", "Configure a stage",
-         "Choose a saved preset, set its loop count and delay, then select Add Stage. "
-         "The Stage Builder also controls running the entire chain.", "stage_builder_dock"),
+        ("sequencer", "Explore Automation Studio",
+         "The Studio represents saved macro chains as clips on a composition timeline. "
+         "Double-click clips to expand actions and select the time ruler to preview timing. "
+         "Scrubbing never executes a macro.", "seq_timeline_viewport"),
+        ("sequencer", "Inspect and configure clips",
+         "Add preset clips using the Inspector. Select a clip to change its loop count "
+         "and delay, reorder stages, or run the chain with the existing execution engine.",
+         "stage_builder_dock"),
         ("settings", "Personalize Sequent",
          "Preferences contains appearance, timing, recording, audio, and hotkeys. "
          "Entertain Me controls the interface animations. You can relaunch this tour from Help anytime.", "frame_settings"),
@@ -8934,16 +11677,19 @@ class SequentWalkthrough:
                                    bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
                                    activeforeground=TEXT_PRIMARY, relief="flat", bd=0,
                                    padx=10, pady=7, cursor="hand2")
+        sequent_style_native_button(self.btn_exit, 'Exit tour', 'close')
         self.btn_exit.pack(side=tk.LEFT)
         self.btn_next = tk.Button(btn_row, text="Next  →", command=self.next,
                                    bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, activebackground=COLOR_ACCENT_HOV,
                                    activeforeground="#ffffff", relief="flat", bd=0,
                                    padx=12, pady=7, cursor="hand2")
+        sequent_style_native_button(self.btn_next, 'Next', 'forward')
         self.btn_next.pack(side=tk.RIGHT)
         self.btn_back = tk.Button(btn_row, text="←  Back", command=self.back,
                                    bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
                                    activeforeground=TEXT_PRIMARY, relief="flat", bd=0,
                                    padx=10, pady=7, cursor="hand2")
+        sequent_style_native_button(self.btn_back, 'Back', 'back')
         self.btn_back.pack(side=tk.RIGHT, padx=(0, 7))
         self.card.bind("<Escape>", lambda e: self.close())
         self.card.bind("<Right>", lambda e: self.next())
@@ -9083,6 +11829,676 @@ class SequentWalkthrough:
             self.app.show_tab(self.original_tab, animate=False)
 
 # --- Main Application ---
+# --- Windows Explorer macro file drops (DLL-owned child window, no Tk subclass) ---
+# --- Shared Sequent visual language for auxiliary IDE tools ---
+# Auxiliary windows reuse Sequent's palette, native Canvas icons, toolbar buttons,
+# Segoe UI/Consolas typography, and dock/header spacing. Avoid OS-default ttk
+# widget styling and additional drag/Win32 message hooks.
+class SequentIDEWindow:
+    """Sequent-themed, resize-friendly Toplevel with live palette refresh."""
+
+    def __init__(self, app, title, subtitle, icon='layout', size=(760, 520), parent=None, embedded=False):
+        self.app = app
+        self.widgets = []
+        self._scheduled_jobs = set()
+        self.embedded = embedded
+        if embedded:
+            if parent is None:
+                raise ValueError('Embedded IDE tools require a parent frame')
+            self.window = tk.Frame(parent, bg=BG_APP)
+            self.window.pack(fill=tk.BOTH, expand=True)
+        else:
+            self.window = tk.Toplevel(parent or app.root)
+            self.window.title('Sequent — ' + title)
+            self.window.configure(bg=BG_APP)
+            w, h = size
+            self.window.geometry(f'{w}x{h}')
+            self.window.minsize(min(520, w), min(335, h))
+        self._add(self.window, 'app')
+        self.window.bind('<Destroy>', self._on_window_destroy, add='+')
+        # Keep the normal, OS-managed Toplevel window frame. Replacing or
+        # subclassing Tk's native WNDPROC reintroduced crash risks previously.
+        head = self.frame(self.window, 'header', height=66)
+        head.pack(fill=tk.X)
+        head.pack_propagate(False)
+        rail = self.frame(head, 'accent', width=4)
+        rail.pack(side=tk.LEFT, fill=tk.Y)
+        icon_canvas = self.icon(head, icon, size=22, bg_role='header')
+        icon_canvas.pack(side=tk.LEFT, padx=(15, 10))
+        titles = self.frame(head, 'header')
+        titles.pack(side=tk.LEFT, fill=tk.Y, expand=True)
+        self.label(titles, title.upper(), role='heading', font=('Segoe UI', 11, 'bold')).pack(anchor='w', pady=(12, 1))
+        self.label(titles, subtitle, role='header_muted', font=('Segoe UI', 9)).pack(anchor='w')
+        # Embedded tools have a shared navigation strip; they are not dialogs.
+        if not embedded:
+            close = self.icon(head, 'close', size=19, bg_role='header')
+            close.pack(side=tk.RIGHT, padx=18)
+            close.bind('<Button-1>', lambda e: self.close())
+            close.bind('<Enter>', lambda e: close.paint(bg=BG_HOVER))
+            close.bind('<Leave>', lambda e: close.paint(bg=BG_HEADER))
+        self.frame(self.window, 'border', height=1).pack(fill=tk.X)
+        self.body = self.frame(self.window, 'app')
+        self.body.pack(fill=tk.BOTH, expand=True, padx=14, pady=(12, 8))
+        self.frame(self.window, 'border', height=1).pack(fill=tk.X)
+        self.footer = self.frame(self.window, 'panel')
+        self.footer.pack(side=tk.BOTTOM, fill=tk.X, padx=0, pady=0)
+        self.footer_buttons = self.frame(self.footer, 'panel')
+        self.footer_buttons.pack(side=tk.RIGHT, padx=12, pady=9)
+        self.status = self.label(self.footer, 'READY', 'muted', font=('Segoe UI', 8))
+        self.status.pack(side=tk.LEFT, padx=14)
+        if not embedded:
+            self.window.protocol('WM_DELETE_WINDOW', self.close)
+            self.window.bind('<Escape>', lambda e: self.close())
+            if not hasattr(app, '_ide_tool_windows'):
+                app._ide_tool_windows = set()
+            app._ide_tool_windows.add(self)
+
+    def _add(self, widget, role):
+        self.widgets.append((widget, role))
+        return widget
+
+    def frame(self, parent, role='panel', **kwargs):
+        palette = dict(app=BG_APP, panel=BG_PANEL, header=BG_HEADER,
+                       input=BG_INPUT, border=BG_BORDER, accent=COLOR_ACCENT)
+        return self._add(tk.Frame(parent, bg=palette[role], **kwargs), role)
+
+    def label(self, parent, text, role='label', font=('Segoe UI', 9), **kwargs):
+        bg = BG_HEADER if role in ('heading', 'header_muted') else BG_PANEL if role in ('label', 'muted') else BG_APP
+        fg = TEXT_MUTED if role in ('muted', 'header_muted') else TEXT_PRIMARY
+        return self._add(tk.Label(parent, text=text, font=font, bg=bg, fg=fg, anchor='w', **kwargs), role)
+
+    def icon(self, parent, icon, size=19, bg_role='panel'):
+        bg = BG_HEADER if bg_role == 'header' else BG_PANEL
+        return self._add(SequentIcon(parent, icon, bg=bg, color=TEXT_MUTED, size=size), 'icon_' + bg_role)
+
+    def button(self, parent, caption, command, icon=None, accent=False, **pack):
+        button = sequent_toolbar_button(parent, caption, command, accent=accent, icon=icon)
+        self._add(button, 'button_accent' if accent else 'button')
+        button.pack(**pack)
+        return button
+
+    def entry(self, parent, textvariable=None, **kwargs):
+        return self._add(tk.Entry(parent, textvariable=textvariable,
+            bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+            highlightbackground=BG_BORDER, highlightcolor=COLOR_ACCENT,
+            highlightthickness=1, relief=tk.FLAT, bd=0,
+            font=('Segoe UI', 10), **kwargs), 'entry')
+
+    def listbox(self, parent, **kwargs):
+        return self._add(tk.Listbox(parent, bg=BG_INPUT, fg=TEXT_PRIMARY,
+            selectbackground=BG_SELECTED, selectforeground=TEXT_PRIMARY,
+            highlightbackground=BG_BORDER, highlightcolor=COLOR_ACCENT,
+            highlightthickness=1, relief=tk.FLAT, bd=0,
+            activestyle='none', exportselection=False,
+            font=('Consolas', 10), **kwargs), 'listbox')
+
+    def text(self, parent, **kwargs):
+        return self._add(tk.Text(parent, bg=BG_INPUT, fg=TEXT_PRIMARY,
+            insertbackground=TEXT_PRIMARY, selectbackground=BG_SELECTED,
+            selectforeground=TEXT_PRIMARY, highlightbackground=BG_BORDER,
+            highlightcolor=COLOR_ACCENT, highlightthickness=1,
+            relief=tk.FLAT, bd=0, font=('Consolas', 10), **kwargs), 'text')
+
+    def checkbox(self, parent, caption, variable, **kwargs):
+        return self._add(tk.Checkbutton(parent, text=caption, variable=variable,
+            bg=BG_PANEL, fg=TEXT_PRIMARY, selectcolor=BG_INPUT,
+            activebackground=BG_PANEL, activeforeground=TEXT_PRIMARY,
+            highlightthickness=0, font=('Segoe UI', 9), **kwargs), 'check')
+
+    def scroll(self, parent, content, side=tk.RIGHT):
+        scroll = self._add(ModernScrollBar(parent, command=content.yview, width=13), 'scroll')
+        content.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=side, fill=tk.Y)
+        return scroll
+
+    def footer_note(self, text):
+        self.status.config(text=text)
+
+    def schedule(self, milliseconds, callback):
+        """Panel-owned polling: cancel pending Tk jobs when a tool is replaced."""
+        key = [None]
+        def execute():
+            self._scheduled_jobs.discard(key[0])
+            if self.window.winfo_exists():
+                callback()
+        key[0] = self.window.after(milliseconds, execute)
+        self._scheduled_jobs.add(key[0])
+        return key[0]
+
+    def _on_window_destroy(self, event):
+        if event.widget is self.window:
+            self.cancel_jobs()
+
+    def cancel_jobs(self):
+        for job in tuple(self._scheduled_jobs):
+            try: self.window.after_cancel(job)
+            except tk.TclError: pass
+        self._scheduled_jobs.clear()
+
+    def dispose(self):
+        self.cancel_jobs()
+        try:
+            if self.window.winfo_exists(): self.window.destroy()
+        except tk.TclError: pass
+
+    def close(self):
+        if self.embedded:
+            # A tool switching workspace should not close the application.
+            self.app._show_debug_overview()
+            return
+        if hasattr(self.app, '_ide_tool_windows'):
+            self.app._ide_tool_windows.discard(self)
+        self.dispose()
+
+    def retheme(self):
+        palette = {'app': BG_APP, 'panel': BG_PANEL, 'header': BG_HEADER,
+                   'border': BG_BORDER, 'input': BG_INPUT, 'accent': COLOR_ACCENT}
+        for widget, role in self.widgets:
+            try:
+                if not widget.winfo_exists(): continue
+                if role in palette:
+                    widget.config(bg=palette[role])
+                    if role == 'panel' and widget.cget('highlightthickness'):
+                        widget.config(highlightbackground=BG_BORDER)
+                elif role in ('heading', 'header_muted'):
+                    widget.config(bg=BG_HEADER, fg=TEXT_MUTED if role == 'header_muted' else TEXT_PRIMARY)
+                elif role in ('label', 'muted'):
+                    widget.config(bg=BG_PANEL, fg=TEXT_MUTED if role == 'muted' else TEXT_PRIMARY)
+                elif role == 'entry':
+                    widget.config(bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                                  highlightbackground=BG_BORDER, highlightcolor=COLOR_ACCENT)
+                elif role == 'listbox':
+                    widget.config(bg=BG_INPUT, fg=TEXT_PRIMARY, selectbackground=BG_SELECTED,
+                                  selectforeground=TEXT_PRIMARY, highlightbackground=BG_BORDER,
+                                  highlightcolor=COLOR_ACCENT)
+                elif role == 'text':
+                    widget.config(bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                                  selectbackground=BG_SELECTED, selectforeground=TEXT_PRIMARY,
+                                  highlightbackground=BG_BORDER, highlightcolor=COLOR_ACCENT)
+                elif role == 'check':
+                    widget.config(bg=BG_PANEL, fg=TEXT_PRIMARY, selectcolor=BG_INPUT,
+                                  activebackground=BG_PANEL, activeforeground=TEXT_PRIMARY)
+                elif role.startswith('icon_'):
+                    widget.paint(bg=BG_HEADER if role == 'icon_header' else BG_PANEL, color=TEXT_MUTED)
+                elif role.startswith('button'):
+                    accent = role == 'button_accent'
+                    widget.base = COLOR_ACCENT if accent else BG_INPUT
+                    widget.hover = COLOR_ACCENT_HOV if accent else BG_HOVER
+                    widget.fg = TEXT_ON_ACCENT if accent else TEXT_PRIMARY
+                    widget.config(highlightbackground=BG_BORDER)
+                    widget.label.config(fg=widget.fg)
+                    if widget.icon: widget.icon.paint(color=widget.fg)
+                    widget._paint(widget.base)
+                elif role == 'scroll':
+                    widget.bg_trough = BG_SCROLL_TRACK
+                    widget.thumb_color = TRACK_INACTIVE
+                    widget.hover_color = TRACK_HOVER
+                    widget.active_color = TRACK_ACTIVE
+                    widget.current_color = TRACK_INACTIVE
+                    widget.config(bg=BG_SCROLL_TRACK)
+                    widget.draw()
+            except tk.TclError:
+                pass
+
+
+def sequent_retheme_ide_windows(app):
+    """Repaint open IDE tools in place, retaining selection and unsaved edits."""
+    for panel in tuple(getattr(app, '_ide_tool_windows', ())):
+        if panel.window.winfo_exists():
+            panel.retheme()
+        else:
+            app._ide_tool_windows.discard(panel)
+
+
+"""Sequent Automation Studio M1: pure-Python timeline renderer and preview model.
+
+This is a non-executing view of existing chains and preset actions. It deliberately
+preserves the chain file format and delegates execution to Sequent's existing engine.
+No third-party packages or Windows drivers are required.
+"""
+
+
+
+ACTION_COLORS = {
+    'move': '#497CA7', 'click': '#497CA7', 'drag': '#497CA7',
+    'scroll': '#497CA7', 'key': '#8563B3', 'hotkey': '#8563B3',
+    'delay': '#6E7682', 'compare_text': '#B18A4B', 'compare_variables': '#B18A4B', 'if_var': '#B18A4B',
+    'goto': '#B18A4B', 'label': '#B18A4B', 'set_variable': '#39977F',
+    'read_clipboard': '#39977F', 'find_text': '#497CA7',
+    'find_image': '#497CA7', 'find_color': '#497CA7',
+}
+
+
+def preview_duration(action):
+    """Approximate *layout* seconds, never a promise of execution timing."""
+    if not isinstance(action, dict):
+        return 0.35
+    kind = action.get('type', '')
+    # The recorder samples movement roughly every 30 ms. Giving each point
+    # the generic 350 ms placeholder massively stretches real recordings.
+    if kind == 'move':
+        return 0.03  # preview spacing only; never changes playback speed
+    try:
+        if kind == 'delay':
+            value = float(action.get('seconds', 1.0))
+            return min(120.0, max(0.05, value)) if math.isfinite(value) else 0.35
+        if kind == 'drag':
+            value = float(action.get('duration', 0.3))
+            return min(120.0, max(0.2, value)) if math.isfinite(value) else 0.35
+    except (TypeError, ValueError, OverflowError):
+        pass
+    # Unknown waits, branches and manual prompts are not deterministic.
+    return 0.35
+
+
+def action_keyframes(action):
+    """Read-only event/keyframe hints based solely on fields actually recorded."""
+    if not isinstance(action, dict):
+        return [('Event', 0.0)]
+    kind = action.get('type')
+    if kind == 'drag':
+        return [('Press', 0.0), ('Release', 1.0)]
+    if kind == 'click':
+        return [('Click', 0.0)]
+    if kind == 'key':
+        return [('Key', 0.0)]
+    if kind in ('compare_text', 'compare_variables'):
+        return [('Compare', 0.0), ('Branch', 1.0)]
+    if kind == 'delay':
+        return [('Start', 0.0), ('End', 1.0)]
+    return [('Event', 0.0)]
+
+
+
+# Exactly three lanes per expanded composition. A recorded mouse sample is
+# ONE point on a lane, never an entire new row/clip in the timeline.
+STUDIO_TRACKS = (
+    ('movement', 'Mouse Movement', '#70B7EF'),
+    ('clicks', 'Mouse Clicks', '#E1AB68'),
+    ('logic', 'Macro Logic', '#AC91DE'),
+)
+
+
+def studio_action_track_events(action):
+    """Return (track, 0..1 fraction, label) for one recorded action.
+
+    The original action is not changed. A drag spans two mouse tracks:
+    position endpoints and press/release discrete input events.
+    """
+    if not isinstance(action, dict):
+        return [('logic', 0.0, 'Event')]
+    kind = str(action.get('type', '')).lower()
+    if kind == 'move':
+        return [('movement', 0.0, 'Cursor position')]
+    if kind == 'drag':
+        return [('movement', 0.0, 'Drag start'),
+                ('movement', 1.0, 'Drag end'),
+                ('clicks', 0.0, 'Mouse down'),
+                ('clicks', 1.0, 'Mouse up')]
+    if kind in ('click', 'double_click', 'mouse_down', 'mouse_up', 'scroll', 'wheel'):
+        return [('clicks', 0.0, 'Scroll' if kind in ('scroll', 'wheel') else kind.replace('_', ' ').title())]
+    return [('logic', fraction, label) for label, fraction in action_keyframes(action)]
+
+
+def studio_track_events(actions):
+    """Full-fidelity event references on only three parallel visual tracks.
+
+    Each event carries its ORIGINAL action index so selection can inspect its
+    source JSON. Zoom-dependent marker clustering happens *only when drawn*.
+    """
+    tracks = {name: [] for name, _, _ in STUDIO_TRACKS}
+    seconds = 0.0
+    for index, action in enumerate(actions):
+        duration = preview_duration(action)
+        for name, fraction, label in studio_action_track_events(action):
+            tracks[name].append((seconds + duration * fraction, index, label))
+        seconds += duration
+    for points in tracks.values():
+        points.sort(key=lambda item: item[0])
+    return tracks
+
+def load_preset_actions(presets_dir, preset_name):
+    """Read known local .json presets, without allowing path traversal."""
+    if not isinstance(preset_name, str) or not preset_name or preset_name in ('.', '..'):
+        return [], 'Invalid preset name'
+    base = os.path.realpath(presets_dir)
+    path = os.path.realpath(os.path.join(base, preset_name + '.json'))
+    if os.path.dirname(path) != base:
+        return [], 'Preset must be inside the presets directory'
+    try:
+        with open(path, 'r', encoding='utf-8') as stream:
+            data = json.load(stream)
+        if not isinstance(data, list):
+            return [], 'Preset does not contain an action list'
+        return [action for action in data if isinstance(action, dict)], None
+    except (OSError, ValueError, UnicodeError) as error:
+        return [], str(error)
+
+
+def preview_sequence(steps, presets_dir):
+    """Compute a non-executable chain timeline; never rewrite any action data."""
+    result = []
+    cursor = 0.0
+    for i, stage in enumerate(steps):
+        name = str(stage.get('preset', ''))
+        actions, error = load_preset_actions(presets_dir, name)
+        try:
+            loops = max(1, min(100000, int(stage.get('loops', 1))))
+            delay = max(0.0, float(stage.get('delay_after', 0.0)))
+            if not math.isfinite(delay):
+                delay = 0.0
+        except (TypeError, ValueError, OverflowError):
+            loops, delay = 1, 0.0
+        action_time = sum(preview_duration(action) for action in actions)
+        # Give empty presets visible but visibly estimated clips.
+        per_pass = max(0.6, action_time)
+        total = min(1000000.0, per_pass * loops + delay)
+        result.append(dict(index=i, name=name, actions=actions, error=error,
+                           start=cursor, duration=total, per_pass=per_pass,
+                           loops=loops, delay=delay))
+        cursor += total
+    return result
+
+
+class StudioTimeline(tk.Frame):
+    """Three-lane macro timeline. Event diamonds share tracks, not rows.
+
+    Preset and chain JSON remain the single source of truth. No timeline input
+    executes a macro. Overlapping markers are clustered *only visually*.
+    """
+
+    LABEL_W = 178
+    TOP = 35
+    ROW_H = 44
+    TRACK_H = 39
+    MARKER_PIXEL_GAP = 7
+
+    def __init__(self, parent, *, steps_getter, presets_dir_getter,
+                 colors_getter, on_select, on_scrub):
+        colors = colors_getter()
+        super().__init__(parent, bg=colors['panel'])
+        self.steps_getter = steps_getter
+        self.presets_dir_getter = presets_dir_getter
+        self.colors_getter = colors_getter
+        self.on_select = on_select
+        self.on_scrub = on_scrub
+        self.scale = 60.0  # pixels per estimated second
+        self.expanded = set()
+        self.selected_stage = None
+        self.selected_action = None
+        self.selected_marker_info = None
+        self.playhead = 0.0
+        self.running_stage = -1
+        self.plans = []
+        self._hit = []
+        self._preview_key = None
+        self._preview_plans = []
+        self.last_drawn_marker_count = 0
+        self.canvas = tk.Canvas(self, bg=colors['background'], bd=0,
+                                highlightthickness=0, relief='flat', cursor='crosshair')
+        self.xbar = tk.Scrollbar(self, orient='horizontal', command=self.canvas.xview)
+        self.ybar = tk.Scrollbar(self, orient='vertical', command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=self.xbar.set, yscrollcommand=self.ybar.set)
+        self.canvas.grid(row=0, column=0, sticky='nsew')
+        self.ybar.grid(row=0, column=1, sticky='ns')
+        self.xbar.grid(row=1, column=0, sticky='ew')
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+        self.canvas.bind('<Button-1>', self._click)
+        self.canvas.bind('<Double-Button-1>', self._double_click)
+        self.canvas.bind('<B1-Motion>', self._scrub_drag)
+        self.canvas.bind('<MouseWheel>', self._mouse_wheel)
+        self.canvas.bind('<Button-4>', lambda e: self.canvas.yview_scroll(-3, 'units'))
+        self.canvas.bind('<Button-5>', lambda e: self.canvas.yview_scroll(3, 'units'))
+        self.canvas.bind('<Configure>', lambda e: self.redraw(), add='+')
+
+    def _mouse_wheel(self, event):
+        if event.state & 0x0004:
+            self.zoom(1 if event.delta > 0 else -1)
+        else:
+            self.canvas.yview_scroll(-3 if event.delta > 0 else 3, 'units')
+        return 'break'
+
+    def zoom(self, step):
+        self.scale = min(1500.0, max(0.06, self.scale * (1.45 if step > 0 else 1/1.45)))
+        self.redraw()
+
+    def fit(self):
+        total = sum(plan['duration'] for plan in self.plans) or 4.0
+        available = max(120, self.canvas.winfo_width() - self.LABEL_W - 70)
+        self.scale = max(0.06, min(1500.0, available / total))
+        self.redraw()
+        self.canvas.xview_moveto(0)
+
+    def toggle_expand(self, index):
+        if index in self.expanded:
+            self.expanded.remove(index)
+        else:
+            self.expanded.add(index)
+        self.redraw()
+
+    def _get_plans(self):
+        # Cache preset parsing and keyframe indexing across scrub/zoom redraws.
+        # Detect saved file changes even if the chain list itself is unchanged.
+        steps = self.steps_getter()
+        folder = self.presets_dir_getter()
+        signatures = []
+        names = set()
+        for step in steps:
+            name = str(step.get('preset', ''))
+            names.add(name)
+            signatures.append((name, repr(step.get('loops')), repr(step.get('delay_after'))))
+        file_states = []
+        for name in sorted(names):
+            try:
+                stat = os.stat(os.path.join(folder, name + '.json'))
+                file_states.append((name, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                file_states.append((name, None, None))
+        key = (os.path.realpath(folder), tuple(signatures), tuple(file_states))
+        if key != self._preview_key:
+            self._preview_plans = preview_sequence(steps, folder)
+            self._preview_key = key
+        return self._preview_plans
+
+    def _paint_diamond(self, x, y, color, *, size=4, outline=''):
+        self.canvas.create_polygon(x, y-size, x+size, y, x, y+size, x-size, y,
+                                   fill=color, outline=outline)
+
+    def _paint_keyframes(self, plan, lane, y_center, lane_color, left_visible, right_visible):
+        """Paint one diamond per point if zoom allows, otherwise a density cluster.
+
+        This changes only paint density, never the underlying action list.
+        Every emitted hit target refers to an original saved action index.
+        """
+        import bisect
+        events = plan.get('_lane_events', {}).get(lane, ())
+        if not events:
+            return
+        times = plan['_lane_times'][lane]
+        local_l = max(0.0, (left_visible - self.LABEL_W) / self.scale - plan['start'])
+        local_r = (right_visible - self.LABEL_W) / self.scale - plan['start']
+        start = bisect.bisect_left(times, local_l - 12/self.scale)
+        stop = bisect.bisect_right(times, local_r + 12/self.scale)
+        # Pixel buckets represent overlapping markers. Zoom in to see each.
+        bucket = None
+        def paint(entry):
+            px, sample_index, label, count = entry
+            selected = plan['index'] == self.selected_stage and sample_index == self.selected_action
+            size = 6 if selected else 4
+            if count > 1:
+                size += 1
+            self._paint_diamond(px, y_center, '#FFFFFF' if selected else lane_color,
+                                size=size, outline=lane_color if selected else '')
+            # Don't draw counts over every dense bucket; that would recreate
+            # the same unreadable visual clutter we're avoiding. The inspector
+            # reports the precise overlap count when a cluster is selected.
+            note = dict(track=lane, label=label, clustered=count,
+                        action_index=sample_index, stage_index=plan['index'])
+            self._hit.append((px-6, y_center-13, px+13, y_center+11,
+                              plan['index'], sample_index, note))
+            self.last_drawn_marker_count += 1
+
+        for i in range(start, stop):
+            seconds, source_index, label = events[i]
+            px = self.LABEL_W + (plan['start']+seconds)*self.scale
+            bucket_id = int(px / self.MARKER_PIXEL_GAP)
+            if bucket is None or bucket[0] != bucket_id:
+                if bucket is not None:
+                    paint((bucket[1], bucket[2], bucket[3], bucket[4]))
+                bucket = [bucket_id, px, source_index, label, 1]
+            else:
+                bucket[4] += 1
+                # Preserve a selected original point when painting a dense group.
+                if source_index == self.selected_action and plan['index'] == self.selected_stage:
+                    bucket[2], bucket[3] = source_index, label
+        if bucket is not None:
+            paint((bucket[1], bucket[2], bucket[3], bucket[4]))
+
+    def redraw(self):
+        if not self.canvas.winfo_exists():
+            return
+        colors = self.colors_getter()
+        c = self.canvas
+        c.configure(bg=colors['background'])
+        c.delete('all')
+        self._hit = []
+        self.last_drawn_marker_count = 0
+        self.plans = self._get_plans()
+        total = sum(plan['duration'] for plan in self.plans)
+        content_w = max(c.winfo_width(), self.LABEL_W + 220 + total*self.scale)
+        y = self.TOP
+        rows = []
+        for plan in self.plans:
+            height = self.ROW_H + (len(STUDIO_TRACKS) * self.TRACK_H if plan['index'] in self.expanded else 0)
+            rows.append((plan, y, height))
+            y += height
+        content_h = max(c.winfo_height(), y + 34)
+        c.configure(scrollregion=(0, 0, content_w+24, content_h))
+        left_visible = c.canvasx(0)
+        right_visible = c.canvasx(c.winfo_width())
+        # Time ruler and composition/track column.
+        c.create_rectangle(0, 0, content_w+24, self.TOP,
+                           fill=colors['panel'], outline='')
+        c.create_rectangle(0, self.TOP, self.LABEL_W, content_h,
+                           fill=colors['panel'], outline='')
+        c.create_text(13, 18, anchor='w', text='COMPOSITION / TRACKS',
+                      fill=colors['muted'], font=('Segoe UI', 8, 'bold'))
+        tick = next((v for v in (0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1200, 3600, 7200, 18000)
+                     if v*self.scale >= 55), 36000)
+        start_tick = max(0, int((left_visible-self.LABEL_W)/self.scale/tick)-1)
+        end_tick = min(start_tick + 500, max(start_tick+1, int((right_visible-self.LABEL_W)/self.scale/tick)+3))
+        for index in range(start_tick, end_tick):
+            seconds = index*tick
+            x = self.LABEL_W + seconds*self.scale
+            c.create_line(x, self.TOP, x, content_h, fill=colors['grid'], dash=(2, 5))
+            c.create_text(x+4, 18, anchor='w', text=f'{seconds:g}s',
+                          fill=colors['muted'], font=('Consolas', 8))
+        c.create_line(self.LABEL_W, 0, self.LABEL_W, content_h, fill=colors['border'])
+
+        for plan, top, height in rows:
+            idx = plan['index']
+            c.create_rectangle(0, top, content_w, top+height,
+                               fill=colors['row'] if idx%2 else colors['background'], outline='')
+            c.create_rectangle(0, top, self.LABEL_W, top+self.ROW_H,
+                               fill=colors['panel'], outline=colors['grid'])
+            selected = idx == self.selected_stage
+            glyph = '▾' if idx in self.expanded else '▸'
+            c.create_text(10, top+22, anchor='w', text=glyph,
+                          fill=colors['accent'], font=('Segoe UI', 13, 'bold'))
+            stage_label = (plan['name'][:17]+'…') if len(plan['name'])>18 else plan['name']
+            c.create_text(29, top+17, anchor='w', text=stage_label,
+                          fill=colors['text'], font=('Segoe UI', 9, 'bold'))
+            c.create_text(29, top+32, anchor='w',
+                          text=f"{len(plan['actions']):,} events  ·  {plan['loops']}×",
+                          fill=colors['muted'], font=('Segoe UI', 8))
+            x0 = self.LABEL_W + plan['start']*self.scale
+            x1 = x0 + plan['duration']*self.scale
+            c.create_rectangle(x0+2, top+7, x1-2, top+37,
+                               width=2 if selected else 1,
+                               outline=colors['accent'] if selected else '#5A83AE',
+                               fill='#344B69' if selected else '#304157')
+            c.create_text(x0+11, top+21, anchor='w', text=stage_label,
+                          fill='#F0F3F8', font=('Segoe UI', 9, 'bold'),
+                          width=max(1, x1-x0-25))
+            if plan['error']:
+                c.create_text(x1-12, top+21, text='!', fill='#FFB3B3',
+                              font=('Segoe UI', 11, 'bold'))
+            if idx == self.running_stage:
+                c.create_rectangle(x0+2, top+7, x1-2, top+37,
+                                   outline=colors['success'], width=3)
+            self._hit.append((x0,top,x1,top+self.ROW_H,idx,None,None))
+            self._hit.append((0,top,self.LABEL_W,top+self.ROW_H,idx,None,None))
+            if idx not in self.expanded:
+                continue
+            if '_lane_events' not in plan:
+                plan['_lane_events'] = studio_track_events(plan['actions'])
+                plan['_lane_times'] = {name: [event[0] for event in events]
+                                       for name, events in plan['_lane_events'].items()}
+            for track_index, (lane,label,lane_color) in enumerate(STUDIO_TRACKS):
+                track_top = top+self.ROW_H+track_index*self.TRACK_H
+                track_mid = track_top+self.TRACK_H/2
+                c.create_rectangle(0,track_top,content_w,track_top+self.TRACK_H,
+                                   fill=colors['row'] if track_index%2 else colors['background'],
+                                   outline='')
+                c.create_rectangle(0,track_top,self.LABEL_W,track_top+self.TRACK_H,
+                                   fill=colors['panel'], outline=colors['grid'])
+                count = len(plan['_lane_events'][lane])
+                c.create_rectangle(12, track_mid-5, 17, track_mid+5,
+                                   fill=lane_color, outline='')
+                c.create_text(25,track_mid-5,anchor='w',text=label,
+                              fill=colors['text'],font=('Segoe UI', 9))
+                c.create_text(self.LABEL_W-9,track_mid+9,anchor='e',
+                              text=f'{count:,}',fill=colors['muted'],font=('Consolas', 8))
+                c.create_line(self.LABEL_W, track_mid, content_w, track_mid,
+                              fill=colors['grid'], dash=(2, 4))
+                self._hit.append((0,track_top,self.LABEL_W,track_top+self.TRACK_H,idx,None,None))
+                self._paint_keyframes(plan,lane,track_mid,lane_color,
+                                      left_visible,right_visible)
+        if not self.plans:
+            c.create_text(self.LABEL_W+26,self.TOP+40,anchor='w',
+                          text='No clips yet. Select a preset and add a stage.',
+                          fill=colors['muted'],font=('Segoe UI', 10))
+        marker_x = self.LABEL_W+self.playhead*self.scale
+        c.create_line(marker_x,7,marker_x,content_h,fill='#F27A75',width=2,
+                      tags=('studio_playhead',))
+        c.create_polygon(marker_x-7,7,marker_x+7,7,marker_x,18,
+                         fill='#F27A75',outline='',tags=('studio_playhead',))
+
+    def _scrub(self, event):
+        pos = self.canvas.canvasx(event.x)
+        self.playhead = max(0.0,(pos-self.LABEL_W)/self.scale)
+        self.redraw()
+        self.on_scrub(self.playhead)
+
+    def _click(self, event):
+        x,y = self.canvas.canvasx(event.x),self.canvas.canvasy(event.y)
+        if y < self.TOP:
+            self._scrub(event)
+            return 'break'
+        for x0,y0,x1,y1,idx,j,note in reversed(self._hit):
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                self.selected_stage,self.selected_action = idx,j
+                self.selected_marker_info = note
+                self.redraw()
+                self.on_select(idx,j)
+                return 'break'
+        return 'break'
+
+    def _double_click(self,event):
+        x,y = self.canvas.canvasx(event.x),self.canvas.canvasy(event.y)
+        for x0,y0,x1,y1,idx,j,note in reversed(self._hit):
+            if j is None and x0 <= x <= x1 and y0 <= y <= y1:
+                self.toggle_expand(idx)
+                return 'break'
+        return 'break'
+
+    def _scrub_drag(self,event):
+        if self.canvas.canvasy(event.y)<self.TOP:
+            self._scrub(event)
+            return 'break'
+
+
 class BuiltInMacroApp:
     def __init__(self, root):
         self.root = root
@@ -9144,6 +12560,25 @@ class BuiltInMacroApp:
         self.is_binding = False
         self.active_hotkey_field = None
         self.recorded_actions = []
+        # Autosave is bound to the actual loaded preset path, never to the
+        # dropdown's display text (which may be changed by menu refreshes).
+        self.autosave_presets = True
+        self._active_preset_path = None
+        self._active_preset_disk_hash = None
+        self._active_saved_snapshot = None
+        self._unbound_saved_snapshot = "[]"
+        self._autosave_observed_snapshot = None
+        self._autosave_deadline = None
+        self._autosave_job = None
+        # Queue deletions and pastes are journaled; typing in editors uses native
+        # Tk undo and is deliberately not captured by queue Ctrl+Z.
+        self._queue_undo_history = []
+        self._queue_redo_history = []
+        self._queue_undo_limit = 30
+        # Action-only clipboard: deliberately separate from the Windows text
+        # clipboard used by Read Clipboard and Type Variable workflows.
+        # Retained when switching presets, cleared only when Sequent closes.
+        self._queue_action_clipboard = None
         self.active_keys = []
         self.variables = {}
         self.breakpoints = set()
@@ -9179,8 +12614,9 @@ class BuiltInMacroApp:
         self.window_relative = False
 
         # Loop & Pause State
-        self.loop_mode = "1x"
-        self.loop_options = ["1x", "2x", "5x", "10x", "25x", "∞ Loop"]
+        # Standalone Playback runs once. Repeat a workflow using an explicit
+        # LOOP action or Sequencer stage instead of the former Repeat control.
+        self.loop_mode = "1x"  # Preserve compatibility with older integrations.
         self.is_paused = False
 
         # Mini HUD State
@@ -9224,6 +12660,8 @@ class BuiltInMacroApp:
         }
 
         self.load_settings()
+        self._trace_lock = RLock()
+        self._trace_rows = deque(maxlen=1500)
         self.dynamic_engine = SequentDynamicEngine(self)
         self._auto_trigger_key = None
         self._auto_trigger_state = None
@@ -9243,6 +12681,8 @@ class BuiltInMacroApp:
         Thread(target=self.global_hotkey_listener, daemon=True).start()
         self._schedule_system_theme_poll()
         self.root.after(1200, self._watch_dynamic_trigger)
+        self.root.protocol("WM_DELETE_WINDOW", self.request_close)
+        self._autosave_job = self.root.after(600, self._autosave_tick)
 
     
     def set_app_window(self):
@@ -9405,13 +12845,19 @@ class BuiltInMacroApp:
         ModernTooltip(btn_expand, "Expand Sequent")
 
     def update_status(self, text, fg_color=TEXT_MUTED):
+        """Show action notices and errors in the bottom-left footer only.
+
+        The Mini HUD retains its compact status when the main window is hidden.
+        All callers keep using this one method so status updates stay consistent.
+        """
         def _apply():
-            if hasattr(self, 'status_text') and self.status_text.winfo_exists():
-                self.status_text.config(text=f"● {text}", fg=fg_color)
             if hasattr(self, "footer_status") and self.footer_status.winfo_exists():
                 self.footer_status.config(text=str(text), fg=fg_color)
-            if self.mini_hud and self.mini_hud.winfo_exists() and hasattr(self, 'hud_status_lbl'):
-                trunc = (text[:14] + "..") if len(text) > 16 else text
+            if (self.mini_hud and self.mini_hud.winfo_exists()
+                    and hasattr(self, 'hud_status_lbl')
+                    and self.hud_status_lbl.winfo_exists()):
+                message = str(text)
+                trunc = (message[:14] + "..") if len(message) > 16 else message
                 self.hud_status_lbl.config(text=f"● {trunc}", fg=fg_color)
         self.root.after(0, _apply)
 
@@ -9517,10 +12963,570 @@ class BuiltInMacroApp:
         if len(path) <= max_len: return path
         return "..." + path[-(max_len - 3):]
 
+    def trace_action(self, action, state, elapsed=0, details=''):
+        # Only metadata/errors go to the journal, NEVER clipboard contents or
+        # variable values (which can contain private defect descriptions).
+        with self._trace_lock:
+            self._trace_rows.append((datetime.now().isoformat(timespec='seconds'),
+                                     str(action), str(state), round(elapsed, 4), str(details)[:300]))
+
+    # All IDE tools are docked within the DEBUG TOOLS sidebar workspace.
+    # No second app window or native window procedure is required.
+    def open_ide_tools(self):
+        self.show_tab('debug_tools', animate=False)
+
+    def _new_debug_panel(self, title, subtitle, icon='layout', size=(760, 520)):
+        if not self._discard_debug_panel():
+            return None
+        ui = SequentIDEWindow(self, title, subtitle, icon, size,
+                              parent=self.debug_tool_host, embedded=True)
+        self._debug_panel = ui
+        return ui
+
+    def _discard_debug_panel(self):
+        ui = getattr(self, '_debug_panel', None)
+        if ui is not None:
+            confirm = getattr(ui, 'confirm_discard', None)
+            if confirm is not None and ui.window.winfo_exists() and not confirm():
+                return False
+            ui.dispose()
+        self._debug_panel = None
+        return True
+
+    def _show_debug_overview(self):
+        if not self._discard_debug_panel():
+            return
+        self._debug_active_tool = None
+        self._update_debug_nav()
+        home = tk.Frame(self.debug_tool_host, bg=BG_APP)
+        home.pack(fill=tk.BOTH, expand=True)
+        self._debug_home = home
+        tk.Label(home, text='DEBUG TOOLS', bg=BG_APP, fg=TEXT_PRIMARY,
+                 font=('Segoe UI', 15, 'bold')).pack(anchor='w', padx=23, pady=(24, 4))
+        tk.Label(home, text='Inspect live state, review execution, recover changes and manage presets.',
+                 bg=BG_APP, fg=TEXT_MUTED, font=('Segoe UI', 10)).pack(anchor='w', padx=23)
+        choices = (('Live Variable Explorer', 'Inspect and edit Local / Global values', 'variable', 'variables'),
+                   ('Execution Timeline', 'Review macro actions, timing and failures', 'timeline', 'timeline'),
+                   ('Preset Version History', 'Compare and restore autosaved revisions', 'history', 'history'),
+                   ('Preset Manager', 'Find, tag, favorite and duplicate presets', 'folder', 'presets'),
+                   ('Difference Inspector', 'Inspect the latest full-text comparison', 'git-compare', 'compare'))
+        for title, caption, glyph, tool in choices:
+            card = tk.Frame(home, bg=BG_PANEL, highlightthickness=1, highlightbackground=BG_BORDER)
+            card.pack(fill=tk.X, padx=23, pady=(12, 0))
+            icon = SequentIcon(card, glyph, bg=BG_PANEL, color=TEXT_MUTED, size=22)
+            icon.pack(side=tk.LEFT, padx=(14, 10), pady=14)
+            labels = tk.Frame(card, bg=BG_PANEL)
+            labels.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            tk.Label(labels, text=title, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                     font=('Segoe UI', 10, 'bold'), anchor='w').pack(fill=tk.X)
+            tk.Label(labels, text=caption, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 9), anchor='w').pack(fill=tk.X)
+            go = sequent_toolbar_button(card, 'Open', lambda key=tool: self._open_debug_tool(key), icon='layers')
+            go.pack(side=tk.RIGHT, padx=12)
+
+    def _open_debug_tool(self, key):
+        # Destroy the overview only after unsaved edits have been handled.
+        if self._debug_active_tool == key and self._debug_panel is not None:
+            return
+        previous = getattr(self, '_debug_panel', None)
+        if previous is not None and not self._discard_debug_panel():
+            return
+        if getattr(self, '_debug_home', None) is not None:
+            try:
+                if self._debug_home.winfo_exists(): self._debug_home.destroy()
+            except tk.TclError: pass
+            self._debug_home = None
+        actions = {'variables': self.open_variable_explorer,
+                   'timeline': self.open_execution_timeline,
+                   'history': self.open_preset_history,
+                   'presets': self.open_preset_manager,
+                   'compare': self.open_compare_inspector}
+        self._debug_active_tool = key
+        self._update_debug_nav()
+        actions[key]()
+        # For a history view without an active preset, show an explanation.
+        if self._debug_panel is None:
+            self._show_debug_overview()
+
+    def _update_debug_nav(self):
+        for key, button in getattr(self, '_debug_nav_buttons', {}).items():
+            active = key == getattr(self, '_debug_active_tool', None)
+            button.base = COLOR_ACCENT if active else BG_INPUT
+            button.hover = COLOR_ACCENT_HOV if active else BG_HOVER
+            button.fg = TEXT_ON_ACCENT if active else TEXT_PRIMARY
+            button.label.config(fg=button.fg)
+            if button.icon: button.icon.paint(color=button.fg)
+            button._paint(button.base)
+
+    def build_debug_view(self):
+        for child in self.frame_debug.winfo_children(): child.destroy()
+        self._debug_panel = None
+        self._debug_home = None
+        nav = tk.Frame(self.frame_debug, bg=BG_HEADER, height=49)
+        nav.pack(fill=tk.X, padx=13, pady=(12, 0))
+        nav.pack_propagate(False)
+        self._debug_nav_buttons = {}
+        choices = (('variables', 'Variables', 'variable'),
+                   ('timeline', 'Timeline', 'timeline'),
+                   ('history', 'Version History', 'history'),
+                   ('presets', 'Presets', 'folder'),
+                   ('compare', 'Differences', 'git-compare'))
+        for key, text, glyph in choices:
+            button = sequent_toolbar_button(nav, text,
+                          lambda choice=key: self._open_debug_tool(choice), icon=glyph)
+            button.icon.override_key = sequent_icon_slot('debug', key)
+            sequent_register_icon_slot(button.icon.override_key, 'Debug: ' + text, glyph)
+            button.icon.paint()
+            button.pack(side=tk.LEFT, padx=(5, 0), pady=7)
+            self._debug_nav_buttons[key] = button
+        tk.Frame(self.frame_debug, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=13)
+        self.debug_tool_host = tk.Frame(self.frame_debug, bg=BG_APP)
+        self.debug_tool_host.pack(fill=tk.BOTH, expand=True, padx=13, pady=(0, 13))
+        selected = getattr(self, '_debug_active_tool', None)
+        self._debug_active_tool = None
+        if selected in dict((key, True) for key, _, _ in choices):
+            self._open_debug_tool(selected)
+        else:
+            self._show_debug_overview()
+
+    def open_compare_inspector(self):
+        """Show the latest comparison in Debug Tools without writing text to logs."""
+        ui = self._new_debug_panel('Difference Inspector',
+                                   'Latest comparison from the running macro', 'git-compare')
+        if ui is None: return None
+        result = getattr(self, '_last_text_comparison', None)
+        if not result:
+            ui.label(ui.body, 'No comparisons have run in this session.',
+                     font=('Segoe UI', 10)).pack(anchor='w', padx=18, pady=18)
+            return ui
+        if result.get('error'):
+            ui.label(ui.body, 'Comparison error: ' + result['error'],
+                     font=('Segoe UI', 10)).pack(anchor='w', padx=18, pady=18)
+            return ui
+        description = ('MATCH' if result['matched'] else 'MISMATCH') + (
+            f"  |  {result['difference_count']} differing lines  |  "
+            f"first difference: line {result['first_different_line']}")
+        ui.label(ui.body, description, font=('Segoe UI', 10, 'bold')).pack(
+            anchor='w', padx=12, pady=(14, 6))
+        container = tk.Frame(ui.body, bg=BG_PANEL)
+        container.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0,12))
+        display = tk.Text(container, wrap='none', bg=BG_INPUT, fg=TEXT_PRIMARY,
+                          font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                          highlightthickness=0, bd=0)
+        vertical = tk.Scrollbar(container, orient='vertical', command=display.yview)
+        horizontal = tk.Scrollbar(container, orient='horizontal', command=display.xview)
+        display.config(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        vertical.pack(side=tk.RIGHT, fill=tk.Y)
+        horizontal.pack(side=tk.BOTTOM, fill=tk.X)
+        display.pack(fill=tk.BOTH, expand=True)
+        display.insert('1.0', result['diff'] or '(No line differences)')
+        display.config(state='disabled')
+        return ui
+
+    def open_variable_explorer(self):
+        ui = self._new_debug_panel( 'Live Variable Explorer',
+                             'Inspect and manage session / saved values', 'layers', (800, 525))
+        if ui is None: return None
+        window = ui.window
+        left = ui.frame(ui.body, 'panel', highlightthickness=1, highlightbackground=BG_BORDER)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        head = ui.frame(left, 'panel'); head.pack(fill=tk.X, padx=12, pady=(11, 5))
+        ui.label(head, 'LOCAL / GLOBAL VARIABLES', font=('Segoe UI', 9, 'bold')).pack(anchor='w')
+        list_container = ui.frame(left, 'panel'); list_container.pack(fill=tk.BOTH, expand=True, padx=11, pady=(0, 10))
+        listing = ui.listbox(list_container)
+        ui.scroll(list_container, listing)
+        listing.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        right = ui.frame(ui.body, 'panel', width=365,
+                         highlightthickness=1, highlightbackground=BG_BORDER)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH)
+        right.pack_propagate(False)
+        ui.label(right, 'SELECTED VALUE', font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=12, pady=(11, 3))
+        ui.label(right, 'Edit the exact text, including multiple lines.', role='muted',
+                 font=('Segoe UI', 8)).pack(anchor='w', padx=12, pady=(0, 8))
+        text_container = ui.frame(right, 'panel')
+        text_container.pack(fill=tk.BOTH, expand=True, padx=11)
+        editor = ui.text(text_container, wrap='word', undo=True)
+        ui.scroll(text_container, editor)
+        editor.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        entries = []
+        editing_pair = [None]
+
+        def selected():
+            index=listing.curselection()
+            return entries[index[0]] if index and index[0]<len(entries) else None
+
+        def on_select(event=None):
+            pair=selected()
+            if not pair: return
+            if editing_pair[0] != pair and editor.edit_modified():
+                if not messagebox.askyesno('Unsaved variable edit',
+                           'Discard the edited variable text without saving?', parent=window):
+                    listing.selection_clear(0,tk.END)
+                    if editing_pair[0] in entries:
+                        listing.selection_set(entries.index(editing_pair[0]))
+                    return
+            scope,name=pair
+            try: value = get_variable(self,name,scope)
+            except MacroExecutionError as exc:
+                self.update_status(str(exc),COLOR_DANGER);return
+            editor.delete('1.0',tk.END)
+            editor.insert('1.0',str(value))
+            editor.edit_modified(False)
+            editing_pair[0] = pair
+            ui.footer_note(f'{scope.upper()}  /  {name}')
+
+        def refresh():
+            if not window.winfo_exists(): return
+            old=selected()
+            try:
+                with _GLOBAL_VARIABLE_LOCK: globals_ = _read_global_values(self)
+                items = ([('Local',k) for k in sorted(self.variables)] +
+                         [('Global',k) for k in sorted(globals_)])
+                if items != entries:
+                    entries[:] = items
+                    listing.delete(0,tk.END)
+                    for scope,name in items: listing.insert(tk.END, f'{scope.upper():7}  {name}')
+                    if old in items: listing.selection_set(items.index(old))
+                pair=selected()
+                if pair and not editor.edit_modified() and editing_pair[0] == pair:
+                    scope,name=pair
+                    current=str(get_variable(self,name,scope))
+                    if editor.get('1.0','end-1c') != current:
+                        editor.delete('1.0',tk.END)
+                        editor.insert('1.0',current)
+                        editor.edit_modified(False)
+            except MacroExecutionError as exc:
+                self.update_status(str(exc),COLOR_DANGER)
+            ui.schedule(1400,refresh)
+
+        def save():
+            pair=selected()
+            if not pair:return
+            scope,name=pair
+            try:
+                set_variable(self,name,editor.get('1.0','end-1c'),scope)
+                editor.edit_modified(False)
+                ui.footer_note(f'SAVED  /  {scope.upper()}  /  {name}')
+                self.update_status(f'Updated {scope} variable {name}',COLOR_SUCCESS)
+            except MacroExecutionError as exc:
+                messagebox.showerror('Save variable',str(exc),parent=window)
+
+        def delete():
+            pair=selected()
+            if not pair:return
+            scope,name=pair
+            if not messagebox.askyesno('Delete variable',f'Delete {scope} variable {name}?',parent=window):return
+            if scope=='Local':self.variables.pop(name,None)
+            else:
+                try:
+                    with _GLOBAL_VARIABLE_LOCK:
+                        all_values=_read_global_values(self)
+                        all_values.pop(name,None)
+                        self._write_json_atomically(_global_variable_path(self),all_values)
+                except (MacroExecutionError,OSError) as exc:
+                    messagebox.showerror('Delete variable',str(exc),parent=window);return
+            listing.selection_clear(0,tk.END)
+            editor.delete('1.0',tk.END)
+            editor.edit_modified(False)
+            refresh()
+
+        def create():
+            name=simpledialog.askstring('New variable','Variable name:',parent=window)
+            if not name:return
+            try:variable_identity(name,'local')
+            except MacroExecutionError as exc:
+                messagebox.showerror('Invalid name',str(exc),parent=window);return
+            global_scope=messagebox.askyesno('Variable scope',
+                'Save this variable globally across all macros?\nYes = Global, No = Local',parent=window)
+            scope='global' if global_scope else 'local'
+            try:
+                set_variable(self,name,'',scope)
+                refresh()
+                key=(scope.title(),name)
+                if key in entries:
+                    listing.selection_clear(0,tk.END)
+                    listing.selection_set(entries.index(key))
+                    listing.see(entries.index(key))
+                    on_select()
+            except MacroExecutionError as exc:
+                messagebox.showerror('New variable',str(exc),parent=window)
+
+        def confirm_discard():
+            if not editor.edit_modified():
+                return True
+            return messagebox.askyesno('Unsaved variable edit',
+                       'Discard the edited variable text without saving?', parent=window)
+        ui.confirm_discard = confirm_discard
+        ui.variable_editor = editor
+        ui.variable_listing = listing
+        ui.variable_entries = entries
+        listing.bind('<<ListboxSelect>>',on_select)
+        buttons=ui.frame(right, 'panel')
+        buttons.pack(fill=tk.X, padx=10, pady=(9, 10))
+        ui.button(buttons, 'New', create, icon='plus', side=tk.LEFT, padx=(0, 5))
+        ui.button(buttons, 'Save Value', save, icon='save', accent=True, side=tk.LEFT, padx=(0, 5))
+        ui.button(buttons, 'Delete', delete, icon='trash', side=tk.LEFT)
+        ui.button(ui.footer_buttons, 'Refresh', lambda:(refresh(),on_select()), icon='refresh', side=tk.RIGHT)
+        refresh()
+        return window
+
+    def open_execution_timeline(self):
+        ui = self._new_debug_panel( 'Execution Timeline',
+                             'Action timings, branch results and failures', 'clock', (950, 520))
+        if ui is None: return None
+        window=ui.window
+        panel=ui.frame(ui.body, 'panel', highlightthickness=1, highlightbackground=BG_BORDER)
+        panel.pack(fill=tk.BOTH, expand=True)
+        header=ui.frame(panel, 'panel');header.pack(fill=tk.X, padx=12, pady=(11, 7))
+        ui.label(header, 'EXECUTION EVENTS', font=('Segoe UI', 9, 'bold')).pack(side=tk.LEFT)
+        ui.label(header, 'TIMESTAMP  /  DURATION  /  STATUS  /  ACTION', 'muted',
+                 font=('Consolas', 8)).pack(side=tk.RIGHT)
+        holder=ui.frame(panel, 'panel');holder.pack(fill=tk.BOTH,expand=True,padx=11,pady=(0,11))
+        text_box=ui.text(holder, wrap='none', state=tk.DISABLED)
+        ui.scroll(holder,text_box)
+        text_box.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
+        last=[None]
+        def update():
+            if not window.winfo_exists():return
+            with self._trace_lock: records=list(self._trace_rows)
+            key=(len(records), records[-1] if records else None)
+            if key!=last[0]:
+                text_box.configure(state=tk.NORMAL);text_box.delete('1.0',tk.END)
+                for timestamp,action,status,seconds,detail in records:
+                    text_box.insert(tk.END,f'{timestamp}  {seconds:8.4f}s  {status:9}  {action:18}  {detail}\n')
+                text_box.see(tk.END);text_box.configure(state=tk.DISABLED)
+                last[0]=key
+                ui.footer_note(f'{len(records)} EVENTS  /  LIVE')
+            ui.schedule(400,update)
+        def export():
+            filename=filedialog.asksaveasfilename(parent=window,defaultextension='.csv',
+                  filetypes=[('CSV files','*.csv')])
+            if filename:
+                try:
+                    with self._trace_lock: rows=list(self._trace_rows)
+                    with open(filename,'w',newline='',encoding='utf-8-sig') as stream:
+                        writer=csv.writer(stream)
+                        writer.writerow(['timestamp','action','status','seconds','detail'])
+                        writer.writerows(rows)
+                    ui.footer_note(f'EXPORTED  /  {len(rows)} EVENTS')
+                except OSError as exc:
+                    messagebox.showerror('Export Timeline', str(exc), parent=window)
+        ui.button(ui.footer_buttons, 'Export Timeline CSV', export, icon='download', accent=True, side=tk.RIGHT)
+        update()
+        return window
+
+    def open_preset_history(self):
+        path=getattr(self,'_active_preset_path',None)
+        if not path:
+            messagebox.showinfo('Preset history','Open a saved preset first.',parent=self.root);return
+        ui=self._new_debug_panel( 'Preset Version History',
+                            'Recover previous autosaves / compare revisions', 'undo', (770, 490))
+        if ui is None: return None
+        window=ui.window
+        panel=ui.frame(ui.body,'panel', highlightthickness=1, highlightbackground=BG_BORDER)
+        panel.pack(fill=tk.BOTH,expand=True)
+        heading=ui.frame(panel,'panel');heading.pack(fill=tk.X,padx=12,pady=(10,6))
+        ui.label(heading,'SAVED REVISIONS',font=('Segoe UI',9,'bold')).pack(side=tk.LEFT)
+        ui.label(heading,'Up to 30 per preset',role='muted',
+                 font=('Segoe UI',8)).pack(side=tk.RIGHT)
+        holder=ui.frame(panel,'panel');holder.pack(fill=tk.BOTH,expand=True,padx=11,pady=(0,11))
+        listing=ui.listbox(holder)
+        ui.scroll(holder,listing)
+        listing.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
+        folder=sequent_history_directory(self.presets_dir,path)
+        names=sorted((n for n in os.listdir(folder) if n.endswith('.json'))) if os.path.isdir(folder) else []
+        for name in names: listing.insert(tk.END,name)
+        ui.footer_note(f'{len(names)} REVISIONS  /  {os.path.basename(path)}')
+
+        def restore():
+            selected=listing.curselection()
+            if not selected:return
+            name=names[selected[0]]
+            try:
+                with open(os.path.join(folder,name),'r',encoding='utf-8-sig') as stream:
+                    actions=json.load(stream)
+                if not isinstance(actions,list) or any(not isinstance(a,dict) or 'type' not in a for a in actions):
+                    raise ValueError('Revision does not contain a macro action list')
+                if not messagebox.askyesno('Restore preset',f'Restore {name}?\nCurrent version will be backed up first.',parent=window):return
+                if not self._safe_to_replace_queue():return
+                with open(path,'rb') as stream: current_hash=hashlib.sha256(stream.read()).hexdigest()
+                if current_hash != self._active_preset_disk_hash:
+                    raise OSError('Preset changed externally; reload before restore')
+                sequent_save_revision(self.presets_dir,path)
+                self._write_json_atomically(path,actions)
+                self.recorded_actions=copy.deepcopy(actions)
+                self.breakpoints.clear();self.current_action_idx=0
+                self._clear_queue_undo();self._bind_preset_autosave(path)
+                self.display_actions_in_queue(self.recorded_actions,self.current_source_label)
+                ui.close()
+                self.update_status('Preset revision restored',COLOR_SUCCESS)
+            except (ValueError,OSError,MacroExecutionError) as exc:
+                messagebox.showerror('Restore failed',str(exc),parent=window)
+
+        def compare_revision():
+            selected=listing.curselection()
+            if not selected:return
+            try:
+                with open(os.path.join(folder,names[selected[0]]),'r',encoding='utf-8-sig') as stream:
+                    previous=json.load(stream)
+                before=json.dumps(previous,indent=2,ensure_ascii=True).splitlines(keepends=True)
+                after=json.dumps(self.recorded_actions,indent=2,ensure_ascii=True).splitlines(keepends=True)
+                change=''.join(difflib.unified_diff(before,after,fromfile='Revision',tofile='Current queue'))
+            except (OSError,ValueError) as exc:
+                messagebox.showerror('Compare failed',str(exc),parent=window);return
+            diff=self._new_debug_panel('Compare Revisions',
+                                  'Read-only unified diff / current Action Queue',
+                                  'layers', (920, 570))
+            if diff is None: return
+            card=diff.frame(diff.body,'panel',highlightthickness=1, highlightbackground=BG_BORDER)
+            card.pack(fill=tk.BOTH,expand=True)
+            view=diff.frame(card,'panel');view.pack(fill=tk.BOTH,expand=True,padx=10,pady=10)
+            viewer=diff.text(view,wrap='none')
+            diff.scroll(view,viewer)
+            viewer.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
+            viewer.insert('1.0',change or 'No differences')
+            viewer.configure(state=tk.DISABLED)
+            diff.footer_note('READ-ONLY  /  REVISION COMPARISON')
+            diff.button(diff.footer_buttons,'Back to History',
+                        lambda: self._return_to_debug_history(),icon='undo',side=tk.RIGHT)
+
+        ui.button(ui.footer_buttons,'Restore Selected Revision',restore,icon='undo',accent=True,side=tk.RIGHT)
+        ui.button(ui.footer_buttons,'Compare With Current',compare_revision,icon='layers',side=tk.RIGHT,padx=(0,8))
+        return window
+
+    def _return_to_debug_history(self):
+        self._debug_active_tool = None
+        self._open_debug_tool('history')
+
+    def open_preset_manager(self):
+        """Sequent-styled searchable manager; no file drop handlers or extra DLLs."""
+        ui=self._new_debug_panel('Preset Manager',
+                            'Find, tag, favorite, duplicate and open saved macros',
+                            'folder', (750, 555))
+        if ui is None: return None
+        window=ui.window
+        query=tk.StringVar();only_fav=tk.BooleanVar(value=False)
+        meta_path=os.path.join(self.presets_dir,'.sequent_preset_catalog.json')
+        def read_meta():
+            try:
+                with open(meta_path,encoding='utf-8') as stream: meta=json.load(stream)
+                return meta if isinstance(meta,dict) else {}
+            except FileNotFoundError:return {}
+        meta=read_meta()
+        panel=ui.frame(ui.body,'panel',highlightthickness=1,highlightbackground=BG_BORDER)
+        panel.pack(fill=tk.BOTH,expand=True)
+        search=ui.frame(panel,'panel');search.pack(fill=tk.X,padx=12,pady=(11,7))
+        ui.icon(search,'search').pack(side=tk.LEFT,padx=(0,8))
+        field=ui.entry(search,textvariable=query)
+        field.pack(side=tk.LEFT,fill=tk.X,expand=True,ipady=7)
+        ui.checkbox(panel,'Favorites only',only_fav).pack(anchor='w',padx=12,pady=(0,7))
+        holder=ui.frame(panel,'panel');holder.pack(fill=tk.BOTH,expand=True,padx=11)
+        listing=ui.listbox(holder)
+        ui.scroll(holder,listing)
+        listing.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
+        tags=ui.frame(panel,'panel');tags.pack(fill=tk.X,padx=12,pady=11)
+        ui.label(tags,'PRESET TAG',font=('Segoe UI',9,'bold')).pack(side=tk.LEFT,padx=(0,12))
+        tag=tk.StringVar()
+        tag_field=ui.entry(tags,textvariable=tag)
+        tag_field.pack(side=tk.LEFT,fill=tk.X,expand=True,ipady=5)
+        names=[]
+        locals_for_favorite = {}
+        def refresh(*_):
+            old=listing.curselection();previous=names[old[0]] if old and old[0]<len(names) else None
+            names[:]=[n for n in self.get_preset_names() if
+                      (query.get().casefold() in n.casefold() or
+                       query.get().casefold() in str(meta.get(n,{}).get('tag','')).casefold())
+                      and (not only_fav.get() or meta.get(n,{}).get('favorite',False))]
+            listing.delete(0,tk.END)
+            for n in names:
+                # Unicode star is a list marker; the actual toggle uses the
+                # same custom-drawn Canvas star as the rest of Sequent.
+                flag='★  ' if meta.get(n,{}).get('favorite') else '☆  '
+                tag_string='  /  '+str(meta.get(n,{}).get('tag')) if meta.get(n,{}).get('tag') else ''
+                listing.insert(tk.END,flag+n+tag_string)
+            if previous in names:listing.selection_set(names.index(previous))
+            if 'favorite_btn' in locals_for_favorite:
+                update_star_button()
+            ui.footer_note(f'{len(names)} PRESETS  /  {"FAVORITES" if only_fav.get() else "ALL"}')
+        def selected():
+            ids=listing.curselection();return names[ids[0]] if ids else None
+        def save_meta():
+            self._write_json_atomically(meta_path,meta)
+        def update_star_button():
+            name=selected()
+            favorite=bool(name and meta.get(name,{}).get('favorite',False))
+            if favorite_btn.icon:
+                favorite_btn.icon.paint(name='star-filled' if favorite else 'star')
+            favorite_btn.label.config(text='Unfavorite' if favorite else 'Favorite')
+
+        def toggle_favorite():
+            name=selected()
+            if not name:return
+            item=meta.setdefault(name,{})
+            old=bool(item.get('favorite',False))
+            item['favorite']=not old
+            try:
+                save_meta()
+                refresh()
+            except (OSError,ValueError) as exc:
+                item['favorite']=old
+                messagebox.showerror('Save preset favorite',str(exc),parent=window)
+            update_star_button()
+
+        def save_tag():
+            name=selected()
+            if not name:return
+            item=meta.setdefault(name,{})
+            old=item.get('tag','')
+            item['tag']=tag.get().strip()[:60]
+            try:
+                save_meta()
+                refresh()
+            except (OSError,ValueError) as exc:
+                item['tag']=old
+                messagebox.showerror('Save preset tag',str(exc),parent=window)
+        def duplicate():
+            name=selected()
+            if not name:return
+            dest=simpledialog.askstring('Duplicate preset','New preset name:',parent=window,
+                                        initialvalue=name+'_copy')
+            if not dest:return
+            try:
+                if not re.fullmatch(r'[A-Za-z0-9 _-]{1,90}',dest):
+                    raise ValueError('Use letters, numbers, spaces, _ or -')
+                old=os.path.join(self.presets_dir,name+'.json')
+                new=os.path.join(self.presets_dir,dest+'.json')
+                with open(old,'rb') as f: raw=f.read()
+                json.loads(raw.decode('utf-8'))
+                with open(new,'xb') as out:out.write(raw)
+                refresh();self.refresh_preset_menu()
+            except (OSError,ValueError) as exc:
+                messagebox.showerror('Duplicate failed',str(exc),parent=window)
+        def on_select(_=None):
+            name=selected()
+            if name:tag.set(str(meta.get(name,{}).get('tag','')))
+            update_star_button()
+        query.trace_add('write',refresh);only_fav.trace_add('write',refresh)
+        listing.bind('<<ListboxSelect>>',on_select)
+        def open_selected():
+            name=selected()
+            if name and self.on_preset_file_selected(name,os.path.join(self.presets_dir,name+'.json')):
+                ui.close()
+        ui.button(ui.footer_buttons,'Open Preset',open_selected,icon='folder',accent=True,side=tk.RIGHT)
+        ui.button(ui.footer_buttons,'Duplicate',duplicate,icon='layers',side=tk.RIGHT,padx=(0,7))
+        ui.button(ui.footer_buttons,'Save Tag',save_tag,icon='save',side=tk.RIGHT,padx=(0,7))
+        favorite_btn = ui.button(ui.footer_buttons,'Favorite',toggle_favorite,
+                                 icon='star',side=tk.RIGHT,padx=(0,7))
+        locals_for_favorite['favorite_btn']=favorite_btn
+        refresh()
+        update_star_button()
+        return window
+
     def get_preset_names(self):
         if not os.path.exists(self.presets_dir): return []
         try:
-            return sorted([os.path.splitext(f)[0] for f in os.listdir(self.presets_dir) if f.lower().endswith(".json") and f.lower() != "globals.json"])
+            return sorted([os.path.splitext(f)[0] for f in os.listdir(self.presets_dir) if f.lower().endswith(".json") and not f.lower().endswith(".chain.json") and not f.startswith(".") and f.lower() != "globals.json"])
         except Exception: return []
 
     def setup_ui(self, initial_tab="playback", animate=True):
@@ -9535,6 +13541,17 @@ class BuiltInMacroApp:
         self.root.bind("<Home>", lambda e: self._on_scrub_nav("home"))
         self.root.bind("<End>", lambda e: self._on_scrub_nav("end"))
         self.root.bind("<space>", lambda e: self._on_scrub_nav("run_step"))
+        # Toplevel bindings work from the queue toolbar too; entry/text fields
+        # keep their ordinary Ctrl+Z behavior. The queue Text handles its own
+        # shortcuts because its read-only KeyPress binding consumes key events.
+        self.root.bind('<Control-z>', self._on_queue_undo_shortcut, add='+')
+        self.root.bind('<Control-Z>', self._on_queue_undo_shortcut, add='+')
+        self.root.bind('<Control-y>', self._on_queue_redo_shortcut, add='+')
+        self.root.bind('<Control-Y>', self._on_queue_redo_shortcut, add='+')
+        self.root.bind('<Control-s>', self._on_save_preset_shortcut, add='+')
+        self.root.bind('<Control-S>', self._on_save_preset_shortcut, add='+')
+        # Only the queue itself handles Ctrl+C/V; normal Entry/Text widgets
+        # (and other applications) retain their regular Windows clipboard.
         for seq, dx, dy in [
             ("<Alt-Left>", -1, 0), ("<Alt-Right>", 1, 0),
             ("<Alt-Up>", 0, -1), ("<Alt-Down>", 0, 1),
@@ -9557,38 +13574,61 @@ class BuiltInMacroApp:
         self.hamburger.bind("<Leave>", lambda e: self.hamburger.paint(bg=BG_HEADER))
         ModernTooltip(self.hamburger, "Toggle Workspace Navigation")
 
+        # Compact top-bar identity: a colored marker beside the *original*
+        # SEQUENT artwork.  The full two-line logo remains a separate asset,
+        # but would make MACRO ENGINE illegible at toolbar sizes.
         brand = tk.Frame(top_bar, bg=BG_HEADER)
         brand.pack(side=tk.LEFT, padx=(6, 20))
-        title = tk.Label(brand, text="SEQUENT", bg=BG_HEADER, fg=TEXT_PRIMARY,
-                         font=("Segoe UI", 12, "bold"))
-        title.pack(anchor="w")
-        tk.Label(brand, text=" MACRO ENGINE", bg=BG_HEADER, fg=COLOR_ACCENT,
-                 font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        for widget in (brand, title):
+        self.brand_marker = tk.Canvas(brand, width=8, height=26, bg=BG_HEADER,
+                                      borderwidth=0, highlightthickness=0,
+                                      takefocus=0)
+        # Rounded 5px bar, centered vertically next to the wordmark.
+        self.brand_marker.create_line(4, 6, 4, 20, width=5,
+                                      fill=COLOR_ACCENT, capstyle=tk.ROUND,
+                                      tags="brand_accent_marker")
+        self.brand_marker.pack(side=tk.LEFT, padx=(0, 10))
+        self.brand_label = None
+        try:
+            brand_photo = sequent_compact_brand_photoimage(brand, TEXT_HEADER)
+        except (OSError, ValueError, tk.TclError, zlib.error) as exc:
+            print(f"[Sequent] Compact brand artwork unavailable: {exc}")
+            brand_photo = None
+        if brand_photo is not None:
+            title = tk.Label(brand, image=brand_photo, bg=BG_HEADER,
+                             borderwidth=0, highlightthickness=0, padx=0, pady=0)
+            title.image = brand_photo  # Keep the PhotoImage alive.
+            self.brand_label = title
+        else:
+            # Safe startup even if the brand asset is deleted or corrupt.
+            title = tk.Label(brand, text="SEQUENT", bg=BG_HEADER, fg=TEXT_HEADER,
+                             font=("Segoe UI", 12, "bold"), borderwidth=0)
+            self.brand_label = title
+        title.pack(side=tk.LEFT)
+        for widget in (brand, self.brand_marker, title):
             widget.bind("<Button-1>", self.start_drag)
             widget.bind("<B1-Motion>", self.drag_window)
 
-        # Align the Mini HUD once with the expanded sidebar boundary.
-        # Its position is independent of sidebar opening/closing animations.
-        self._topbar_brand = brand
-        self.mini_hud_button = sequent_toolbar_button(top_bar, "Mini HUD", self.toggle_mini_hud)
-        self.mini_hud_button.place(x=self.sidebar_width + 12, rely=0.5, anchor=tk.W)
-        top_bar.bind("<Configure>", self._position_mini_hud_button, add="+")
-
+        # Debug Tools remains accessible from the workspace sidebar.
+        # Mini HUD is entered using the existing minimize icon below, so the
+        # top bar needs neither of the duplicate shortcut buttons.
         win_controls = tk.Frame(top_bar, bg=BG_HEADER)
         win_controls.pack(side=tk.RIGHT, fill=tk.Y)
         btn_close = SequentIcon(win_controls, 'close', bg=BG_HEADER,
                                 color=TEXT_MUTED, size=19)
         btn_close.pack(side=tk.RIGHT, padx=15, pady=15)
-        btn_close.bind("<Button-1>", lambda e: self.root.destroy())
+        btn_close.bind("<Button-1>", lambda e: self.request_close())
         btn_close.bind("<Enter>", lambda e: btn_close.paint(bg=COLOR_DANGER, color="#fff"))
         btn_close.bind("<Leave>", lambda e: btn_close.paint(bg=BG_HEADER, color=TEXT_MUTED))
         btn_min = SequentIcon(win_controls, 'minimize', bg=BG_HEADER,
                               color=TEXT_MUTED, size=19)
         btn_min.pack(side=tk.RIGHT, padx=13, pady=15)
-        btn_min.bind("<Button-1>", lambda e: self.minimize_window())
+        # Keep the native-looking MINIMIZE glyph but collapse to Mini HUD.
+        # The HUD's Expand button restores the full Sequent workspace.
+        self.mini_hud_button = btn_min  # Guided Tour target (not another button).
+        btn_min.bind("<Button-1>", lambda e: self.toggle_mini_hud())
         btn_min.bind("<Enter>", lambda e: btn_min.paint(bg=BG_HOVER))
         btn_min.bind("<Leave>", lambda e: btn_min.paint(bg=BG_HEADER))
+        ModernTooltip(btn_min, "Minimize to Mini HUD")
         # The native title bar already supplies Windows minimize/close controls.
         if self.native_window_resize:
             win_controls.pack_forget()
@@ -9602,9 +13642,8 @@ class BuiltInMacroApp:
             # Windows handles double-click-to-maximize on the custom caption.
             top_bar.bind("<Double-Button-1>", lambda e: self.toggle_maximize_window())
 
-        self.status_text = tk.Label(top_bar, text="● Ready", bg=BG_HEADER,
-                                    fg=COLOR_SUCCESS, font=("Segoe UI", 9, "bold"))
-        self.status_text.pack(side=tk.RIGHT, padx=(4, 16))
+        # Notifications live exclusively in the bottom-left footer. Keep the
+        # top-right area available for the preset selector and window controls.
 
         preset_card = ModernCard(top_bar, bg_card=BG_INPUT)
         self.preset_card = preset_card  # Walkthrough highlights the complete preset selector.
@@ -9637,7 +13676,7 @@ class BuiltInMacroApp:
                                       fg=TEXT_MUTED, font=("Segoe UI", 8), anchor="w")
         self.footer_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(self.footer, text="SEQUENT  •  WORKSPACE", bg=BG_HEADER,
-                 fg=TEXT_MUTED, font=("Consolas", 8)).pack(side=tk.RIGHT, padx=12)
+                     fg=TEXT_MUTED, font=("Consolas", 8)).pack(side=tk.RIGHT, padx=12)
         tk.Frame(self.main_container, bg=BG_BORDER, height=1).pack(side=tk.BOTTOM, fill=tk.X)
 
         self.workspace = tk.Frame(self.main_container, bg=BG_APP)
@@ -9699,6 +13738,7 @@ class BuiltInMacroApp:
         self._tab_anim_id = None
         self.frame_playback = tk.Frame(self.content_frame, bg=BG_APP)
         self.frame_sequencer = tk.Frame(self.content_frame, bg=BG_APP)
+        self.frame_debug = tk.Frame(self.content_frame, bg=BG_APP)
         # Settings is a peer of the independent Playback/Sequencer docks.
         # If it stays nested in content_frame, the dock windows always paint
         # above it during page transitions, obscuring the Settings controls.
@@ -9717,6 +13757,7 @@ class BuiltInMacroApp:
         self.build_playback_view()
         self.build_sequencer_view()
         self.build_settings_view()
+        self.build_debug_view()
         # Separate transition canvas (for page effects, not sidebar movement).
         self.overlay = tk.Canvas(self.root, bg=BG_APP, highlightthickness=0)
         self.show_tab(initial_tab, animate=animate)
@@ -9735,10 +13776,7 @@ class BuiltInMacroApp:
         if action == "prev": self.step_backward()
         elif action == "next": self.step_forward()
         elif action == "home": self.jump_to_start()
-        elif action == "end":
-            if self.recorded_actions:
-                self.current_action_idx = len(self.recorded_actions) - 1
-                self.update_scrubber_ui()
+        elif action == "end": self.jump_to_end()
         elif action == "run_step":
             self.run_single_step()
         return "break"
@@ -9869,9 +13907,13 @@ class BuiltInMacroApp:
             command=lambda: self.show_tab("playback"))
         self.btn_tab_playback.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_sequencer = SidebarButton(
-            self.sidebar_frame, text="SEQUENCER",
+            self.sidebar_frame, text="STUDIO",
             command=lambda: self.show_tab("sequencer"))
         self.btn_tab_sequencer.pack(fill=tk.X, padx=7, pady=2)
+        self.btn_tab_debug = SidebarButton(
+            self.sidebar_frame, text='DEBUG TOOLS',
+            command=lambda: self.show_tab('debug_tools'))
+        self.btn_tab_debug.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_settings = SidebarButton(
             self.sidebar_frame, text="SETTINGS",
             command=lambda: self.show_tab("settings"))
@@ -10122,41 +14164,33 @@ class BuiltInMacroApp:
                  font=("Segoe UI", 8, "bold")).pack(fill=tk.X, anchor="w")
         self.scrub_card = tk.Frame(controls, bg=BG_PANEL)
         self.scrub_card.pack(fill=tk.X, pady=(9, 9))
-        step_controls = tk.Frame(self.scrub_card, bg=BG_PANEL)
-        step_controls.pack(fill=tk.X, pady=(0, 12))
-        for title, callback, hint, icon_name in [
-            ("", self.jump_to_start, "Home", "first"),
-            ("", self.step_backward, "Previous", "back"),
-            ("", self.step_forward, "Next", "forward"),
-            ("Step", self.run_single_step, "Execute selected action", "step"),
-        ]:
-            btn = sequent_toolbar_button(step_controls, title, callback, icon=icon_name)
-            btn.pack(side=tk.LEFT, padx=(0, 5))
-            ModernTooltip(btn, hint)
-        tk.Label(self.scrub_card, text="PLAYHEAD", bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        # Keep the scrubber and action count, but omit the redundant PLAYHEAD
+        # heading so the transport is cleaner and uses less vertical space.
         scrub_row = tk.Frame(self.scrub_card, bg=BG_PANEL)
-        scrub_row.pack(fill=tk.X, pady=(5, 9))
+        scrub_row.pack(fill=tk.X, pady=(1, 12))
         self.scrub_badge = tk.Label(scrub_row, text="[ 0 / 0 ]",
                                     bg=BG_INPUT, fg=SYNTAX_BLUE,
                                     font=("Consolas", 8, "bold"), padx=7, pady=4)
         self.scrub_badge.pack(side=tk.RIGHT)
         self.scrubber = ModernScrubberTrack(scrub_row, command=self.on_scrub)
         self.scrubber.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 7))
-        options = tk.Frame(self.scrub_card, bg=BG_PANEL)
-        options.pack(fill=tk.X, pady=(2, 4))
-        tk.Label(options, text="Repeat", bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT)
-        self.loop_var = tk.StringVar(value=self.loop_mode)
-        self.loop_menu = tk.OptionMenu(options, self.loop_var, *self.loop_options,
-                                       command=lambda val: setattr(self, 'loop_mode', val))
-        self.loop_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
-                              activeforeground=TEXT_PRIMARY, font=("Segoe UI", 9),
-                              highlightthickness=1, highlightbackground=BG_BORDER,
-                              bd=0, relief="flat", cursor="hand2")
-        self.loop_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
-                                      activebackground=COLOR_ACCENT, bd=0)
-        self.loop_menu.pack(side=tk.RIGHT)
+
+        # A centered, animated capsule, with independently customizable icons.
+        step_controls = tk.Frame(self.scrub_card, bg=BG_PANEL)
+        step_controls.pack(fill=tk.X, pady=(0, 5))
+        transport_items = [
+            ("transport.jump-to-start", "", self.jump_to_start, "Home", "first"),
+            ("transport.previous", "", self.step_backward, "Previous", "back"),
+            ("transport.next", "", self.step_forward, "Next", "forward"),
+            ("transport.skip-to-end", "", self.jump_to_end,
+             "Skip to End (select last action, do not execute)", "last"),
+        ]
+        self.transport_pillbar = SequentAnimatedPillBar(
+            step_controls, transport_items, icon_only=True)
+        self.transport_pillbar.pack(anchor="center")
+        # Named segment icons are exposed for legacy integrations and tests.
+        self.transport_buttons = dict(zip(
+            (item[0] for item in transport_items), self.transport_pillbar.icons))
         tk.Frame(controls, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=(12, 14))
         tk.Label(controls, text="CURRENT ACTION", bg=BG_PANEL, fg=TEXT_MUTED,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w")
@@ -10212,16 +14246,30 @@ class BuiltInMacroApp:
         self.action_badge.pack(side=tk.RIGHT, padx=(3, 9))
         filebar = tk.Frame(queue_dock, bg=BG_PANEL, padx=11, pady=9)
         filebar.pack(fill=tk.X)
-        self.import_macro_button = sequent_toolbar_button(filebar, "Import", self.load_macro_from_file)
-        self.import_macro_button.pack(side=tk.LEFT, padx=(0, 5))
-        sequent_toolbar_button(filebar, "Export", self.save_macro_to_file).pack(side=tk.LEFT)
+        file_actions = [
+            ("button.import", "Import", self.load_macro_from_file,
+             "Import a macro from a file", "upload"),
+            ("button.export", "Export", self.save_macro_to_file,
+             "Export the macro to a file", "download"),
+            ("button.save", "Save", self.save_current_preset,
+             "Save the loaded preset (Ctrl+S)", "save"),
+            ("button.undo", "Undo", self.undo_deleted_actions,
+             "Restore deleted queue actions (Ctrl+Z)", "undo"),
+        ]
+        self.file_action_pillbar = SequentAnimatedPillBar(filebar, file_actions)
+        self.file_action_pillbar.pack(side=tk.LEFT)
+        # Retain references for workflows that inspect these controls.
+        self.import_macro_button = self.file_action_pillbar.icons[0]
+        self.queue_undo_btn = self.file_action_pillbar.icons[3]
         
         # The lengthy instruction consumed more width than the queue could
         # supply at its default size. Keep the help accessible via a tooltip.
         help_label = tk.Label(filebar, text="?", bg=BG_PANEL, fg=TEXT_MUTED,
                               font=("Segoe UI", 9, "bold"), padx=7)
         help_label.pack(side=tk.RIGHT)
-        ModernTooltip(help_label, "Double-click to edit • Right-click for options")
+        ModernTooltip(help_label,
+                      "Double-click to edit • Right-click: Copy/Paste • "
+                      "Ctrl+A select all • Ctrl+C copy • Ctrl+V paste • Ctrl+Z undo")
 
         # --- NEW SEARCH BAR UI ---
         search_frame = tk.Frame(filebar, bg=BG_INPUT, highlightbackground=BG_BORDER, highlightthickness=1)
@@ -10252,89 +14300,385 @@ class BuiltInMacroApp:
                 seq, lambda e, x=dx, y=dy: self.nudge_active_coordinate(x, y))
 
     def build_sequencer_view(self):
-        """Independent sequencer docks: animated timeline and pinned Stage Builder."""
-        # Match Playback's dock geometry. Both docks belong to the stationary
-        # workspace, not workspace_main (which moves during sidebar animation).
+        """After Effects-inspired studio replacing the old stage-card Sequencer.
+
+        Keep chain_steps and the existing execution path intact. This is a
+        visual editor/inspector for legacy chain stages and a read-only view
+        of their nested preset actions; timeline scrubbing never executes.
+        """
+        self.studio_selected_stage = getattr(self, 'studio_selected_stage', None)
+        self.studio_selected_action = getattr(self, 'studio_selected_action', None)
+        self.studio_scrub_time = getattr(self, 'studio_scrub_time', 0.0)
         self.stage_builder_dock = ModernCard(self.workspace, bg_card=BG_PANEL)
         right = self.stage_builder_dock
         right.pack_propagate(False)
         self._place_stage_builder_dock()
-        sequent_dock_header(right, "Stage Builder", "CONFIGURE")
-        config = tk.Frame(right, bg=BG_PANEL, padx=14, pady=14)
+        sequent_dock_header(right, 'Clip Inspector', 'COMPOSITION / STAGES')
+        # The inspector is scrollable at 768p and when the window is resized.
+        inspector_scroll = ModernScrollableFrame(right, bg=BG_PANEL)
+        inspector_scroll.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 8))
+        config = tk.Frame(inspector_scroll.scrollable_frame, bg=BG_PANEL, padx=8, pady=6)
         config.pack(fill=tk.BOTH, expand=True)
 
         def field_title(text):
             tk.Label(config, text=text.upper(), bg=BG_PANEL, fg=TEXT_MUTED,
-                     font=("Segoe UI", 8, "bold"), anchor="w").pack(
-                         fill=tk.X, pady=(10, 5))
-        field_title("Macro preset")
-        self.seq_preset_var = tk.StringVar(value="-- Select Preset --")
+                     font=('Segoe UI', 8, 'bold'), anchor='w').pack(
+                         fill=tk.X, pady=(9, 4))
+
+        field_title('Add composition clip')
+        self.seq_preset_var = tk.StringVar(value='-- Select Preset --')
         self.seq_preset_menu = tk.OptionMenu(config, self.seq_preset_var,
-                                             "-- Select Preset --")
+                                             '-- Select Preset --')
         self.seq_preset_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY,
-                                    activebackground=BG_HOVER, font=("Segoe UI", 9),
+                                    activebackground=BG_HOVER, font=('Segoe UI', 9),
                                     highlightthickness=1, highlightbackground=BG_BORDER,
-                                    bd=0, relief="flat", cursor="hand2")
-        self.seq_preset_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                    bd=0, relief='flat', cursor='hand2')
+        self.seq_preset_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
                                             activebackground=COLOR_ACCENT, bd=0)
         self.seq_preset_menu.pack(fill=tk.X, ipady=3)
-        field_title("Loop count")
+        field_title('Loop count')
         self.seq_loops_entry = tk.Entry(config, bg=BG_INPUT, fg=SYNTAX_PURPLE,
                                         insertbackground=TEXT_PRIMARY,
-                                        font=("Consolas", 10), bd=0,
+                                        font=('Consolas', 10), bd=0,
                                         highlightbackground=BG_BORDER,
                                         highlightthickness=1)
-        self.seq_loops_entry.insert(0, "1")
-        self.seq_loops_entry.pack(fill=tk.X, ipady=6)
-        field_title("Post-stage delay (seconds)")
+        self.seq_loops_entry.insert(0, '1')
+        self.seq_loops_entry.pack(fill=tk.X, ipady=5)
+        field_title('Post-stage delay (seconds)')
         self.seq_delay_entry = tk.Entry(config, bg=BG_INPUT, fg=SYNTAX_BLUE,
                                         insertbackground=TEXT_PRIMARY,
-                                        font=("Consolas", 10), bd=0,
+                                        font=('Consolas', 10), bd=0,
                                         highlightbackground=BG_BORDER,
                                         highlightthickness=1)
-        self.seq_delay_entry.insert(0, "1.0")
-        self.seq_delay_entry.pack(fill=tk.X, ipady=6)
-        btn_add_stage = ModernButton(config, text="+ Add Stage",
-                                     bg_color=COLOR_ACCENT,
-                                     hover_color=COLOR_ACCENT_HOV,
-                                     command=self.add_chain_stage)
-        btn_add_stage.pack(fill=tk.X, pady=(18, 0))
-        tk.Frame(config, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=18)
-        tk.Label(config, text="CHAIN TRANSPORT", bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        self.btn_run_chain = ModernButton(config, text="Run Macro Chain (F9)",
+        self.seq_delay_entry.insert(0, '1.0')
+        self.seq_delay_entry.pack(fill=tk.X, ipady=5)
+        ModernButton(config, text='+ Add Clip', bg_color=COLOR_ACCENT,
+                     hover_color=COLOR_ACCENT_HOV,
+                     command=self.add_chain_stage).pack(fill=tk.X, pady=(12, 8))
+        tk.Frame(config, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=(8, 10))
+        field_title('Selected composition')
+        self.studio_selection_label = tk.Label(
+            config, text='Select a clip on the timeline', anchor='w',
+            bg=BG_PANEL, fg=TEXT_PRIMARY, font=('Segoe UI', 9, 'bold'),
+            wraplength=236, justify=tk.LEFT)
+        self.studio_selection_label.pack(fill=tk.X)
+        tk.Label(config, text='LOOPS    /    POST DELAY', bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(9, 3))
+        edit_row = tk.Frame(config, bg=BG_PANEL)
+        edit_row.pack(fill=tk.X)
+        self.studio_loop_edit = tk.Entry(edit_row, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                         insertbackground=TEXT_PRIMARY, bd=0,
+                                         font=('Consolas', 10), width=7)
+        self.studio_loop_edit.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5, padx=(0, 7))
+        self.studio_delay_edit = tk.Entry(edit_row, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                          insertbackground=TEXT_PRIMARY, bd=0,
+                                          font=('Consolas', 10), width=8)
+        self.studio_delay_edit.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5)
+        ModernButton(config, text='Apply Clip Properties', bg_color=BG_BORDER,
+                     hover_color=BG_HOVER,
+                     command=self.studio_apply_stage_properties).pack(fill=tk.X, pady=(9, 5))
+        reorder_row = tk.Frame(config, bg=BG_PANEL)
+        reorder_row.pack(fill=tk.X)
+        for label, fn in [('Move Up', lambda: self.studio_reorder(-1)),
+                          ('Move Down', lambda: self.studio_reorder(1))]:
+            tk.Button(reorder_row, text=label, command=fn, cursor='hand2',
+                      font=('Segoe UI', 9), bg=BG_INPUT, fg=TEXT_PRIMARY,
+                      activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
+                      bd=0, relief='flat').pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                                padx=2, ipady=6)
+        tk.Button(config, text='Remove Selected Clip',
+                  command=self.studio_remove_selected, cursor='hand2',
+                  font=('Segoe UI', 9), bg=BG_INPUT, fg=COLOR_DANGER,
+                  activebackground=BG_HOVER, bd=0, relief='flat').pack(
+                      fill=tk.X, pady=(6, 8), ipady=5)
+        self.studio_action_detail = tk.Label(
+            config, text='Double-click a clip to expand three tracks. Click diamonds to inspect events.',
+            anchor='nw', justify=tk.LEFT, bg=BG_PANEL, fg=TEXT_MUTED,
+            wraplength=238, font=('Consolas', 8))
+        self.studio_action_detail.pack(fill=tk.X, pady=(5, 10))
+        tk.Frame(config, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=(8, 10))
+        field_title('Execution')
+        self.btn_run_chain = ModernButton(config, text='Run Macro Chain (F9)',
                                           bg_color=COLOR_SUCCESS,
-                                          hover_color="#278761",
+                                          hover_color='#278761',
                                           command=self.toggle_chain_run)
-        self.btn_run_chain.pack(fill=tk.X, pady=(10, 7))
-        sequent_toolbar_button(config, "Clear All Stages", self.clear_chain).pack(fill=tk.X)
+        self.btn_run_chain.pack(fill=tk.X, pady=(7, 7))
+        sequent_toolbar_button(config, 'Clear All Clips', self.clear_chain).pack(fill=tk.X)
 
-        self.seq_timeline_dock = ModernCard(
-            self.seq_timeline_viewport, bg_card=BG_PANEL
-        )
+        self.seq_timeline_dock = ModernCard(self.seq_timeline_viewport,
+                                            bg_card=BG_PANEL)
         left = self.seq_timeline_dock
-        initial_timeline_width = self._queue_available_width(self._sidebar_visible_width)
-        left.place(
-            relx=1.0, x=0, y=-1, anchor="ne",
-            width=initial_timeline_width,
-            relheight=1.0, height=2
-        )
-        self._seq_timeline_content_width = initial_timeline_width
+        initial_width = self._queue_available_width(self._sidebar_visible_width)
+        left.place(relx=1.0, x=0, y=-1, anchor='ne', width=initial_width,
+                   relheight=1.0, height=2)
+        self._seq_timeline_content_width = initial_width
         self._place_sequencer_timeline()
-        head = sequent_dock_header(left, "Macro Chain", "STAGE TIMELINE")
-        self.chain_badge = tk.Label(head, text="0 Stages", bg=BG_INPUT,
-                                    fg=TEXT_MUTED, font=("Segoe UI", 8, "bold"),
+        head = sequent_dock_header(left, 'Automation Studio', 'COMPOSITION TIMELINE')
+        self.chain_badge = tk.Label(head, text='0 Clips', bg=BG_INPUT,
+                                    fg=TEXT_MUTED, font=('Segoe UI', 8, 'bold'),
                                     padx=8, pady=3)
         self.chain_badge.pack(side=tk.RIGHT, padx=(3, 9))
-        filebar = tk.Frame(left, bg=BG_PANEL, padx=11, pady=9)
-        filebar.pack(fill=tk.X)
-        sequent_toolbar_button(filebar, "Import Chain", self.load_chain_from_file).pack(
-            side=tk.LEFT, padx=(0, 6))
-        sequent_toolbar_button(filebar, "Export Chain", self.save_chain_to_file).pack(
-            side=tk.LEFT)
-        self.chain_scroll = ModernScrollableFrame(left, bg=BG_PANEL)
-        self.chain_scroll.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        tools = tk.Frame(left, bg=BG_PANEL, padx=10, pady=8)
+        tools.pack(fill=tk.X)
+        self.chain_action_pillbar = SequentAnimatedPillBar(tools, [
+            ('button.import-chain', 'Import Chain', self.load_chain_from_file,
+             'Import a macro chain', 'upload'),
+            ('button.export-chain', 'Export Chain', self.save_chain_to_file,
+             'Export the macro chain', 'download'),
+        ])
+        self.chain_action_pillbar.pack(side=tk.LEFT)
+        self.studio_time_label = tk.Label(tools, text='Preview  0.00s',
+                                          bg=BG_PANEL, fg=TEXT_MUTED,
+                                          font=('Consolas', 9))
+        self.studio_time_label.pack(side=tk.RIGHT, padx=(8, 0))
+        for caption, callback in [('+', lambda: self.studio_timeline.zoom(1)),
+                                  ('−', lambda: self.studio_timeline.zoom(-1)),
+                                  ('Fit', lambda: self.studio_timeline.fit())]:
+            tk.Button(tools, text=caption, command=callback, font=('Segoe UI', 9),
+                      bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
+                      activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
+                      padx=7, pady=4).pack(side=tk.RIGHT, padx=2)
+        # Resolve-inspired workspace: a resizeable browser/viewer above the timeline.
+        # The inspector remains the existing right-hand dock, preserving its commands.
+        self.studio_vertical_pane = tk.PanedWindow(
+            left, orient=tk.VERTICAL, sashwidth=7, sashrelief=tk.FLAT,
+            bg=BG_BORDER, bd=0, showhandle=False)
+        self.studio_vertical_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+        self.studio_top_pane = tk.PanedWindow(
+            self.studio_vertical_pane, orient=tk.HORIZONTAL, sashwidth=7,
+            sashrelief=tk.FLAT, bg=BG_BORDER, bd=0, showhandle=False)
+        self.studio_vertical_pane.add(self.studio_top_pane, minsize=90, stretch='never')
+        library = tk.Frame(self.studio_top_pane, bg=BG_INPUT)
+        viewer = tk.Frame(self.studio_top_pane, bg=BG_INPUT)
+        self.studio_top_pane.add(library, minsize=150)
+        self.studio_top_pane.add(viewer, minsize=160)
+        tk.Label(library, text='MACRO LIBRARY', anchor='w', bg=BG_INPUT,
+                 fg=TEXT_MUTED, font=('Segoe UI', 9, 'bold')).pack(fill=tk.X, padx=10, pady=(8, 6))
+        library_tools = tk.Frame(library, bg=BG_INPUT)
+        library_tools.pack(fill=tk.X, padx=8)
+        tk.Button(library_tools, text='Refresh', command=self.studio_refresh_library,
+                  bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
+                  relief='flat', bd=0, cursor='hand2').pack(side=tk.LEFT)
+        tk.Button(library_tools, text='Add Selected', command=self.studio_add_library_preset,
+                  bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
+                  relief='flat', bd=0, cursor='hand2').pack(side=tk.RIGHT)
+        self.studio_library_list = tk.Listbox(
+            library, bg=BG_INPUT, fg=TEXT_PRIMARY, selectbackground=COLOR_ACCENT,
+            selectforeground='#FFFFFF', highlightthickness=0, bd=0,
+            font=('Segoe UI', 9), exportselection=False, activestyle='none')
+        self.studio_library_list.pack(fill=tk.BOTH, expand=True, padx=7, pady=(6, 7))
+        self.studio_library_list.bind('<Double-Button-1>',
+                                      lambda _e: self.studio_add_library_preset())
+        tk.Label(viewer, text='EXECUTION PREVIEW  •  SAFE / READ-ONLY',
+                 anchor='w', bg=BG_INPUT, fg=TEXT_MUTED,
+                 font=('Segoe UI', 9, 'bold')).pack(fill=tk.X, padx=10, pady=(8, 6))
+        self.studio_preview_canvas = tk.Canvas(
+            viewer, bg=BG_APP, bd=0, highlightthickness=0)
+        self.studio_preview_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+        self.studio_preview_canvas.bind('<Configure>',
+                                        lambda _e: self.studio_draw_preview())
+        self.studio_preview_caption = tk.Label(
+            viewer, text='Select a macro clip or a recorded event to inspect it.',
+            bg=BG_INPUT, fg=TEXT_MUTED, font=('Segoe UI', 8), anchor='w')
+        self.studio_preview_caption.pack(fill=tk.X, padx=10, pady=(0, 8))
+        self.studio_timeline = StudioTimeline(
+            self.studio_vertical_pane, steps_getter=lambda: self.chain_steps,
+            presets_dir_getter=lambda: self.presets_dir,
+            colors_getter=lambda: {
+                'panel': BG_PANEL, 'background': BG_APP, 'row': BG_INPUT,
+                'grid': BG_BORDER, 'border': BG_BORDER, 'text': TEXT_PRIMARY,
+                'muted': TEXT_MUTED, 'accent': COLOR_ACCENT,
+                'success': COLOR_SUCCESS},
+            on_select=self.studio_select, on_scrub=self.studio_scrub)
+        self.studio_vertical_pane.add(self.studio_timeline, minsize=130, stretch='always')
+        self.studio_refresh_library()
+        self.root.after_idle(self.studio_restore_layout)
+        tk.Label(left, text='Double-click clip: three tracks    •    Click diamonds: inspect events    •    Ruler: preview only    •    Ctrl + wheel: zoom    •    Dense markers cluster visually',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 anchor='w').pack(fill=tk.X, padx=13, pady=(0, 8))
         self.refresh_chain_ui()
+
+    def studio_restore_layout(self):
+        """Apply sensible first-open sash positions after geometry is measured."""
+        pane = getattr(self, 'studio_vertical_pane', None)
+        if not pane or not pane.winfo_exists():
+            return
+        try:
+            height = pane.winfo_height()
+            width = self.studio_top_pane.winfo_width()
+            if height > 280:
+                pane.sash_place(0, 1, max(105, min(255, int(height * .32))))
+            if width > 350:
+                self.studio_top_pane.sash_place(0, max(150, int(width * .36)), 1)
+        except tk.TclError:
+            pass
+
+    def studio_refresh_library(self):
+        """Read available JSON presets without loading or executing them."""
+        widget = getattr(self, 'studio_library_list', None)
+        if widget is None or not widget.winfo_exists():
+            return
+        previous = widget.get(widget.curselection()[0]) if widget.curselection() else None
+        widget.delete(0, tk.END)
+        from pathlib import Path
+        try:
+            names = sorted((f.stem for f in Path(self.presets_dir).glob('*.json')
+                            if f.name.lower() != 'globals.json'), key=str.casefold)
+        except (OSError, TypeError):
+            names = []
+        for name in names:
+            widget.insert(tk.END, name)
+        if previous in names:
+            widget.selection_set(names.index(previous))
+
+    def studio_add_library_preset(self):
+        """Route through the existing stage creation callback and defaults."""
+        widget = getattr(self, 'studio_library_list', None)
+        if widget is None or not widget.curselection():
+            self.update_status('Select a macro in the Studio Library', COLOR_DANGER)
+            return
+        name = widget.get(widget.curselection()[0])
+        self.seq_preset_var.set(name)
+        self.add_chain_stage()
+
+    def studio_draw_preview(self):
+        """Non-executing visualization of the selected event and its coordinates."""
+        canvas = getattr(self, 'studio_preview_canvas', None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+        canvas.delete('all')
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if width < 20 or height < 20:
+            return
+        cx, cy = width/2, height/2
+        canvas.create_line(cx, 14, cx, height-14, fill=BG_BORDER, dash=(3, 5))
+        canvas.create_line(14, cy, width-14, cy, fill=BG_BORDER, dash=(3, 5))
+        stage_index = getattr(self, 'studio_selected_stage', None)
+        action_index = getattr(self, 'studio_selected_action', None)
+        if stage_index is None or not 0 <= stage_index < len(self.chain_steps):
+            canvas.create_text(cx, cy, text='SELECT A CLIP', fill=TEXT_MUTED,
+                               font=('Segoe UI', 11, 'bold'))
+            return
+        stage = self.chain_steps[stage_index]
+        canvas.create_text(12, 13, anchor='nw', text=str(stage['preset'])[:65],
+                           fill=TEXT_PRIMARY, font=('Segoe UI', 10, 'bold'))
+        if action_index is None:
+            canvas.create_text(cx, cy, text='Select a keyframe to inspect its data',
+                               fill=TEXT_MUTED, font=('Segoe UI', 9))
+            return
+        actions, error = load_preset_actions(self.presets_dir, stage['preset'])
+        if not 0 <= action_index < len(actions):
+            return
+        action = actions[action_index]
+        canvas.create_text(12, 36, anchor='nw', text=f'Event {action_index+1}: {action.get("type", "unknown")}',
+                           fill=TEXT_MUTED, font=('Segoe UI', 9))
+        # This is an indicative coordinate diagram, not a screenshot or input injection.
+        data = action.get('params', action)
+        try:
+            x = float(data.get('x', action.get('x')))
+            y = float(data.get('y', action.get('y')))
+        except (TypeError, ValueError, AttributeError):
+            canvas.create_text(cx, cy, text='No coordinate preview for this event',
+                               fill=TEXT_MUTED, font=('Segoe UI', 9))
+            return
+        # Scale arbitrary desktop coordinates into a reference grid only.
+        px = max(20, min(width-20, 20 + (x / max(1920.0, abs(x)+100.0)) * (width-40)))
+        py = max(40, min(height-20, 40 + (y / max(1080.0, abs(y)+100.0)) * (height-60)))
+        canvas.create_oval(px-6, py-6, px+6, py+6, fill=COLOR_ACCENT, outline='')
+        canvas.create_line(px-14, py, px+14, py, fill=TEXT_PRIMARY)
+        canvas.create_line(px, py-14, px, py+14, fill=TEXT_PRIMARY)
+        canvas.create_text(px, min(height-8,py+18), text=f'({x:g}, {y:g})',
+                           fill=TEXT_PRIMARY, font=('Consolas', 9))
+
+    def studio_scrub(self, seconds):
+        self.studio_scrub_time = max(0.0, float(seconds))
+        if hasattr(self, 'studio_time_label') and self.studio_time_label.winfo_exists():
+            self.studio_time_label.configure(text=f'Preview  {seconds:.2f}s')
+
+    def studio_select(self, index, action_index=None):
+        if not 0 <= index < len(self.chain_steps):
+            return
+        self.studio_selected_stage = index
+        self.studio_selected_action = action_index
+        stage = self.chain_steps[index]
+        self.studio_draw_preview()
+        self.studio_selection_label.configure(text=f"#{index + 1}  {stage['preset']}")
+        for entry, value in ((self.studio_loop_edit, stage['loops']),
+                             (self.studio_delay_edit, stage['delay_after'])):
+            entry.delete(0, tk.END)
+            entry.insert(0, str(value))
+        if action_index is None:
+            self.studio_action_detail.configure(
+                text='Double-click the clip to show Mouse Movement,\n'
+                     'Mouse Clicks, and Macro Logic tracks.\n'
+                     'Select a diamond to inspect its original event.')
+        else:
+            actions, error = load_preset_actions(self.presets_dir, stage['preset'])
+            if 0 <= action_index < len(actions):
+                action = actions[action_index]
+                details = json.dumps(action, indent=2, ensure_ascii=False)
+                if len(details) > 450:
+                    details = details[:450] + '\n… (preview shortened)'
+                note = getattr(self.studio_timeline, 'selected_marker_info', None)
+                prefix = ''
+                if note and note.get('action_index') == action_index and note.get('stage_index') == index:
+                    track_title = dict(movement='Mouse Movement', clicks='Mouse Clicks',
+                                       logic='Macro Logic').get(note['track'], note['track'])
+                    prefix = f"{track_title}: {note['label']}\n"
+                    if note['clustered'] > 1:
+                        prefix += f"{note['clustered']:,} markers overlap here — zoom in to inspect individually.\n"
+                self.studio_action_detail.configure(
+                    text=prefix+f'Action {action_index + 1}: {action.get("type", "unknown")}\n'
+                         + details)
+            else:
+                self.studio_action_detail.configure(text=error or 'Action unavailable')
+
+    def studio_apply_stage_properties(self):
+        index = getattr(self, 'studio_selected_stage', None)
+        if self.chain_running or self.playing or self.recording:
+            self.update_status('Stop execution before editing clips', COLOR_DANGER)
+            return
+        if index is None or not 0 <= index < len(self.chain_steps):
+            self.update_status('Select a composition clip first', COLOR_DANGER)
+            return
+        try:
+            loops = int(self.studio_loop_edit.get().strip())
+            delay = float(self.studio_delay_edit.get().strip())
+            if not 1 <= loops <= 100000 or not math.isfinite(delay) or not 0 <= delay <= 86400:
+                raise ValueError('Values out of range')
+        except (ValueError, OverflowError):
+            self.update_status('Enter loops 1–100000 and delay 0–86400s', COLOR_DANGER)
+            return
+        stage = self.chain_steps[index]
+        stage['loops'], stage['delay_after'] = loops, delay
+        self.refresh_chain_ui()
+        self.update_status('Clip properties updated', COLOR_SUCCESS)
+
+    def studio_reorder(self, direction):
+        index = getattr(self, 'studio_selected_stage', None)
+        if self.chain_running or self.playing or self.recording or index is None:
+            return
+        if 0 <= index < len(self.chain_steps):
+            target = index + direction
+            if 0 <= target < len(self.chain_steps):
+                self.chain_steps[index], self.chain_steps[target] = (
+                    self.chain_steps[target], self.chain_steps[index])
+                self.studio_selected_stage = target
+                self.studio_selected_action = None
+                self.studio_timeline.expanded.clear()
+                self.refresh_chain_ui()
+
+    def studio_remove_selected(self):
+        index = getattr(self, 'studio_selected_stage', None)
+        if self.chain_running or self.playing or self.recording or index is None:
+            return
+        if 0 <= index < len(self.chain_steps):
+            self.chain_steps.pop(index)
+            self.studio_selected_stage = min(index, len(self.chain_steps) - 1) if self.chain_steps else None
+            self.studio_selected_action = None
+            self.studio_timeline.expanded.clear()
+            self.refresh_chain_ui()
+            self.update_status('Composition clip removed', TEXT_MUTED)
 
     def refresh_sequencer_preset_dropdown(self):
         menu = self.seq_preset_menu["menu"]
@@ -10365,6 +14709,8 @@ class BuiltInMacroApp:
             return
 
         self.chain_steps.append({"preset": preset, "loops": loops, "delay_after": delay})
+        self.studio_selected_stage = len(self.chain_steps) - 1
+        self.studio_selected_action = None
         self.refresh_chain_ui()
         self.update_status(f"Added '{preset}' to Chain", COLOR_SUCCESS)
 
@@ -10380,89 +14726,44 @@ class BuiltInMacroApp:
         target = idx + direction
         if 0 <= target < len(self.chain_steps):
             self.chain_steps[idx], self.chain_steps[target] = self.chain_steps[target], self.chain_steps[idx]
+            self.studio_timeline.expanded.clear()
             self.refresh_chain_ui()
 
     def clear_chain(self):
         if self.chain_running: return
         self.chain_steps.clear()
+        self.studio_selected_stage = None
+        self.studio_selected_action = None
+        self.studio_timeline.expanded.clear()
         self.refresh_chain_ui()
         self.update_status("Cleared chain stages", TEXT_MUTED)
 
     def refresh_chain_ui(self):
-        container = self.chain_scroll.scrollable_frame
-        for w in container.winfo_children():
-            w.destroy()
-
+        """Refresh the Automation Studio without modifying chain semantics."""
         count = len(self.chain_steps)
-        self.chain_badge.config(
-            text=f"{count} Stage{'s' if count != 1 else ''}",
-            fg=COLOR_SUCCESS if count > 0 else TEXT_MUTED
-        )
-
-        if not self.chain_steps:
-            tk.Label(
-                container, text="// Chain is empty. Add presets above to build a pipeline.",
-                font=("Consolas", 9), bg=BG_APP, fg=TEXT_MUTED
-            ).pack(anchor="w", padx=10, pady=20)
-            return
-
-        for idx, stage in enumerate(self.chain_steps):
-            is_active = (self.chain_running and self.current_chain_stage == idx)
-            card_bg = BG_HEADER if is_active else BG_PANEL
-            border = COLOR_SUCCESS if is_active else BG_BORDER
-
-            card = ModernCard(container, bg_card=card_bg, border_color=border)
-            card.pack(fill=tk.X, pady=(0, 6))
-
-            row = tk.Frame(card, bg=card_bg, padx=10, pady=8)
-            row.pack(fill=tk.X)
-
-            # Stage number badge
-            num_lbl = tk.Label(
-                row, text=f"Stage #{idx + 1}", font=("Segoe UI", 8, "bold"),
-                bg=COLOR_ACCENT if not is_active else COLOR_SUCCESS,
-                fg=TEXT_ON_ACCENT if not is_active else "#ffffff", padx=6, pady=2
-            )
-            num_lbl.pack(side=tk.LEFT, padx=(0, 10))
-
-            # Preset Name
-            tk.Label(
-                row, text=stage["preset"], font=("Consolas", 10, "bold"),
-                bg=card_bg, fg=TEXT_PRIMARY
-            ).pack(side=tk.LEFT, padx=(0, 12))
-
-            # Loops Badge
-            tk.Label(
-                row, text=f"{stage['loops']}x Loop", font=("Segoe UI", 8, "bold"),
-                bg=BG_INPUT, fg=SYNTAX_PURPLE, padx=6, pady=2,
-                highlightbackground=BG_BORDER, highlightthickness=1
-            ).pack(side=tk.LEFT, padx=(0, 6))
-
-            # Post-Delay Badge
-            tk.Label(
-                row, text=f"+{stage['delay_after']:.1f}s Delay", font=("Segoe UI", 8, "bold"),
-                bg=BG_INPUT, fg=SYNTAX_BLUE, padx=6, pady=2,
-                highlightbackground=BG_BORDER, highlightthickness=1
-            ).pack(side=tk.LEFT)
-
-            # Delete Stage Button
-            btn_del = tk.Label(row, text=" ✕ ", font=("Segoe UI", 9, "bold"), bg=card_bg, fg=TEXT_MUTED, cursor="hand2")
-            btn_del.pack(side=tk.RIGHT, padx=(4, 0))
-            btn_del.bind("<Button-1>", lambda e, i=idx: self.remove_chain_stage(i))
-            btn_del.bind("<Enter>", lambda e, w=btn_del: w.config(fg="white", bg=COLOR_DANGER))
-            btn_del.bind("<Leave>", lambda e, w=btn_del, bg=card_bg: w.config(fg=TEXT_MUTED, bg=bg))
-
-            # Move Down Button
-            if idx < count - 1:
-                btn_down = tk.Label(row, text=" ▼ ", font=("Segoe UI", 8), bg=BG_INPUT, fg=TEXT_MUTED, cursor="hand2", padx=4, pady=2)
-                btn_down.pack(side=tk.RIGHT, padx=(2, 2))
-                btn_down.bind("<Button-1>", lambda e, i=idx: self.move_chain_stage(i, 1))
-
-            # Move Up Button
-            if idx > 0:
-                btn_up = tk.Label(row, text=" ▲ ", font=("Segoe UI", 8), bg=BG_INPUT, fg=TEXT_MUTED, cursor="hand2", padx=4, pady=2)
-                btn_up.pack(side=tk.RIGHT, padx=(2, 2))
-                btn_up.bind("<Button-1>", lambda e, i=idx: self.move_chain_stage(i, -1))
+        if hasattr(self, 'chain_badge') and self.chain_badge.winfo_exists():
+            self.chain_badge.configure(
+                text=f"{count} Clip{'s' if count != 1 else ''}",
+                fg=COLOR_SUCCESS if count else TEXT_MUTED)
+        timeline = getattr(self, 'studio_timeline', None)
+        if timeline is not None and timeline.winfo_exists():
+            index = getattr(self, 'studio_selected_stage', None)
+            if index is not None and index >= count:
+                index = count-1 if count else None
+                self.studio_selected_stage = index
+                self.studio_selected_action = None
+            timeline.selected_stage = index
+            timeline.selected_action = getattr(self, 'studio_selected_action', None)
+            timeline.running_stage = self.current_chain_stage if self.chain_running else -1
+            timeline.redraw()
+            if hasattr(self, 'studio_preview_canvas'):
+                self.studio_draw_preview()
+            if index is not None:
+                self.studio_select(index, self.studio_selected_action)
+            elif hasattr(self, 'studio_selection_label'):
+                self.studio_selection_label.configure(text='Select a clip on the timeline')
+                self.studio_action_detail.configure(
+                    text='Double-click a clip to inspect its actions.')
 
     def save_chain_to_file(self):
         if not self.chain_steps:
@@ -10511,6 +14812,9 @@ class BuiltInMacroApp:
                                 "delay_after": max(0.0, float(item.get("delay_after", 1.0)))
                             })
                     self.chain_steps = validated
+                    self.studio_selected_stage = 0 if validated else None
+                    self.studio_selected_action = None
+                    self.studio_timeline.expanded.clear()
                     self.refresh_chain_ui()
                     self.update_status("Imported Chain", COLOR_SUCCESS)
                 else:
@@ -10722,6 +15026,13 @@ class BuiltInMacroApp:
                 return (f'{mode}: {target}' if target and mode in
                         ('Run Saved Macro', 'Jump to Label') else mode)
             return f'{name} | Found: {describe(found, found_target)} | Not found: {describe(missing, missing_target)}'
+        if act_type in ('compare_text', 'compare_variables'):
+            if act_type == 'compare_variables':
+                return (f"variables.compare({action.get('left_value','')!r}, "
+                        f"{action.get('right_value','')!r}, {action.get('mode','Exact Match')})")
+            left = action.get('left_source', 'Literal Text')
+            right = action.get('right_source', 'Literal Text')
+            return f"text.compare({left} vs {right}, {action.get('mode','Exact Match')})"
         if act_type == 'run_macro':
             target = str(action.get('preset', '')).strip()
             mode = action.get('mode', 'Run & Return')
@@ -10746,18 +15057,22 @@ class BuiltInMacroApp:
             preview = (msg[:24] + "..") if len(msg) > 26 else msg
             return f"ui.disclaimer('{preview}')"
         elif act_type == "if_var":
-            op = action.get("op", "==")
-            v_name = action.get("var_name", "status")
-            v_val = action.get("val", "")
-            t_type = action.get("target_type", "preset")
-            tgt = action.get("target", "")
-            if t_type == "label":
-                return f"flow.if('{v_name}' {op} '{v_val}' ➔ goto '{tgt}')"
-            elif t_type == "preset":
-                return f"flow.if('{v_name}' {op} '{v_val}' ➔ preset '{tgt}')"
-            elif t_type == "file":
-                fname = os.path.basename(tgt)
-                return f"flow.if('{v_name}' {op} '{v_val}' ➔ run '{fname}')"
+            op = action.get('op', '==')
+            v_name = action.get('var_name', 'status')
+            rhs = (action.get('match_var_name', '') if action.get('match_source') == 'variable'
+                   else repr(action.get('val', '')))
+            t_type = action.get('target_type', 'preset')
+            tgt = action.get('target', '')
+            if t_type == 'set_variable':
+                value = ('@' + action.get('set_source_name','') if action.get('set_value_source') == 'variable'
+                         else repr(action.get('set_value', '')))
+                return f'flow.if({v_name} {op} {rhs} ➔ set {tgt} = {value})'
+            if t_type == 'continue': return f'flow.if({v_name} {op} {rhs} ➔ continue)'
+            if t_type == 'stop': return f'flow.if({v_name} {op} {rhs} ➔ stop)'
+            if t_type == 'error': return f'flow.if({v_name} {op} {rhs} ➔ error)'
+            if t_type == 'label': return f'flow.if({v_name} {op} {rhs} ➔ goto {tgt})'
+            if t_type == 'preset': return f'flow.if({v_name} {op} {rhs} ➔ preset {tgt})'
+            if t_type == 'file': return f'flow.if({v_name} {op} {rhs} ➔ run {os.path.basename(tgt)})'
         elif act_type == "drag": 
             return f"mouse.drag(({action.get('start_x')},{action.get('start_y')}) ➔ ({action.get('end_x')},{action.get('end_y')}))"
         elif act_type == "scroll": 
@@ -10768,6 +15083,11 @@ class BuiltInMacroApp:
         elif act_type == "wait_text":
             return f"ocr.wait_text({action.get('text', '')!r}, {action.get('mode', 'appears')})"
         elif act_type == "read_clipboard":
+            if action.get('mode', 'keywords') == 'file':
+                name = os.path.basename(str(action.get('path', 'defect_description.txt')))
+                suffix = (f" + {action.get('var_scope', 'local')} variable"
+                          if action.get('also_set_variable') else '')
+                return f'clipboard.to_file({name!r}){suffix}'
             if action.get('mode', 'keywords') == 'capture':
                 return (f"clipboard.capture() -> {action.get('var_scope', 'local').title()} "
                         f"${action.get('var_name', 'clipboard_text')}")
@@ -10854,7 +15174,7 @@ class BuiltInMacroApp:
 
     def get_action_color(self, action):
         act_type = action.get("type", "") if action else ""
-        if act_type in ("label", "goto", "if_var", "read_clipboard", "type_variable", "prompt_input"): return SYNTAX_PURPLE
+        if act_type in ("label", "goto", "if_var", "compare_text", "compare_variables", "read_clipboard", "type_variable", "prompt_input"): return SYNTAX_PURPLE
         if act_type in DYNAMIC_ACTION_TYPES: return SYNTAX_GREEN if act_type not in DYNAMIC_FLOW_TYPES else SYNTAX_PURPLE
         if act_type == "disclaimer": return SYNTAX_ORANGE
         if act_type in ("wait_pixel", "wait_text", "find_color", "find_text"): return COLOR_SUCCESS
@@ -10939,6 +15259,13 @@ class BuiltInMacroApp:
     def jump_to_start(self):
         if (self.recording and not self.recording_paused) or self.playing or not self.recorded_actions: return
         self.current_action_idx = 0
+        self.update_scrubber_ui()
+
+    def jump_to_end(self):
+        """Select the last queued action without executing it or changing the macro."""
+        if (self.recording and not self.recording_paused) or self.playing or not self.recorded_actions:
+            return
+        self.current_action_idx = len(self.recorded_actions) - 1
         self.update_scrubber_ui()
 
     def step_backward(self):
@@ -11082,6 +15409,13 @@ class BuiltInMacroApp:
                 if self.audio_cues: play_cue('match')
                 report(f"Clipboard saved to {saved['scope'].title()} variable "
                        f"'{saved['variable']}' ({saved['length']} characters)", COLOR_SUCCESS)
+            elif mode == 'file':
+                saved = sequent_clipboard_to_file(self, action)
+                if self.audio_cues: play_cue('match')
+                destination = (f"; also saved to {saved['scope'].title()} variable '{saved['variable']}'"
+                               if saved['variable'] else '')
+                report(f"Clipboard saved to {os.path.basename(saved['path'])!r} "
+                       f"({saved['length']} characters){destination}", COLOR_SUCCESS)
             elif mode == 'keywords':
                 results = apply_clipboard_keyword_rules(self, action)
                 if results:
@@ -11102,7 +15436,9 @@ class BuiltInMacroApp:
                     "Click the destination field before Type Variable, or start "
                     "playback with the global hotkey while the destination is focused."
                 )
-            type_string(val, self.playback_speed)
+            # A persisted description may contain arbitrary punctuation;
+            # don't translate it through the active keyboard layout.
+            type_variable_text(val, self.playback_speed)
             report(f"Typed variable '{var_name}' ({len(val)} characters)", COLOR_SUCCESS)
         elif act_type == "key":
             type_string(str(action.get("key", "")), self.playback_speed)
@@ -11215,36 +15551,222 @@ class BuiltInMacroApp:
         desc = "Any Text" if match_any else f"'{text}'"
         self.update_status(f"Added Area Search: {desc}", COLOR_SUCCESS)
 
+    def _snapshot_queue_for_undo(self):
+        """Copy complete queue state for undo of deletion, paste, or reorder."""
+        return {
+            'actions': copy.deepcopy(self.recorded_actions),
+            'breakpoints': set(self.breakpoints),
+            'playhead': self.current_action_idx,
+            'source': self.current_source_label,
+        }
+
+    def _queue_matches_snapshot(self, snapshot):
+        # Navigation alone shouldn't invalidate an action deletion undo.
+        return (self.recorded_actions == snapshot['actions'] and
+                self.breakpoints == snapshot['breakpoints'] and
+                self.current_source_label == snapshot['source'])
+
+    def _clear_queue_undo(self):
+        self._queue_undo_history.clear()
+        self._queue_redo_history.clear()
+
+    def _begin_queue_deletion(self):
+        """Break history if another editor changed the queue since the last edit."""
+        before = self._snapshot_queue_for_undo()
+        if (self._queue_undo_history and
+                not self._queue_matches_snapshot(self._queue_undo_history[-1]['after'])):
+            self._queue_undo_history.clear()
+        self._queue_redo_history.clear()
+        return before
+
+    def _finish_queue_deletion(self, before, description):
+        self._queue_undo_history.append({
+            'before': before,
+            'after': self._snapshot_queue_for_undo(),
+            'description': description,
+        })
+        if len(self._queue_undo_history) > self._queue_undo_limit:
+            self._queue_undo_history.pop(0)
+        self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+        self.update_status(f"{description} — Ctrl+Z to undo", COLOR_SUCCESS)
+
+    def _restore_queue_snapshot(self, snapshot):
+        # Restores deleted actions at their exact index, nested configuration,
+        # breakpoints, and the pre-deletion playhead.
+        self.recorded_actions = copy.deepcopy(snapshot['actions'])
+        self.breakpoints = set(snapshot['breakpoints'])
+        self.current_action_idx = snapshot['playhead']
+        self.current_source_label = snapshot['source']
+        self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+
+    def undo_deleted_actions(self):
+        """Ctrl+Z: undo a queue deletion, paste or reorder; leave text fields alone."""
+        if self.recording or self.playing or self.chain_running:
+            self.update_status('Stop recording/playback before undoing deletion', COLOR_DANGER)
+            return False
+        if not self._queue_undo_history:
+            self.update_status('Nothing to undo', TEXT_MUTED)
+            return False
+        entry = self._queue_undo_history[-1]
+        if not self._queue_matches_snapshot(entry['after']):
+            self._clear_queue_undo()
+            self.update_status('Undo history expired: queue was edited or replaced', COLOR_DANGER)
+            return False
+        self._queue_undo_history.pop()
+        self._restore_queue_snapshot(entry['before'])
+        self._queue_redo_history.append(entry)
+        self.update_status(f"Undid: {entry['description']} (Ctrl+Y to redo)", COLOR_SUCCESS)
+        return True
+
+    def redo_deleted_actions(self):
+        """Ctrl+Y (or Ctrl+Shift+Z): redo the last undone queue edit."""
+        if self.recording or self.playing or self.chain_running:
+            self.update_status('Stop recording/playback before redoing deletion', COLOR_DANGER)
+            return False
+        if not self._queue_redo_history:
+            self.update_status('Nothing to redo', TEXT_MUTED)
+            return False
+        entry = self._queue_redo_history[-1]
+        if not self._queue_matches_snapshot(entry['before']):
+            self._clear_queue_undo()
+            self.update_status('Redo history expired: queue was edited or replaced', COLOR_DANGER)
+            return False
+        self._queue_redo_history.pop()
+        self._restore_queue_snapshot(entry['after'])
+        self._queue_undo_history.append(entry)
+        self.update_status(f"Redid: {entry['description']}", TEXT_MUTED)
+        return True
+
+    def _queue_shortcut_allowed(self, event):
+        """Keep Ctrl+Z native in entry widgets and in secondary dialogs."""
+        widget = event.widget
+        if widget.winfo_toplevel() != self.root:
+            return False
+        if (widget is not getattr(getattr(self, 'queue_viewer', None), 'code_text', None) and
+                widget.winfo_class() in
+                ('Entry', 'TEntry', 'Text', 'Spinbox', 'TSpinbox', 'TCombobox',
+                 'Listbox', 'TListbox')):
+            return False
+        return True
+
+    def _on_queue_undo_shortcut(self, event):
+        if not self._queue_shortcut_allowed(event):
+            return None
+        if bool(event.state & 0x0001):
+            self.redo_deleted_actions()  # Ctrl+Shift+Z
+        else:
+            self.undo_deleted_actions()
+        return 'break'
+
+    def _on_queue_redo_shortcut(self, event):
+        if not self._queue_shortcut_allowed(event):
+            return None
+        self.redo_deleted_actions()
+        return 'break'
+
+    def copy_queue_actions(self, indices=None):
+        """Copy complete action dictionaries, not the formatted queue text.
+
+        Clipboard content stays in Sequent and survives loading another macro;
+        it never overwrites CF_UNICODETEXT used by real clipboard actions.
+        """
+        if indices is None:
+            indices = self.queue_viewer.selected_action_indices()
+        indices = sorted(set(i for i in indices
+                             if isinstance(i, int) and 0 <= i < len(self.recorded_actions)))
+        if not indices:
+            self.update_status('No queue actions to copy', TEXT_MUTED)
+            return False
+        self._queue_action_clipboard = {
+            'actions': copy.deepcopy([self.recorded_actions[i] for i in indices]),
+            'breakpoints': [position for position, i in enumerate(indices)
+                            if i in self.breakpoints],
+        }
+        count = len(indices)
+        self.update_status(f'Copied {count} action(s) — Ctrl+V to paste', COLOR_SUCCESS)
+        return True
+
+    def paste_queue_actions(self, index=None):
+        """Insert independent action copies after the selection or at *index*.
+
+        Explicit index means insert BEFORE that zero-based action (used by the
+        right-click menu). The normal shortcut pastes AFTER the last selected
+        action, or at index zero into an empty queue.
+        """
+        if self.recording or self.playing or self.chain_running:
+            self.update_status('Stop recording/playback before pasting actions', COLOR_DANGER)
+            return False
+        clip = self._queue_action_clipboard
+        if not clip or not clip.get('actions'):
+            self.update_status('Copy an Action Queue item first (Ctrl+C)', TEXT_MUTED)
+            return False
+        if index is None:
+            selected = self.queue_viewer.selected_action_indices()
+            index = selected[-1] + 1 if selected else 0
+        index = max(0, min(int(index), len(self.recorded_actions)))
+        pasted = copy.deepcopy(clip['actions'])
+        amount = len(pasted)
+        before = self._begin_queue_deletion()  # Shared undo/redo snapshot journal.
+        self.recorded_actions[index:index] = pasted
+        self.breakpoints = ({bp + amount if bp >= index else bp
+                             for bp in self.breakpoints} |
+                            {index + relative for relative in clip.get('breakpoints', ())
+                             if 0 <= relative < amount})
+        self.current_action_idx = index
+        self._finish_queue_deletion(before, f'Pasted {amount} action(s)')
+        self.queue_viewer.select_action_range(index, index + amount - 1)
+        return True
+
     def delete_action(self, index):
         if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused): return
         if 0 <= index < len(self.recorded_actions):
+            before = self._begin_queue_deletion()
             act = self.recorded_actions.pop(index)
-            if self.current_action_idx >= len(self.recorded_actions):
-                self.current_action_idx = max(0, len(self.recorded_actions) - 1)
-            self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-            act_type = act.get("type", "action")
-            self.update_status(f"Deleted {act_type} (Action #{index + 1})", COLOR_DANGER)
+            self.breakpoints = {bp - 1 if bp > index else bp
+                                for bp in self.breakpoints if bp != index}
+            if self.current_action_idx > index:
+                self.current_action_idx -= 1
+            elif self.current_action_idx == index:
+                self.current_action_idx = min(index, len(self.recorded_actions) - 1)
+            self.current_action_idx = max(0, self.current_action_idx)
+            act_type = act.get('type', 'action')
+            self._finish_queue_deletion(before, f"Deleted {act_type} (Action #{index + 1})")
 
     def delete_action_range(self, start_idx, end_idx):
         if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused): return
         start_idx = max(0, start_idx)
         end_idx = min(len(self.recorded_actions) - 1, end_idx)
         if start_idx <= end_idx:
+            before = self._begin_queue_deletion()
             count = end_idx - start_idx + 1
             del self.recorded_actions[start_idx:end_idx + 1]
-            if self.current_action_idx >= len(self.recorded_actions):
-                self.current_action_idx = max(0, len(self.recorded_actions) - 1)
-            self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-            self.update_status(f"Deleted {count} action(s)", COLOR_DANGER)
+            self.breakpoints = {bp if bp < start_idx else bp - count
+                                for bp in self.breakpoints
+                                if bp < start_idx or bp > end_idx}
+            if self.current_action_idx > end_idx:
+                self.current_action_idx -= count
+            elif self.current_action_idx >= start_idx:
+                self.current_action_idx = start_idx
+            self.current_action_idx = max(0, min(self.current_action_idx,
+                                                  len(self.recorded_actions) - 1))
+            self._finish_queue_deletion(before, f"Deleted {count} action(s)")
 
     def remove_all_mouse_moves(self):
         if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused): return
-        initial_len = len(self.recorded_actions)
-        self.recorded_actions = [a for a in self.recorded_actions if a.get("type") != "move"]
-        removed = initial_len - len(self.recorded_actions)
-        self.current_action_idx = 0
-        self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-        self.update_status(f"Removed {removed} mouse move(s)", COLOR_SUCCESS)
+        kept = [i for i, action in enumerate(self.recorded_actions)
+                if action.get('type') != 'move']
+        removed = len(self.recorded_actions) - len(kept)
+        if not removed:
+            self.update_status('No mouse moves to remove', TEXT_MUTED)
+            return
+        before = self._begin_queue_deletion()
+        idx_map = {old: new for new, old in enumerate(kept)}
+        self.recorded_actions = [self.recorded_actions[i] for i in kept]
+        self.breakpoints = {idx_map[i] for i in self.breakpoints if i in idx_map}
+        new_selection = next((i for i in kept if i >= self.current_action_idx),
+                             kept[-1] if kept else None)
+        self.current_action_idx = idx_map[new_selection] if new_selection is not None else 0
+        self._finish_queue_deletion(before, f"Removed {removed} mouse move(s)")
 
     def start_pixel_inspection(self, callback):
         """Creates a crosshair canvas, hiding it before sampling so true desktop colors are captured."""
@@ -11982,7 +16504,9 @@ try {{
             self.finish_macro("failed", "Macro file not found")
             return
 
-        self.on_preset_file_selected(preset_name, preset_file)
+        if not self.on_preset_file_selected(preset_name, preset_file):
+            self.finish_macro('cancelled')
+            return
         self.update_status(f"Switching to '{preset_name}'...", COLOR_ACCENT)
         self.root.after(150, self.start_macro)
 
@@ -11994,7 +16518,9 @@ try {{
             return
 
         stem = os.path.splitext(os.path.basename(file_path))[0]
-        self.on_preset_file_selected(stem, file_path)
+        if not self.on_preset_file_selected(stem, file_path):
+            self.finish_macro('cancelled')
+            return
         self.update_status(f"Switching to '{stem}'...", COLOR_ACCENT)
         self.root.after(150, self.start_macro)
 
@@ -12028,6 +16554,7 @@ try {{
                 self.clicks_and_keys_only = config.get("clicks_and_keys_only", False)
                 self.window_relative = config.get("window_relative", False)
                 self.audio_cues = config.get("audio_cues", True)
+                self.autosave_presets = bool(config.get("autosave_presets", True))
                 self.delay_jitter = config.get("delay_jitter", False)
                 self.natural_timing = config.get("natural_timing", False)
                 ACTIVE_SOUND_THEME = config.get("sound_theme", "Classic")
@@ -12053,6 +16580,7 @@ try {{
             "clicks_and_keys_only": self.clicks_and_keys_only,
             "window_relative": self.window_relative,
             "audio_cues": self.audio_cues,
+            "autosave_presets": self.autosave_presets,
             "delay_jitter": self.delay_jitter,
             "natural_timing": self.natural_timing,
             "sound_theme": ACTIVE_SOUND_THEME,
@@ -12111,7 +16639,25 @@ try {{
         f_app.pack(fill=tk.X)
 
         self.build_appearance_settings(f_app)
+        icons_row = tk.Frame(f_app, bg=BG_PANEL)
+        icons_row.pack(fill=tk.X, pady=(2, 11))
+        tk.Label(icons_row, text="Custom Button Icons", font=("Segoe UI", 9, "bold"),
+                 bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        def reload_custom_icons():
+            count = sequent_reload_icons(self.root)
+            self.update_status(f"Icon assets reloaded ({count} icons refreshed)", COLOR_SUCCESS)
+        sequent_toolbar_button(icons_row, "Reload Icons", reload_custom_icons,
+                               icon='refresh').pack(side=tk.LEFT, padx=(0, 8))
+        sequent_toolbar_button(icons_row, "Manage Icons...", self.open_icon_manager,
+                               icon='settings').pack(side=tk.LEFT)
         self.build_entertain_me_toggle(f_app)
+        self.autosave_toggle = add_setting_toggle(
+            f_app, "Autosave loaded presets", self.autosave_presets,
+            self.set_autosave_presets)
+        tk.Label(f_app, text="Automatically saves edited presets after 1–2 seconds idle. "
+                 "New recordings require a filename.", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8), wraplength=500, justify=tk.LEFT).pack(
+                     anchor="w", pady=(0, 5))
 
         # Guided help can be restarted without reopening Sequent.
         tk.Label(scroll_container, text="HELP & ONBOARDING", font=("Segoe UI", 8, "bold"),
@@ -12226,11 +16772,13 @@ try {{
                 CUSTOM_SOUND_PATHS[cue_key] = ""
                 lbl_path.config(text="Default Theme Sound", fg=TEXT_MUTED)
 
-            btn_clear = tk.Label(path_box, text=" ✕ ", font=("Segoe UI", 9, "bold"), bg=BG_INPUT, fg=TEXT_MUTED, cursor="hand2")
+            btn_clear = SequentIcon(path_box, 'close', color=TEXT_MUTED, bg=BG_INPUT,
+                                    size=16, override_key='button.clear-sound',
+                                    slot_label='Clear custom sound')
             btn_clear.pack(side=tk.RIGHT, padx=(2, 0))
             btn_clear.bind("<Button-1>", lambda e: _clear())
-            btn_clear.bind("<Enter>", lambda e: btn_clear.config(fg=COLOR_DANGER))
-            btn_clear.bind("<Leave>", lambda e: btn_clear.config(fg=TEXT_MUTED))
+            btn_clear.bind("<Enter>", lambda e: btn_clear.paint(color=COLOR_DANGER))
+            btn_clear.bind("<Leave>", lambda e: btn_clear.paint(color=TEXT_MUTED))
             
             btn_browse = tk.Label(controls, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=10, pady=4)
             btn_browse.pack(side=tk.RIGHT)
@@ -12296,6 +16844,306 @@ try {{
 
         return self.entertain_pill
 
+
+    def open_icon_manager(self):
+        """Browse a folder of image assets and assign them to Sequent controls."""
+        window = tk.Toplevel(self.root)
+        window.title('Sequent — Icon Manager')
+        window.configure(bg=BG_APP)
+        window.geometry('1160x715')
+        window.minsize(850, 540)
+        window.transient(self.root)
+        header = tk.Frame(window, bg=BG_HEADER)
+        header.pack(fill=tk.X)
+        tk.Label(header, text='ICON MANAGER', bg=BG_HEADER, fg=TEXT_PRIMARY,
+                 font=('Segoe UI', 12, 'bold')).pack(anchor='w', padx=18, pady=(13, 3))
+        tk.Label(header, text='Choose a control, then select artwork from your icon library.',
+                 bg=BG_HEADER, fg=TEXT_MUTED, font=('Segoe UI', 9)).pack(
+                     anchor='w', padx=18, pady=(0, 10))
+
+        library_folder = [sequent_icon_directory().resolve()]
+        chosen_icon = [None]
+        folder_bar = tk.Frame(window, bg=BG_PANEL)
+        folder_bar.pack(fill=tk.X, padx=16, pady=(12, 0))
+        tk.Label(folder_bar, text='ICON FOLDER', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 9, 'bold')).pack(side=tk.LEFT, padx=(10, 8), pady=8)
+        folder_label = tk.Label(folder_bar, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                                font=('Segoe UI', 9), anchor='w')
+        folder_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        body = tk.Frame(window, bg=BG_APP)
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
+        left = tk.Frame(body, bg=BG_PANEL, width=304)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        left.pack_propagate(False)
+        right = tk.Frame(body, bg=BG_PANEL, width=275)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        right.pack_propagate(False)
+        middle = tk.Frame(body, bg=BG_PANEL)
+        middle.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        tk.Label(left, text='SEQUENT CONTROL', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=12, pady=(12, 0))
+        search_var = tk.StringVar()
+        search_entry = tk.Entry(left, textvariable=search_var, bg=BG_INPUT,
+                                fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                                relief=tk.FLAT, font=('Segoe UI', 10))
+        search_entry.pack(fill=tk.X, padx=10, pady=10, ipady=5)
+        listbox = tk.Listbox(left, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                             selectbackground=BG_SELECTED, selectforeground=TEXT_PRIMARY,
+                             font=('Consolas', 9), relief=tk.FLAT, exportselection=False)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        selection = [None]
+        shown = []
+
+        tk.Label(middle, text='AVAILABLE ICONS', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=12, pady=(12, 0))
+        library_search = tk.StringVar()
+        tk.Entry(middle, textvariable=library_search, bg=BG_INPUT,
+                 fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                 relief=tk.FLAT, font=('Segoe UI', 10)).pack(
+                     fill=tk.X, padx=10, pady=10, ipady=5)
+        gallery = ModernScrollableFrame(middle, bg=BG_PANEL)
+        gallery.pack(fill=tk.BOTH, expand=True, padx=6)
+        gallery_body = gallery.scrollable_frame
+        page_index = [0]
+        page_size = 36
+        thumbnails = []  # PhotoImage references must survive Tk garbage collection.
+        filtered_files = []
+        gallery_tiles = {}
+        gallery_footer = tk.Frame(middle, bg=BG_PANEL)
+        gallery_footer.pack(fill=tk.X, padx=10, pady=(7, 10))
+        page_label = tk.Label(gallery_footer, text='', bg=BG_PANEL, fg=TEXT_MUTED,
+                              font=('Segoe UI', 8))
+        page_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        label = tk.Label(right, text='SELECT AN ICON SLOT', bg=BG_PANEL,
+                         fg=TEXT_PRIMARY, font=('Segoe UI', 10, 'bold'),
+                         wraplength=245, justify=tk.LEFT)
+        label.pack(anchor='w', padx=14, pady=(14, 9))
+        preview = SequentIcon(right, 'folder', bg=BG_PANEL, color=TEXT_PRIMARY,
+                              size=48)
+        preview.pack(pady=(10, 12))
+        state = tk.Label(right, text='Select a control to see its icon', bg=BG_PANEL,
+                         fg=TEXT_MUTED, font=('Consolas', 9), wraplength=245,
+                         justify=tk.LEFT)
+        state.pack(anchor='w', padx=14, pady=(0, 12))
+        tk.Frame(right, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12)
+        tk.Label(right, text='SELECTED ARTWORK', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=14, pady=(13, 3))
+        selected_preview = tk.Label(right, bg=BG_PANEL, fg=TEXT_PRIMARY)
+        selected_preview.pack(pady=4)
+        selected_name = tk.Label(right, text='No image selected', bg=BG_PANEL,
+                                 fg=TEXT_MUTED, font=('Segoe UI', 9),
+                                 wraplength=235, justify=tk.CENTER)
+        selected_name.pack(padx=12, pady=(2, 12))
+
+        def refresh_slots(*_):
+            needle = search_var.get().casefold()
+            old = selection[0]
+            catalog = sequent_icon_catalog()
+            shown[:] = [slot for slot, (title, _) in catalog.items()
+                        if needle in slot.casefold() or needle in title.casefold()]
+            listbox.delete(0, tk.END)
+            for slot in shown:
+                title, _ = catalog[slot]
+                custom = '  *' if sequent_icon_path(slot) else ''
+                listbox.insert(tk.END, f'{title[:23]:23s} {slot}{custom}')
+            if old in shown:
+                idx = shown.index(old)
+                listbox.selection_set(idx)
+                listbox.see(idx)
+                on_slot_selection()
+
+        def on_slot_selection(event=None):
+            if not listbox.curselection():
+                return
+            selected = shown[listbox.curselection()[0]]
+            selection[0] = selected
+            title, glyph = sequent_icon_catalog()[selected]
+            label.config(text=title)
+            preview.override_key = selected
+            preview.paint(name=glyph)
+            linked = sequent_icon_path(selected)
+            state.config(text=selected + '\n' +
+                         (str(linked.relative_to(sequent_icon_directory())) if linked
+                          else '(built-in vector fallback)'))
+
+        def choose_gallery_icon(path):
+            chosen_icon[0] = path
+            selected_name.config(text=path.name)
+            try:
+                image = sequent_icon_thumbnail(window, path, 70)
+                selected_preview.configure(image=image, text='')
+                selected_preview.image = image
+            except (tk.TclError, OSError, ValueError):
+                selected_preview.configure(image='', text='Preview unavailable')
+                selected_preview.image = None
+            for tile_path, tile in gallery_tiles.items():
+                tile.configure(highlightbackground=(COLOR_ACCENT if tile_path == path
+                                                     else BG_BORDER),
+                               highlightthickness=(2 if tile_path == path else 1))
+
+        def render_gallery():
+            for item in gallery_body.winfo_children():
+                item.destroy()
+            gallery_tiles.clear()
+            thumbnails.clear()
+            max_page = max(0, (len(filtered_files) - 1) // page_size)
+            page_index[0] = min(max(0, page_index[0]), max_page)
+            start = page_index[0] * page_size
+            files = filtered_files[start:start + page_size]
+            if not files:
+                tk.Label(gallery_body, text='No SVG, PNG, or GIF icons found in this folder.',
+                         bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 9),
+                         wraplength=300).pack(padx=12, pady=18)
+            for pos, path in enumerate(files):
+                tile = tk.Frame(gallery_body, bg=BG_INPUT,
+                                highlightbackground=(COLOR_ACCENT if path == chosen_icon[0]
+                                                     else BG_BORDER),
+                                highlightthickness=(2 if path == chosen_icon[0] else 1),
+                                cursor='hand2', width=90, height=99)
+                tile.grid(row=pos // 3, column=pos % 3, padx=4, pady=4, sticky='nsew')
+                tile.grid_propagate(False)
+                gallery_tiles[path] = tile
+                try:
+                    img = sequent_icon_thumbnail(window, path, 54)
+                    thumbnails.append(img)
+                    art = tk.Label(tile, image=img, bg=BG_INPUT, cursor='hand2')
+                except (tk.TclError, OSError, ValueError):
+                    art = tk.Label(tile, text='?', bg=BG_INPUT, fg=COLOR_DANGER,
+                                   font=('Segoe UI', 18), cursor='hand2')
+                art.pack(expand=True)
+                name = tk.Label(tile, text=path.stem[:15], bg=BG_INPUT,
+                                fg=TEXT_MUTED, font=('Segoe UI', 8), cursor='hand2')
+                name.pack(pady=(0, 5))
+                for control in (tile, art, name):
+                    control.bind('<Button-1>', lambda _e, p=path: choose_gallery_icon(p))
+            for col in range(3):
+                gallery_body.columnconfigure(col, weight=1)
+            page_label.config(text=f'{len(filtered_files)} icons  ·  '
+                              f'Page {page_index[0]+1} of {max_page+1}')
+            gallery.canvas.yview_moveto(0)
+
+        def filter_gallery(*_):
+            query = library_search.get().casefold().strip()
+            files = sequent_icon_library_files(library_folder[0])
+            filtered_files[:] = [path for path in files
+                                 if query in str(path.relative_to(library_folder[0])).casefold()]
+            page_index[0] = 0
+            render_gallery()
+
+        def page(direction):
+            page_index[0] += direction
+            render_gallery()
+
+        back_btn = sequent_toolbar_button(gallery_footer, 'Previous',
+                  lambda: page(-1) if page_index[0] > 0 else None, icon='back')
+        back_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        next_btn = sequent_toolbar_button(gallery_footer, 'Next',
+                  lambda: page(1) if (page_index[0] + 1) * page_size < len(filtered_files)
+                  else None, icon='forward')
+        next_btn.pack(side=tk.RIGHT)
+
+        def set_folder(folder):
+            library_folder[0] = Path(folder).expanduser().resolve()
+            folder_label.config(text=str(library_folder[0]))
+            chosen_icon[0] = None
+            selected_preview.configure(image='', text='')
+            selected_preview.image = None
+            selected_name.config(text='No image selected')
+            if library_search.get():
+                library_search.set('')  # The StringVar callback refreshes the gallery.
+            else:
+                filter_gallery()
+
+        def pick_folder():
+            folder = filedialog.askdirectory(parent=window, title='Select your icon folder',
+                                             initialdir=str(library_folder[0]))
+            if folder:
+                set_folder(folder)
+
+        def import_all():
+            if not filtered_files:
+                messagebox.showinfo('No icon files', 'Choose a folder containing SVG, PNG, or GIF icons.',
+                                    parent=window)
+                return
+            try:
+                count, total = sequent_import_icon_folder(library_folder[0])
+                set_folder(sequent_icon_directory())
+                self.update_status(f'{count} of {total} icons copied into project assets/icons',
+                                   COLOR_SUCCESS)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror('Icon folder import failed', str(exc), parent=window)
+
+        def assign_selected():
+            if not selection[0]:
+                messagebox.showinfo('Select a control', 'Select a Sequent control first.',
+                                    parent=window)
+                return
+            if not chosen_icon[0]:
+                messagebox.showinfo('Select artwork', 'Select an icon from the gallery first.',
+                                    parent=window)
+                return
+            try:
+                # Validate the actual decoder, not just the file extension.
+                sequent_icon_thumbnail(window, chosen_icon[0], 52)
+                sequent_assign_library_icon(selection[0], chosen_icon[0])
+                sequent_reload_icons(self.root)
+                refresh_slots()
+                self.update_status(f'Icon assigned: {selection[0]}', COLOR_SUCCESS)
+            except (OSError, tk.TclError, ValueError) as exc:
+                messagebox.showerror('Icon assignment failed', str(exc), parent=window)
+
+        def choose_icon():
+            # Keep the original file picker for those assigning just one asset.
+            path = filedialog.askopenfilename(parent=window, title='Choose button icon',
+                        filetypes=[('Supported icons', '*.svg *.png *.gif'),
+                                   ('SVG vector', '*.svg'),
+                                   ('PNG image', '*.png'), ('GIF image', '*.gif')])
+            if path:
+                choose_gallery_icon(Path(path))
+                assign_selected()
+
+        def clear_icon():
+            slot = selection[0]
+            if not slot: return
+            mappings = sequent_icon_map().copy()
+            if slot in mappings:
+                del mappings[slot]
+                manifest = sequent_icon_directory() / 'icon_map.json'
+                manifest.write_text(json.dumps(mappings, indent=2) + '\n', encoding='utf-8')
+            global _SEQUENT_ICON_MAP_STATE
+            _SEQUENT_ICON_MAP_STATE = (None, None, {})
+            sequent_reload_icons(self.root)
+            preview.paint()
+            refresh_slots()
+
+        listbox.bind('<<ListboxSelect>>', on_slot_selection)
+        search_var.trace_add('write', refresh_slots)
+        library_search.trace_add('write', filter_gallery)
+        sequent_toolbar_button(folder_bar, 'Choose Folder...', pick_folder, icon='folder').pack(
+            side=tk.RIGHT, padx=(6, 10), pady=5)
+        sequent_toolbar_button(folder_bar, 'Project Icons',
+                               lambda: set_folder(sequent_icon_directory()), icon='folder').pack(
+                                   side=tk.RIGHT, padx=(6, 0), pady=5)
+        sequent_toolbar_button(folder_bar, 'Import Folder for GitHub', import_all,
+                               icon='download').pack(side=tk.RIGHT, padx=(6, 0), pady=5)
+        buttons = tk.Frame(right, bg=BG_PANEL)
+        buttons.pack(fill=tk.X, padx=12, pady=(4, 0))
+        sequent_toolbar_button(buttons, 'Assign Selected Icon', assign_selected,
+                               accent=True, icon='check').pack(fill=tk.X, pady=(0, 6))
+        sequent_toolbar_button(buttons, 'Assign Image...', choose_icon,
+                               icon='image').pack(fill=tk.X, pady=(0, 6))
+        sequent_toolbar_button(buttons, 'Restore Default', clear_icon,
+                               icon='undo').pack(fill=tk.X, pady=(0, 6))
+        tk.Label(right, text='Assigned artwork is always stored in assets/icons\n'
+                 'using a portable relative path for GitHub releases.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, wraplength=245, justify=tk.LEFT,
+                 font=('Segoe UI', 8)).pack(anchor='w', padx=13, pady=(14, 10))
+        refresh_slots()
+        set_folder(sequent_icon_directory())
+        return window
 
     def build_appearance_settings(self, parent):
         """Persistent, easy-to-read theme selector and shared accent picker."""
@@ -12550,10 +17398,21 @@ try {{
         self._theme_rebuilding = True
 
         self._update_theme_tokens(theme_name)
+        sequent_retheme_ide_windows(self)
         if getattr(self, 'native_chrome', None) is not None:
             self.native_chrome.refresh_dwm_frame()
 
         active_tab = getattr(self, 'current_tab_name', 'playback') or 'playback'
+        debug_edit_snapshot = None
+        ui = getattr(self, '_debug_panel', None)
+        if (active_tab == 'debug_tools' and ui is not None and
+                getattr(ui, 'variable_editor', None) is not None):
+            editor = ui.variable_editor
+            if editor.winfo_exists() and editor.edit_modified():
+                selection = ui.variable_listing.curselection()
+                pair = (ui.variable_entries[selection[0]]
+                        if selection and selection[0] < len(ui.variable_entries) else None)
+                debug_edit_snapshot = (pair, editor.get('1.0', 'end-1c'))
         self._cancel_old_ui_jobs()
         try:
             self.root.configure(bg=BG_APP)
@@ -12578,6 +17437,16 @@ try {{
                 old_overlay.destroy()
 
             self.setup_ui(initial_tab=active_tab, animate=False)
+            if debug_edit_snapshot and getattr(self, '_debug_panel', None) is not None:
+                ui = self._debug_panel
+                pair, unsaved_text = debug_edit_snapshot
+                if pair in getattr(ui, 'variable_entries', []):
+                    index = ui.variable_entries.index(pair)
+                    ui.variable_listing.selection_clear(0, tk.END)
+                    ui.variable_listing.selection_set(index)
+                    ui.variable_editor.delete('1.0', tk.END)
+                    ui.variable_editor.insert('1.0', unsaved_text)
+                    ui.variable_editor.edit_modified(True)
             for grip in getattr(self, '_native_grips', ()):
                 if grip.winfo_exists():
                     grip.lift()
@@ -12706,6 +17575,173 @@ try {{
         hk_field = SequentHotkeyField(row, action_key, self.hotkeys[action_key]["name"], self)
         hk_field.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+    # --- Reliable, identity-bound preset autosave ---
+    def set_autosave_presets(self, enabled):
+        self.autosave_presets = bool(enabled)
+        if self.autosave_presets:
+            self._autosave_observed_snapshot = None
+        self.update_status('Preset autosave enabled' if enabled else 'Preset autosave disabled',
+                           COLOR_SUCCESS if enabled else TEXT_MUTED)
+
+    def _queue_content_snapshot(self):
+        """Content-only fingerprint: debugger navigation doesn't dirty a preset."""
+        return json.dumps(self.recorded_actions, ensure_ascii=True,
+                          separators=(',', ':'), sort_keys=True)
+
+    def _bind_preset_autosave(self, path):
+        """Only an explicitly loaded/saved preset is eligible for autosave."""
+        path = os.path.abspath(path)
+        with open(path, 'rb') as source:
+            disk_hash = hashlib.sha256(source.read()).hexdigest()
+        self._active_preset_path = path
+        self._active_preset_disk_hash = disk_hash
+        self._active_saved_snapshot = self._queue_content_snapshot()
+        self._autosave_observed_snapshot = self._active_saved_snapshot
+        self._autosave_deadline = None
+
+    def _unbind_preset_autosave(self):
+        """Never autosave a fresh recording/import into a previously selected preset."""
+        self._active_preset_path = None
+        self._active_preset_disk_hash = None
+        self._active_saved_snapshot = None
+        self._unbound_saved_snapshot = self._queue_content_snapshot()
+        self._autosave_observed_snapshot = None
+        self._autosave_deadline = None
+
+    def _write_json_atomically(self, path, actions):
+        """Replace a complete, fsynced UTF-8 JSON file without partial writes."""
+        path = os.path.abspath(path)
+        folder = os.path.dirname(path)
+        os.makedirs(folder, exist_ok=True)
+        data = (json.dumps(actions, ensure_ascii=True, indent=2) + '\n').encode('utf-8')
+        fd, temporary = tempfile.mkstemp(prefix='.sequent-save-', suffix='.tmp', dir=folder)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return hashlib.sha256(data).hexdigest()
+
+    def _save_bound_preset(self):
+        """Save the current queue only to its actual loaded preset.
+
+        Detect external edits instead of silently clobbering them. Empty queues
+        are valid saved presets too, e.g. after deleting every queue action.
+        """
+        path = self._active_preset_path
+        if not path:
+            return False
+        current = self._queue_content_snapshot()
+        if current == self._active_saved_snapshot:
+            self._autosave_deadline = None
+            return True
+        try:
+            with open(path, 'rb') as stream:
+                actual_hash = hashlib.sha256(stream.read()).hexdigest()
+            if actual_hash != self._active_preset_disk_hash:
+                raise OSError('preset changed outside Sequent; export or reload it to avoid overwriting newer data')
+            # Keep the old preset before replacing it; no edit loss on autosave.
+            sequent_save_revision(self.presets_dir, path)
+            new_hash = self._write_json_atomically(path, self.recorded_actions)
+        except (OSError, ValueError, TypeError, OverflowError) as exc:
+            self.update_status(f'Autosave failed: {exc}', COLOR_DANGER)
+            return False
+        self._active_saved_snapshot = current
+        self._active_preset_disk_hash = new_hash
+        self._autosave_observed_snapshot = current
+        self._autosave_deadline = None
+        self.update_status(f'Saved {os.path.basename(path)}', COLOR_SUCCESS)
+        return True
+
+    def _autosave_tick(self):
+        """Poll content on Tk's main thread, debounce disk writes until idle."""
+        self._autosave_job = None
+        try:
+            if (self.autosave_presets and self._active_preset_path and
+                    not self.recording and not self.playing and
+                    not getattr(self, 'chain_running', False)):
+                current = self._queue_content_snapshot()
+                if current == self._active_saved_snapshot:
+                    self._autosave_deadline = None
+                    self._autosave_observed_snapshot = current
+                elif current != self._autosave_observed_snapshot:
+                    self._autosave_observed_snapshot = current
+                    self._autosave_deadline = time.monotonic() + 1.2
+                elif (self._autosave_deadline is not None and
+                      time.monotonic() >= self._autosave_deadline):
+                    # On an I/O error, wait for another edit or manual retry;
+                    # avoid spamming the status bar with repeated failed writes.
+                    self._autosave_deadline = None
+                    self._save_bound_preset()
+        except (TypeError, ValueError) as exc:
+            self.update_status(f'Autosave validation failed: {exc}', COLOR_DANGER)
+        finally:
+            try:
+                if self.root.winfo_exists():
+                    self._autosave_job = self.root.after(600, self._autosave_tick)
+            except tk.TclError:
+                pass
+
+    def _safe_to_replace_queue(self):
+        """Save or ask before replacing the queue, including new recordings."""
+        if self._active_preset_path:
+            if self._queue_content_snapshot() == self._active_saved_snapshot:
+                return True
+            if self.autosave_presets:
+                return self._save_bound_preset()
+            answer = messagebox.askyesnocancel(
+                'Unsaved preset', 'Save changes to the current preset before switching?',
+                parent=self.root)
+            if answer is None:
+                return False
+            return self._save_bound_preset() if answer else True
+        if self._queue_content_snapshot() == self._unbound_saved_snapshot:
+            return True
+        answer = messagebox.askyesnocancel(
+            'Unsaved actions',
+            'This queue is not associated with a saved preset. Save it before replacing it?',
+            parent=self.root)
+        if answer is None:
+            return False
+        return self.save_macro_to_file() if answer else True
+
+    def save_current_preset(self):
+        """Save now: save in place if bound, otherwise open Save As."""
+        if self.recording or self.playing or getattr(self, 'chain_running', False):
+            self.update_status('Stop recording or playback before saving', COLOR_DANGER)
+            return False
+        if self._active_preset_path:
+            if self._queue_content_snapshot() == self._active_saved_snapshot:
+                self.update_status('Preset already saved', TEXT_MUTED)
+                return True
+            return self._save_bound_preset()
+        return self.save_macro_to_file()
+
+    def _on_save_preset_shortcut(self, event):
+        if not self._queue_shortcut_allowed(event):
+            return None
+        self.save_current_preset()
+        return 'break'
+
+    def request_close(self):
+        """Use the same unsaved-change guard for X, Alt+F4 and the custom X."""
+        if self.recording or self.playing or getattr(self, 'chain_running', False):
+            self.update_status('Stop recording or playback before closing', COLOR_DANGER)
+            return False
+        if not self._safe_to_replace_queue():
+            return False
+        if self._autosave_job is not None:
+            try:
+                self.root.after_cancel(self._autosave_job)
+            except tk.TclError:
+                pass
+        self.root.destroy()
+        return True
+
     def refresh_preset_menu(self, selected=None):
         menu = self.preset_menu["menu"]
         menu.delete(0, "end")
@@ -12716,7 +17752,7 @@ try {{
 
         json_files = []
         if os.path.isdir(self.presets_dir):
-            try: json_files = sorted([f for f in os.listdir(self.presets_dir) if f.lower().endswith(".json") and f.lower() != "globals.json"])
+            try: json_files = sorted([f for f in os.listdir(self.presets_dir) if f.lower().endswith(".json") and not f.lower().endswith(".chain.json") and not f.startswith(".") and f.lower() != "globals.json"])
             except Exception: json_files = []
 
         if not json_files:
@@ -12724,19 +17760,27 @@ try {{
             self.preset_var.set("-- No Presets Found --")
             return
 
-        menu.add_command(label="-- Select Preset --", command=lambda: self.preset_var.set("-- Select Preset --"))
+        menu.add_command(label="-- Select Preset --", command=lambda: self.preset_var.set(
+            os.path.splitext(os.path.basename(self._active_preset_path))[0]
+            if self._active_preset_path else "-- Select Preset --"))
         for fname in json_files:
             stem = os.path.splitext(fname)[0]
             full_path = os.path.join(self.presets_dir, fname)
             menu.add_command(label=stem, command=lambda s=stem, p=full_path: self.on_preset_file_selected(s, p))
 
+        active_name = (os.path.splitext(os.path.basename(self._active_preset_path))[0]
+                       if self._active_preset_path else None)
+        selected = selected or active_name
         if selected and any(os.path.splitext(f)[0] == selected for f in json_files):
             self.preset_var.set(selected)
         else:
             self.preset_var.set("-- Select Preset --")
 
     def on_preset_file_selected(self, stem, file_path):
-        if self.recording or self.playing: return
+        if self.recording or self.playing: return False
+        file_path = os.path.abspath(file_path)
+        if self._active_preset_path and os.path.normcase(file_path) == os.path.normcase(self._active_preset_path):
+            return True  # Do not reload this preset over its in-memory edits.
         try:
             with open(file_path, "r", encoding="utf-8") as f: loaded_data = json.load(f)
             if isinstance(loaded_data, list):
@@ -12764,21 +17808,27 @@ try {{
                             cleaned_act["match_any"] = bool(act["match_any"])
                         validated_actions.append(cleaned_act)
 
-                if validated_actions:
-                    self.recorded_actions = validated_actions
-                    self.current_action_idx = 0
-                    self.preset_var.set(stem)
-                    self.current_source_label = f"Preset: {stem}"
-                    self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-                    self.update_status(f"Loaded '{stem}'", COLOR_SUCCESS)
-                else: self.update_status("Empty Preset File", COLOR_DANGER)
-            else: self.update_status("Invalid Format", COLOR_DANGER)
-        except Exception: self.update_status("Preset Load Error", COLOR_DANGER)
+                if not self._safe_to_replace_queue():
+                    return False
+                self._clear_queue_undo()  # New macro replaces the editable queue.
+                self.recorded_actions = validated_actions
+                self.current_action_idx = 0
+                self.breakpoints.clear()
+                self.preset_var.set(stem)
+                self.current_source_label = f"Preset: {stem}"
+                self._bind_preset_autosave(file_path)
+                self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+                self.update_status(f"Loaded '{stem}'", COLOR_SUCCESS)
+                return True
+            self.update_status("Invalid Format", COLOR_DANGER)
+        except Exception as exc:
+            self.update_status(f"Preset Load Error: {exc}", COLOR_DANGER)
+        return False
   
     def save_macro_to_file(self):
         if not self.recorded_actions:
             self.update_status("Queue Empty", COLOR_DANGER)
-            return
+            return False
 
         self.root.attributes('-topmost', False)
         try:
@@ -12789,14 +17839,26 @@ try {{
         finally:
             self.root.attributes('-topmost', False)
 
-        if file_path:
-            try:
-                with open(file_path, "w", encoding="utf-8") as f: json.dump(self.recorded_actions, f, indent=2)
-                self.update_status("Exported File", COLOR_SUCCESS)
-                if os.path.dirname(os.path.abspath(file_path)) == self.presets_dir:
-                    stem = os.path.splitext(os.path.basename(file_path))[0]
-                    self.refresh_preset_menu(selected=stem)
-            except Exception: self.update_status("Export Error", COLOR_DANGER)
+        if not file_path:
+            return False
+        try:
+            full = os.path.abspath(file_path)
+            if os.path.normcase(full) == os.path.normcase(os.path.join(self.presets_dir, 'globals.json')):
+                raise ValueError('globals.json stores Global variables and cannot be used as a macro preset')
+            self._write_json_atomically(full, self.recorded_actions)
+            if os.path.normcase(os.path.dirname(full)) == os.path.normcase(os.path.abspath(self.presets_dir)):
+                # An explicit Export into presets becomes the current saved preset.
+                stem = os.path.splitext(os.path.basename(full))[0]
+                self.current_source_label = f"Preset: {stem}"
+                self._bind_preset_autosave(full)
+                self.refresh_preset_menu(selected=stem)
+            elif self._active_preset_path is None:
+                self._unbound_saved_snapshot = self._queue_content_snapshot()
+            self.update_status("Exported File", COLOR_SUCCESS)
+            return True
+        except (OSError, ValueError, TypeError) as exc:
+            self.update_status(f"Export Error: {exc}", COLOR_DANGER)
+            return False
 
     def load_macro_from_file(self):
         if self.recording or self.playing: return
@@ -12838,16 +17900,19 @@ try {{
                                 cleaned_act["match_any"] = bool(act["match_any"])
                             validated_actions.append(cleaned_act)
 
-                    if validated_actions:
-                        self.recorded_actions = validated_actions
-                        self.current_action_idx = 0
-                        self.preset_var.set("-- Select Preset --")
-                        file_name = file_path.replace("\\", "/").split("/")[-1]
-                        self.current_source_label = f"File: {file_name}"
-                        self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-                        self.update_status("Loaded File", COLOR_SUCCESS)
-                    else: 
-                        self.update_status("Empty/Invalid File", COLOR_DANGER)
+                    if not self._safe_to_replace_queue():
+                        return False
+                    self._clear_queue_undo()  # New macro replaces the editable queue.
+                    self.recorded_actions = validated_actions
+                    self.current_action_idx = 0
+                    self.breakpoints.clear()
+                    self.preset_var.set("-- Select Preset --")
+                    file_name = os.path.basename(file_path)
+                    self.current_source_label = f"File: {file_name}"
+                    self._unbind_preset_autosave()
+                    self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+                    self.update_status("Loaded File", COLOR_SUCCESS)
+                    return True
                 else: 
                     self.update_status("Invalid File", COLOR_DANGER)
             except Exception: 
@@ -13091,6 +18156,11 @@ try {{
                 self.seq_timeline_viewport.place_configure(x=left)
             if self.stage_builder_dock.winfo_manager() == "place":
                 self.stage_builder_dock.place_configure(x=-13 + offset)
+        elif tab_name == "debug_tools":
+            # The embedded workspace is a single page, so animate its native
+            # frame directly. Never capture, destroy, or rebuild tool widgets.
+            if self.frame_debug.winfo_manager() == "place":
+                self.frame_debug.place_configure(x=offset)
 
     def _settle_tab_transition(self):
         """Finish/interupt animation and leave exactly one page visible."""
@@ -13105,12 +18175,13 @@ try {{
         if hasattr(self, "_settings_motion_view"):
             self._clear_settings_motion()
         current = self.current_tab_name
-        if current in ("playback", "sequencer", "settings"):
+        if current in ("playback", "sequencer", "settings", "debug_tools"):
             self._set_tab_heading(current)
         for name, frame in (
             ("playback", self.frame_playback),
             ("sequencer", self.frame_sequencer),
             ("settings", self.frame_settings),
+            ("debug_tools", self.frame_debug),
         ):
             if name != current:
                 frame.place_forget()
@@ -13124,14 +18195,17 @@ try {{
             # Settings must appear above the dock siblings, not behind them.
             self.frame_settings.lift()
         else:
-            self.frame_playback.tkraise() if current == "playback" else self.frame_sequencer.tkraise()
+            if current == 'playback': self.frame_playback.tkraise()
+            elif current == 'sequencer': self.frame_sequencer.tkraise()
+            elif current == 'debug_tools': self.frame_debug.tkraise()
         if hasattr(self, "sidebar_host") and self.sidebar_host.winfo_exists():
             self.sidebar_host.lift()
 
     def _set_tab_heading(self, tab_name):
         headings = {
             "playback": ("Playback", "Record, edit and execute actions"),
-            "sequencer": ("Sequencer", "Arrange presets into repeatable pipelines"),
+            "sequencer": ("Automation Studio", "Compose macro chains on a visual timeline"),
+            "debug_tools": ("Debug Tools", "Inspect, troubleshoot and organize Sequent workflows"),
             "settings": ("Settings", "Customize your automation workspace"),
         }
         title, subtitle = headings[tab_name]
@@ -13149,7 +18223,8 @@ try {{
 
         headings = {
             "playback": ("Playback", "Record, edit and execute actions"),
-            "sequencer": ("Sequencer", "Arrange presets into repeatable pipelines"),
+            "sequencer": ("Automation Studio", "Compose macro chains on a visual timeline"),
+            "debug_tools": ("Debug Tools", "Inspect, troubleshoot and organize Sequent workflows"),
             "settings": ("Settings", "Customize your automation workspace"),
         }
         if tab_name not in headings:
@@ -13178,6 +18253,7 @@ try {{
         # We update the heading when the new page actually begins entering.
         self.btn_tab_playback.set_active(tab_name == "playback")
         self.btn_tab_sequencer.set_active(tab_name == "sequencer")
+        self.btn_tab_debug.set_active(tab_name == 'debug_tools')
         self.btn_tab_settings.set_active(tab_name == "settings")
         if tab_name == "sequencer":
             self.refresh_sequencer_preset_dropdown()
@@ -13187,9 +18263,10 @@ try {{
             "playback": self.frame_playback,
             "sequencer": self.frame_sequencer,
             "settings": self.frame_settings,
+            "debug_tools": self.frame_debug,
         }
 
-        if not animate or not self.entertain_me or old_tab not in tab_frames:
+        if (not animate or not self.entertain_me or old_tab not in tab_frames):
             self._set_tab_heading(tab_name)
             self._settle_tab_transition()
             return
@@ -13200,7 +18277,7 @@ try {{
         for name, frame in tab_frames.items():
             if name not in (old_tab, tab_name):
                 frame.place_forget()
-        order = {"playback": 0, "sequencer": 1, "settings": 2}
+        order = {"playback": 0, "sequencer": 1, "debug_tools": 2, "settings": 3}
         direction = 1 if order[tab_name] > order[old_tab] else -1
         self._tab_transition_from = old_tab
         self._tab_transition_to = tab_name
@@ -13220,6 +18297,8 @@ try {{
         elif tab_name == "settings":
             self._clear_settings_motion()
             self.frame_settings.place_forget()
+        elif tab_name == "debug_tools":
+            self.frame_debug.place_forget()
 
     def _start_tab_animation_phase(self, phase):
         """Stage one real page at a time: exit first, then enter."""
@@ -13245,8 +18324,9 @@ try {{
                 return
         else:
             self._show_docks_for_tab(tab)
-            frame = (self.frame_playback if tab == "playback"
-                     else self.frame_sequencer)
+            frame = (self.frame_playback if tab == "playback" else
+                     self.frame_sequencer if tab == "sequencer" else
+                     self.frame_debug)
             frame.place(x=0, y=0, relwidth=1, relheight=1)
 
         self.animate_tab_transition(phase, step=0)
@@ -13305,18 +18385,6 @@ try {{
             self._start_tab_animation_phase("in")
         else:
             self._settle_tab_transition()
-
-    def _position_mini_hud_button(self, event=None):
-        """Keep Mini HUD fixed beside the expanded sidebar boundary."""
-        button = getattr(self, "mini_hud_button", None)
-        brand = getattr(self, "_topbar_brand", None)
-        if not button or not button.winfo_exists() or not brand or not brand.winfo_exists():
-            return
-        brand_right = brand.winfo_x() + brand.winfo_width()
-        # Use the sidebar's full width, not its animated visible width.
-        x = max(brand_right + 8, self.sidebar_width + 12)
-        if button.winfo_x() != x:
-            button.place_configure(x=x)
 
     def _cancel_sidebar_animation(self):
         """Cancel a pending frame before reversing or rebuilding navigation."""
@@ -13599,6 +18667,9 @@ try {{
         else: self.stop_macro()
 
     def start_recording(self):
+        if not self._safe_to_replace_queue():
+            return
+        self._unbind_preset_autosave()
         self.recording = True
         self.recording_paused = False
         self.last_event_time = time.perf_counter()
@@ -13612,7 +18683,9 @@ try {{
         self.play_btn.set_state("disabled")
         self.pause_btn.set_state("normal", text="Pause Rec (F9)", bg=BG_BORDER, hover=BG_HOVER)
 
+        self._clear_queue_undo()  # Recording starts a fresh editable sequence.
         self.recorded_actions.clear()
+        self.breakpoints.clear()
         self.current_action_idx = 0
         self.update_action_count_badge()
         self.queue_viewer.clear()
@@ -14302,7 +19375,10 @@ try {{
         reason = ''
         if self.audio_cues:play_cue('start')
         try:
-            loops = 1000000 if self.loop_mode == '∞ Loop' else int(self.loop_mode.replace('x',''))
+            # The Playback view no longer exposes Repeat. A single Run command
+            # makes one pass; explicit LOOP actions and Sequencer stages retain
+            # their separate repetition semantics.
+            loops = 1
             for rep in range(loops):
                 if not self.playing:break
                 start = self.current_action_idx if rep==0 and 0 <= self.current_action_idx < total else 0
@@ -14314,6 +19390,7 @@ try {{
                         while self.is_paused and self.playing:time.sleep(.04)
                     if not self.playing:
                         raise MacroCancelled('Playback stopped at breakpoint')
+                    self.trace_action(action.get('type','?'), f'STEP {index+1}', 0)
                     if not self._playback_ui_pending or action.get('type') != 'move':
                         self._playback_ui_pending = True
                         self.root.after(0, lambda i=index, r=run_id:
@@ -14343,6 +19420,7 @@ try {{
             if self.audio_cues:play_cue('error')
         finally:
             if not self.switching_preset:
+                self.trace_action('macro', 'ERROR' if reason else 'END', 0, reason)
                 state = 'failed' if reason else 'cancelled' if not self.playing else 'completed'
                 self.root.after(0,self.finish_macro,state,reason)
 
