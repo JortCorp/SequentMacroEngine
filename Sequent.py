@@ -7699,7 +7699,7 @@ class VSCodeQueueViewer(tk.Frame):
                     gradient_bg = SequentSelectionGradient(
                         row, COLOR_ACCENT, self.app.gradient_second_color, bg=color)
                     gradient_bg.place(x=0, y=0, relwidth=1, relheight=1)
-                    gradient_bg.lower()
+                    gradient_bg.tk.call('lower', str(gradient_bg))
                     gradient_bg.bind('<Button-1>', lambda e, n=name: self._switch_action_view(
                         n, self._action_menu_line_num, self._action_menu_edit_idx))
                     # Text-bearing widgets use representative gradient samples;
@@ -7809,7 +7809,10 @@ class VSCodeQueueViewer(tk.Frame):
         }
         self._selected_action_title.config(text=action_type)
         self._selected_action_desc.config(text=descriptions.get(action_type, ""))
-        self._rebuild_action_picker()
+        try:
+            self._rebuild_action_picker()
+        except (tk.TclError, ValueError) as exc:
+            print(f"Action Library highlight refresh failed: {exc}")
 
         for child in self.action_content_frame.winfo_children():
             child.destroy()
@@ -12158,8 +12161,9 @@ class SequentHotkeyField(tk.Frame):
         return "break"
 
 class SidebarButton(tk.Frame):
-    def __init__(self, parent, text, command, **kwargs):
+    def __init__(self, parent, text, command, app=None, **kwargs):
         super().__init__(parent, bg=BG_SIDEBAR, cursor="hand2", **kwargs)
+        self.app_ref = app
         self.command = command
         self.active = False
         self.selection_gradient = SequentSelectionGradient(self, COLOR_ACCENT, COLOR_ACCENT,
@@ -12209,7 +12213,7 @@ class SidebarButton(tk.Frame):
         self.configure(bg=color)
         self.label.configure(bg=color, fg=fg_color)
         self.icon.paint(bg=color, color=fg_color)
-        app = self.winfo_toplevel()
+        app = self.app_ref
         gradient = bool(getattr(app, 'gradient_enabled', False))
         self.indicator.set_gradient(COLOR_ACCENT if is_active else '',
             getattr(app, 'gradient_second_color', None) if gradient and is_active else None)
@@ -12218,9 +12222,8 @@ class SidebarButton(tk.Frame):
             end = getattr(app, 'gradient_second_color', COLOR_ACCENT)
             self.selection_gradient.set_colors(COLOR_ACCENT, end)
             self.selection_gradient.place(x=0, y=0, relwidth=1, relheight=1)
-            self.selection_gradient.lower()
+            self.selection_gradient.tk.call('lower', str(self.selection_gradient))
             # Match each foreground widget to its position on the gradient.
-            self.update_idletasks()
             width = max(1, self.winfo_width())
             inks = sequent_gradient_colors(COLOR_ACCENT, end, 128)
             def sampled(widget):
@@ -15078,24 +15081,24 @@ class BuiltInMacroApp:
                  anchor="w").pack(fill=tk.X, pady=(3, 0))
         tk.Frame(self.sidebar_frame, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(0, 12))
         self.btn_tab_playback = SidebarButton(
-            self.sidebar_frame, text="PLAYBACK",
+            self.sidebar_frame, text="PLAYBACK", app=self,
             command=lambda: self.show_tab("playback"))
         self.btn_tab_playback.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_sequencer = SidebarButton(
-            self.sidebar_frame, text="STUDIO",
+            self.sidebar_frame, text="STUDIO", app=self,
             command=lambda: self.show_tab("sequencer"))
         self.btn_tab_sequencer.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_debug = SidebarButton(
-            self.sidebar_frame, text='DEBUG TOOLS',
+            self.sidebar_frame, text='DEBUG TOOLS', app=self,
             command=lambda: self.show_tab('debug_tools'))
         self.btn_tab_debug.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_settings = SidebarButton(
-            self.sidebar_frame, text="SETTINGS",
+            self.sidebar_frame, text="SETTINGS", app=self,
             command=lambda: self.show_tab("settings"))
         self.btn_tab_settings.pack(fill=tk.X, padx=7, pady=2)
         tk.Frame(self.sidebar_frame, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(20, 10))
         self.btn_tab_guide = SidebarButton(
-            self.sidebar_frame, text="GUIDED TOUR", command=self.start_walkthrough)
+            self.sidebar_frame, text="GUIDED TOUR", app=self, command=self.start_walkthrough)
         self.btn_tab_guide.pack(fill=tk.X, padx=7, pady=(0, 12))
         tk.Label(self.sidebar_frame, text="Ctrl+F in Action Library\nF7 Record   •   F9 Run",
                  bg=BG_SIDEBAR, fg=TEXT_MUTED, justify="left",
