@@ -10352,12 +10352,58 @@ class VSCodeQueueViewer(tk.Frame):
                      bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
                      command=pick_new_area).pack(fill=tk.X, pady=(0, 12))
 
-        txt_row = tk.Frame(body, bg=BG_PANEL)
-        txt_row.pack(fill=tk.X, pady=(0, 8))
-        text_label(txt_row, "Target Text:").pack(side=tk.LEFT)
-        txt_entry = tk.Entry(txt_row, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        # Search source: literal text or a runtime-resolved local/global variable.
+        text_label(body, "Search Target:").pack(anchor="w", pady=(0, 3))
+        initial_source = curr.get("text_source", "Literal")
+        source_var = tk.StringVar(value="Search for variables" if initial_source in ("Local", "Global") else "Search for text")
+        source_menu = tk.OptionMenu(body, source_var, "Search for text", "Search for variables")
+        source_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 9),
+                           highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
+        source_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        source_menu.pack(fill=tk.X, pady=(0, 8))
+
+        literal_panel = tk.Frame(body, bg=BG_PANEL)
+        text_label(literal_panel, "Target Text:").pack(anchor="w", pady=(0, 2))
+        txt_entry = tk.Entry(literal_panel, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                             font=("Segoe UI", 9), insertbackground=TEXT_PRIMARY,
+                             bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         txt_entry.insert(0, curr.get("text", ""))
-        txt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0), ipady=3)
+        txt_entry.pack(fill=tk.X, ipady=3)
+
+        variable_panel = tk.Frame(body, bg=BG_PANEL)
+        text_label(variable_panel, "Variable Name:").pack(anchor="w", pady=(0, 2))
+        variable_entry = tk.Entry(variable_panel, bg=BG_INPUT, fg=SYNTAX_PURPLE,
+                                  font=("Consolas", 10, "bold"), insertbackground=TEXT_PRIMARY,
+                                  bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        variable_entry.insert(0, curr.get("text_variable", ""))
+        variable_entry.pack(fill=tk.X, ipady=3)
+        variable_scope = self._add_variable_scope_picker(variable_panel,
+                            {"var_name": curr.get("text_variable") or "target",
+                             "var_scope": "global" if initial_source == "Global" else "local"})
+
+        def update_search_source(*_):
+            literal_panel.pack_forget()
+            variable_panel.pack_forget()
+            if source_var.get() == "Search for variables":
+                variable_panel.pack(fill=tk.X, pady=(0, 8))
+            else:
+                literal_panel.pack(fill=tk.X, pady=(0, 8))
+        source_var.trace_add("write", update_search_source)
+        update_search_source()
+
+        def target_settings():
+            if source_var.get() == "Search for variables":
+                name = variable_entry.get().strip()
+                if not name:
+                    raise ValueError("Enter a variable name to search for.")
+                scope = variable_scope.get()
+                variable_identity(name, scope)
+                return {"text_source": scope, "text_variable": name,
+                        "text": txt_entry.get().strip()}
+            value = txt_entry.get().strip()
+            if not value:
+                raise ValueError("Target text cannot be empty.")
+            return {"text_source": "Literal", "text_variable": "", "text": value}
 
         off_row = tk.Frame(body, bg=BG_PANEL)
         off_row.pack(fill=tk.X, pady=(0, 7))
@@ -10455,9 +10501,7 @@ class VSCodeQueueViewer(tk.Frame):
                 if area[2] * area[3] > 16_000_000:
                     raise ValueError("Search region is over 16 million pixels. Select a smaller area.")
                 ox, oy = int(ox_entry.get().strip()), int(oy_entry.get().strip())
-                target_text = txt_entry.get().strip()
-                if not target_text:
-                    raise ValueError("Target text cannot be empty.")
+                search_settings = target_settings()
             except ValueError as exc:
                 error_lbl.config(text=str(exc) or "Enter valid integer coordinates and offsets.")
                 return
@@ -10469,7 +10513,7 @@ class VSCodeQueueViewer(tk.Frame):
                 error_lbl.config(text=str(exc))
                 return
             updated_action.update({"type": "find_text", "area": area,
-                                   "text": target_text, "anchor": anchor_var.get(),
+                                   **search_settings, "anchor": anchor_var.get(),
                                    "ox": ox, "oy": oy, "action": act_var.get(),
                                    "match_mode": match_var.get(), "scan_mode": scan_var.get(),
                                    "occurrence": occurrence_var.get(),
@@ -10494,9 +10538,7 @@ class VSCodeQueueViewer(tk.Frame):
             try:
                 coords = [int(field.get().strip()) for field in area_entries]
                 validated_capture_area(coords)
-                target = txt_entry.get().strip()
-                if not target:
-                    raise ValueError('Enter text to search for')
+                target = resolve_find_text_target(self.app, target_settings())
                 options = {'match_mode': match_var.get(), 'scan_mode': scan_var.get(),
                            'occurrence': occurrence_var.get()}
             except (ValueError, MacroExecutionError) as exc:
