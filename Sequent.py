@@ -4657,7 +4657,7 @@ def sequent_screen_outcome_config(action, found):
         target = ''
         behavior = ('Continue' if found or typ == 'search_area'
                     else 'Stop with Error')
-    if behavior not in SCREEN_OUTCOME_OPTIONS:
+    if behavior not in SCREEN_OUTCOME_OPTIONS and not (typ == 'find_text' and found and behavior == 'Save Coordinates to Variables'):
         raise MacroExecutionError(f'Invalid {key} option: {behavior!r}')
     return behavior, str(target or '').strip()
 
@@ -4687,7 +4687,8 @@ def sequent_add_screen_outcome_editor(parent, app, action):
         tk.Label(frame, text=caption, bg=BG_PANEL, fg=TEXT_MUTED,
                  font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(0, 3))
         choice = tk.StringVar(value=mode)
-        menu = tk.OptionMenu(frame, choice, *SCREEN_OUTCOME_OPTIONS)
+        choices = SCREEN_OUTCOME_OPTIONS + (('Save Coordinates to Variables',) if found and action.get('type') == 'find_text' else ())
+        menu = tk.OptionMenu(frame, choice, *choices)
         menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
                     highlightthickness=1, highlightbackground=BG_BORDER)
         menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
@@ -4705,6 +4706,27 @@ def sequent_add_screen_outcome_editor(parent, app, action):
             selected['variable'] = None
             selected['kind'] = None
             mode = choice.get()
+            if mode == 'Save Coordinates to Variables':
+                tk.Label(target_box, text='Save detected text coordinates as:', bg=BG_PANEL,
+                         fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+                entries = {}
+                for field, label in (('save_x_variable', 'Found X'), ('save_y_variable', 'Found Y'),
+                                     ('save_click_x_variable', 'Click X'), ('save_click_y_variable', 'Click Y')):
+                    row = tk.Frame(target_box, bg=BG_PANEL)
+                    row.pack(fill=tk.X, pady=2)
+                    tk.Label(row, text=label, width=10, anchor='w', bg=BG_PANEL,
+                             fg=TEXT_MUTED).pack(side=tk.LEFT)
+                    variable = tk.StringVar(value=str(action.get(field, '')))
+                    tk.Entry(row, textvariable=variable, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                             insertbackground=TEXT_PRIMARY).pack(side=tk.LEFT, fill=tk.X, expand=True)
+                    entries[field] = variable
+                scope = tk.StringVar(value=action.get('coordinate_scope', 'Local'))
+                tk.OptionMenu(target_box, scope, 'Local', 'Global').pack(fill=tk.X, pady=3)
+                selected['entries'] = entries
+                selected['scope'] = scope
+                return
+            selected.pop('entries', None)
+            selected.pop('scope', None)
             if mode not in ('Run Saved Macro', 'Jump to Label'):
                 return
             values = presets if mode == 'Run Saved Macro' else labels
@@ -4734,7 +4756,7 @@ def sequent_add_screen_outcome_editor(parent, app, action):
         result = {}
         for key, (choice, selected) in settings.items():
             mode = choice.get()
-            if mode not in SCREEN_OUTCOME_OPTIONS:
+            if mode not in SCREEN_OUTCOME_OPTIONS and not (key == 'if_found' and action.get('type') == 'find_text' and mode == 'Save Coordinates to Variables'):
                 raise MacroExecutionError(f'Invalid {key}: {mode}')
             target = ''
             if mode in ('Run Saved Macro', 'Jump to Label'):
@@ -4743,6 +4765,13 @@ def sequent_add_screen_outcome_editor(parent, app, action):
                 if target not in available:
                     item = 'saved macro' if mode == 'Run Saved Macro' else 'label'
                     raise MacroExecutionError(f'Select an existing {item} for {key.replace("_", " ")}.')
+            if mode == 'Save Coordinates to Variables':
+                entries = selected.get('entries', {})
+                names = {field: var.get().strip() for field, var in entries.items()}
+                if not any(names.values()):
+                    raise MacroExecutionError('Enter at least one coordinate variable name.')
+                result.update(names)
+                result['coordinate_scope'] = selected['scope'].get()
             result[key] = mode
             result[key + '_target'] = target
         return result
@@ -4987,7 +5016,7 @@ def resolve_find_text_target(app, action):
 
 def save_find_text_coordinates(app, action, box):
     """Save matched anchor coordinates and click coordinates independently."""
-    if not box:
+    if not box or (action.get('if_found') != 'Save Coordinates to Variables' and not any(action.get(k) for k in ('save_x_variable', 'save_y_variable', 'save_click_x_variable', 'save_click_y_variable'))):
         return
     x, y = color_anchor_position(box, action.get('anchor', 'Center'))
     click_x, click_y = color_click_target(action, box)
@@ -5856,7 +5885,7 @@ class SequentDynamicEngine:
                 if hasattr(self.app, 'trace_action'):
                     self.app.trace_action('compare_text',
                         'ERROR' if compare_error else 'MATCH' if result['matched'] else 'MISMATCH')
-                if behavior == 'Continue':
+                if behavior in ('Continue', 'Save Coordinates to Variables'):
                     index += 1
                     continue
                 if behavior == 'Set Variable':
