@@ -6046,6 +6046,10 @@ class SequentDynamicEngine:
             if typ in SCREEN_RECOGNITION_TYPES:
                 match = self._recognize_screen_action(action, idle=idle)
                 behavior, target = sequent_screen_outcome_config(action, match['found'])
+                if behavior == 'Save Coordinates to Variables' and typ == 'find_text' and match['found']:
+                    # Coordinates were saved by _recognize_screen_action on a successful match.
+                    # Treat this branch as a normal continuation.
+                    behavior = 'Continue'
                 if behavior == 'Continue':
                     index += 1
                     if not idle:
