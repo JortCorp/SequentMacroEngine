@@ -8628,8 +8628,11 @@ class VSCodeQueueViewer(tk.Frame):
             selector.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0)
             selector['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
             selector.pack(fill=tk.X)
-            fixed_frame = tk.Frame(body, bg=BG_PANEL)
-            variable_frame = tk.Frame(body, bg=BG_PANEL)
+            # Keep conditional fields in a dedicated slot immediately below this selector.
+            slot = tk.Frame(body, bg=BG_PANEL)
+            slot.pack(fill=tk.X, pady=(4, 5))
+            fixed_frame = tk.Frame(slot, bg=BG_PANEL)
+            variable_frame = tk.Frame(slot, bg=BG_PANEL)
             tk.Label(fixed_frame, text=f'{axis.upper()} Position', bg=BG_PANEL,
                      fg=TEXT_MUTED).pack(anchor='w')
             fixed = tk.Entry(fixed_frame, bg=BG_INPUT, fg=TEXT_PRIMARY,
@@ -8652,7 +8655,7 @@ class VSCodeQueueViewer(tk.Frame):
             def refresh(*_, src=source, ff=fixed_frame, vf=variable_frame):
                 ff.pack_forget()
                 vf.pack_forget()
-                (vf if src.get() == 'Variable' else ff).pack(fill=tk.X, pady=(4, 5))
+                (vf if src.get() == 'Variable' else ff).pack(fill=tk.X)
             source.trace_add('write', refresh)
             refresh()
             axes[axis] = (source, fixed, name, scope)
