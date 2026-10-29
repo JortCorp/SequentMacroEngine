@@ -7411,6 +7411,17 @@ class VSCodeQueueViewer(tk.Frame):
             font=("Segoe UI", 9), bd=0, relief="flat")
         self._action_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), pady=7)
         self._action_search_entry.bind("<Return>", self._select_first_search_result)
+        self._action_favorites = getattr(self, '_action_favorites', set())
+        self._action_collapsed = getattr(self, '_action_collapsed', set())
+        self._action_filter = tk.StringVar(value='All')
+        filter_bar = tk.Frame(nav, bg=BG_SIDEBAR)
+        filter_bar.pack(fill=tk.X, padx=10, pady=(0, 8))
+        for title in ('All', 'Favorites'):
+            btn = tk.Label(filter_bar, text=title, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                           font=('Segoe UI', 8), padx=11, pady=5, cursor='hand2')
+            btn.pack(side=tk.LEFT, padx=(0, 5))
+            btn.bind('<Button-1>', lambda e, t=title: self._action_filter.set(t))
+        self._action_filter.trace_add('write', lambda *_: self._rebuild_action_picker())
 
         picker_area = tk.Frame(nav, bg=BG_SIDEBAR)
         picker_area.pack(fill=tk.BOTH, expand=True, padx=(4, 2), pady=(0, 8))
@@ -7544,6 +7555,20 @@ class VSCodeQueueViewer(tk.Frame):
                 canvas.yview_scroll(amount, "units")
                 return "break"
 
+    def _toggle_action_category(self, category):
+        if category in self._action_collapsed:
+            self._action_collapsed.remove(category)
+        else:
+            self._action_collapsed.add(category)
+        self._rebuild_action_picker()
+
+    def _toggle_action_favorite(self, name):
+        if name in self._action_favorites:
+            self._action_favorites.remove(name)
+        else:
+            self._action_favorites.add(name)
+        self._rebuild_action_picker()
+
     def _rebuild_action_picker(self):
         if not self.sub_menu or not self.sub_menu.winfo_exists():
             return
@@ -7551,61 +7576,124 @@ class VSCodeQueueViewer(tk.Frame):
         old_scroll = self._action_picker_canvas.yview()[0]
         for child in self._action_picker_inner.winfo_children():
             child.destroy()
-
+        all_items = {name: (name, desc, icon) for _, actions in self.ACTION_PICKER_GROUPS
+                     for name, desc, icon in actions}
+        groups = []
+        favorites = [all_items[name] for name in sorted(self._action_favorites) if name in all_items]
+        if favorites:
+            groups.append(('Favorites', favorites))
+        if self._action_filter.get() != 'Favorites':
+            groups.extend(self.ACTION_PICKER_GROUPS)
         matches = []
-        for category, actions in self.ACTION_PICKER_GROUPS:
-            visible = [item for item in actions if not search or
-                       search in category.casefold() or
-                       search in item[0].casefold() or
-                       search in item[1].casefold()]
+        for category, actions in groups:
+            visible = [item for item in actions if
+                       (not search or search in category.casefold() or
+                        search in item[0].casefold() or search in item[1].casefold())]
             if not visible:
                 continue
-            tk.Label(self._action_picker_inner, text=category.upper(),
-                     font=("Segoe UI", 8, "bold"), fg=TEXT_MUTED,
-                     bg=BG_SIDEBAR, anchor="w").pack(
-                         fill=tk.X, padx=14, pady=(14, 5))
+            section = tk.Frame(self._action_picker_inner, bg=BG_SIDEBAR)
+            section.pack(fill=tk.X, padx=(8, 9), pady=(8, 0))
+            is_closed = category in self._action_collapsed and not search
+            heading = tk.Label(section, text=('▸  ' if is_closed else '▾  ') +
+                               category.upper() + f'  ({len(visible)})',
+                               font=('Segoe UI', 8, 'bold'), fg=TEXT_MUTED,
+                               bg=BG_SIDEBAR, anchor='w', cursor='hand2', pady=5)
+            heading.pack(fill=tk.X)
+            heading.bind('<Button-1>', lambda e, c=category: self._toggle_action_category(c))
             for name, description, sigil in visible:
-                matches.append(name)
-                selected = (name == self._selected_action_name)
-                row_color = BG_SELECTED if selected else BG_SIDEBAR
-                tile = tk.Frame(self._action_picker_inner, bg=row_color,
-                                cursor="hand2", padx=9, pady=8)
-                tile.pack(fill=tk.X, padx=(4, 8), pady=2)
-                accent = SequentRoundedAccentBar(
-                    tile, thickness=3, background=row_color,
-                    accent=COLOR_ACCENT if selected else '', inset=4)
-                accent.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 9))
-                tag = SequentIcon(tile, sequent_icon_for_action(name),
-                                  color=SYNTAX_BLUE, bg=BG_INPUT, size=24,
-                                  override_key=sequent_icon_slot('action', name),
-                                  slot_label=name)
-                tag.pack(side=tk.LEFT, padx=(0, 8))
-                names = tk.Frame(tile, bg=row_color)
-                names.pack(side=tk.LEFT, fill=tk.X, expand=True)
-                name_lbl = tk.Label(
-                    names, text=name, font=("Segoe UI", 9, "bold"),
-                    bg=row_color, fg=TEXT_PRIMARY, anchor="w")
-                name_lbl.pack(fill=tk.X)
-                summary = tk.Label(
-                    names, text=description, font=("Segoe UI", 8),
-                    bg=row_color, fg=TEXT_MUTED, anchor="w", justify="left",
-                    wraplength=170)
-                summary.pack(fill=tk.X, pady=(2, 0))
-                for widget in (tile, accent, tag, names, name_lbl, summary):
-                    widget.bind("<Button-1>",
-                                lambda e, n=name: self._switch_action_view(
-                                    n, self._action_menu_line_num,
-                                    self._action_menu_edit_idx))
+                if name not in matches:
+                    matches.append(name)
+                if is_closed:
+                    continue
+                selected = name == self._selected_action_name
+                color = BG_SELECTED if selected else BG_SIDEBAR
+                row = tk.Frame(self._action_picker_inner, bg=color, cursor='hand2', pady=5)
+                row.pack(fill=tk.X, padx=(7, 9), pady=1)
+                ico = SequentIcon(row, sequent_icon_for_action(name), color=SYNTAX_BLUE,
+                                  bg=color, size=17,
+                                  override_key=sequent_icon_slot('action', name), slot_label=name)
+                ico.pack(side=tk.LEFT, padx=(8, 8))
+                label = tk.Label(row, text=name, bg=color, fg=TEXT_PRIMARY,
+                                 font=('Segoe UI', 9, 'bold' if selected else 'normal'),
+                                 anchor='w', cursor='hand2')
+                label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                star = tk.Label(row, text='★' if name in self._action_favorites else '☆',
+                                bg=color, fg=COLOR_ACCENT if name in self._action_favorites else TEXT_MUTED,
+                                font=('Segoe UI', 13), cursor='hand2', padx=7)
+                star.pack(side=tk.RIGHT)
+                star.bind('<Button-1>', lambda e, n=name: self._toggle_action_favorite(n))
+                for widget in (row, ico, label):
+                    widget.bind('<Button-1>', lambda e, n=name: self._switch_action_view(
+                        n, self._action_menu_line_num, self._action_menu_edit_idx))
         self._visible_action_names = matches
         if not matches:
-            tk.Label(self._action_picker_inner,
-                     text="No matching actions.\nTry another search.",
-                     font=("Segoe UI", 9), bg=BG_SIDEBAR,
-                     fg=TEXT_MUTED, justify="center").pack(padx=8, pady=32)
+            tk.Label(self._action_picker_inner, text='No matching actions',
+                     bg=BG_SIDEBAR, fg=TEXT_MUTED).pack(pady=24)
         self._action_picker_inner.update_idletasks()
-        self._action_picker_canvas.configure(
-            scrollregion=self._action_picker_canvas.bbox("all"))
-        self._action_picker_canvas.yview_moveto(old_scroll)
+        self._action_picker_canvas.configure(scrollregion=self._action_picker_canvas.bbox('all'))
+        self._action_picker_canvas.yview_moveto(0 if search else old_scroll)
+
+    def open_action_command_palette(self, event=None):
+        """Fast searchable action chooser; opens the existing editor unchanged."""
+        if getattr(self, '_command_palette', None) is not None:
+            try:
+                if self._command_palette.winfo_exists():
+                    self._command_palette.lift()
+                    self._palette_search.focus_set()
+                    return 'break'
+            except tk.TclError:
+                pass
+        win = tk.Toplevel(self.app.root)
+        self._command_palette = win
+        win.title('Sequent — Insert Action')
+        win.configure(bg=BG_PANEL)
+        win.geometry('480x420')
+        win.transient(self.app.root)
+        win.bind('<Escape>', lambda e: win.destroy())
+        tk.Label(win, text='INSERT ACTION', bg=BG_PANEL, fg=TEXT_PRIMARY,
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w', padx=18, pady=(16, 7))
+        query = tk.StringVar()
+        entry = tk.Entry(win, textvariable=query, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                         insertbackground=TEXT_PRIMARY, font=('Segoe UI', 11), bd=0)
+        entry.pack(fill=tk.X, padx=18, ipady=8)
+        self._palette_search = entry
+        result_frame = tk.Frame(win, bg=BG_PANEL)
+        result_frame.pack(fill=tk.BOTH, expand=True, padx=18, pady=12)
+        scroll_canvas = tk.Canvas(result_frame, bg=BG_PANEL, bd=0, highlightthickness=0)
+        scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ModernScrollBar(result_frame, command=scroll_canvas.yview,
+                                    width=12, bg_trough=BG_PANEL)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        scroll_canvas.configure(yscrollcommand=scrollbar.set)
+        inner = tk.Frame(scroll_canvas, bg=BG_PANEL)
+        item = scroll_canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda e: scroll_canvas.configure(scrollregion=scroll_canvas.bbox('all')))
+        scroll_canvas.bind('<Configure>', lambda e: scroll_canvas.itemconfigure(item, width=e.width))
+        actions = [(name, desc) for _, group in self.ACTION_PICKER_GROUPS for name, desc, _ in group]
+        results = []
+        def choose(name):
+            win.destroy()
+            # Use the normal add-action workflow, preserving all action editors.
+            line_num = max(2, len(self.app.recorded_actions) + 2)
+            self.open_action_submenu(line_num, None)
+            if self.sub_menu and self.sub_menu.winfo_exists():
+                self._switch_action_view(name, self._action_menu_line_num, self._action_menu_edit_idx)
+        def refresh(*_):
+            for child in inner.winfo_children():
+                child.destroy()
+            term = query.get().strip().casefold()
+            results[:] = [name for name, desc in actions if term in name.casefold() or term in desc.casefold()]
+            for name in results:
+                line = tk.Label(inner, text='  ' + name, anchor='w', bg=BG_PANEL,
+                                fg=TEXT_PRIMARY, font=('Segoe UI', 9), pady=7, cursor='hand2')
+                line.pack(fill=tk.X)
+                line.bind('<Button-1>', lambda e, n=name: choose(n))
+            scroll_canvas.yview_moveto(0)
+        query.trace_add('write', refresh)
+        entry.bind('<Return>', lambda e: choose(results[0]) if results else None)
+        refresh()
+        entry.focus_set()
+        return 'break'
 
     def _switch_action_view(self, action_type, line_num, edit_idx=None):
         if not self.sub_menu or not self.sub_menu.winfo_exists():
@@ -15242,6 +15330,8 @@ class BuiltInMacroApp:
         # Trigger the search dynamically as the user types
         self.queue_search_var.trace_add("write", lambda *args: self.queue_viewer.search_queue(self.queue_search_var.get()))
         self.queue_viewer = VSCodeQueueViewer(queue_dock, app_instance=self)
+        self.root.bind('<Control-Shift-P>', self.queue_viewer.open_action_command_palette, add='+')
+        self.root.bind('<Control-Shift-p>', self.queue_viewer.open_action_command_palette, add='+')
         self.queue_viewer.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self.queue_viewer.append_line("// Awaiting input...", SYNTAX_GREEN)
         for seq, dx, dy in [
