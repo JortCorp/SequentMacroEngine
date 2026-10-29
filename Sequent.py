@@ -40,6 +40,30 @@ def sequent_gradient_colors(first, second, steps=64):
                         for x,y in zip(a,b)) for t in range(steps)]
 
 
+class SequentSelectionGradient(tk.Canvas):
+    """Canvas backdrop for a selected row, painted with a horizontal gradient."""
+    def __init__(self, parent, start, end, **kwargs):
+        super().__init__(parent, bd=0, highlightthickness=0, takefocus=0, **kwargs)
+        self.start, self.end = start, end
+        self.bind('<Configure>', self.redraw, add='+')
+
+    def set_colors(self, start, end):
+        self.start, self.end = start, end
+        self.redraw()
+
+    def redraw(self, event=None):
+        self.delete('gradient')
+        width, height = self.winfo_width(), self.winfo_height()
+        if width < 2 or height < 2:
+            return
+        inks = sequent_gradient_colors(self.start, self.end, min(128, max(2, width)))
+        for i, ink in enumerate(inks):
+            x0 = round(width*i/len(inks))
+            x1 = round(width*(i+1)/len(inks))+1
+            self.create_rectangle(x0, 0, x1, height, fill=ink,
+                                  outline='', tags='gradient')
+
+
 class SequentGradientStrip(tk.Canvas):
     """Resizing, non-interactive accent gradient preview/header strip."""
     def __init__(self, parent, start, end, height=10, **kwargs):
@@ -7670,16 +7694,32 @@ class VSCodeQueueViewer(tk.Frame):
                 color = BG_SELECTED if selected else BG_SIDEBAR
                 row = tk.Frame(self._action_picker_inner, bg=color, cursor='hand2', pady=5)
                 row.pack(fill=tk.X, padx=(7, 9), pady=1)
+                use_gradient = selected and bool(getattr(self.app, 'gradient_enabled', False))
+                if use_gradient:
+                    gradient_bg = SequentSelectionGradient(
+                        row, COLOR_ACCENT, self.app.gradient_second_color, bg=color)
+                    gradient_bg.place(x=0, y=0, relwidth=1, relheight=1)
+                    gradient_bg.lower()
+                    gradient_bg.bind('<Button-1>', lambda e, n=name: self._switch_action_view(
+                        n, self._action_menu_line_num, self._action_menu_edit_idx))
+                    # Text-bearing widgets use representative gradient samples;
+                    # the canvas paints the full selected surface behind them.
+                    inks = sequent_gradient_colors(COLOR_ACCENT, self.app.gradient_second_color, 8)
+                    icon_bg, label_bg, star_bg = inks[1], inks[4], inks[7]
+                else:
+                    icon_bg = label_bg = star_bg = color
                 ico = SequentIcon(row, sequent_icon_for_action(name), color=SYNTAX_BLUE,
-                                  bg=color, size=17,
+                                  bg=icon_bg, size=17,
                                   override_key=sequent_icon_slot('action', name), slot_label=name)
                 ico.pack(side=tk.LEFT, padx=(8, 8))
-                label = tk.Label(row, text=name, bg=color, fg=TEXT_PRIMARY,
+                label = tk.Label(row, text=name, bg=label_bg,
+                                 fg=accent_text_color(COLOR_ACCENT) if use_gradient else TEXT_PRIMARY,
                                  font=('Segoe UI', 9, 'bold' if selected else 'normal'),
                                  anchor='w', cursor='hand2')
                 label.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 star = tk.Label(row, text='★' if name in self._action_favorites else '☆',
-                                bg=color, fg=COLOR_ACCENT if name in self._action_favorites else TEXT_MUTED,
+                                bg=star_bg, fg=(accent_text_color(COLOR_ACCENT) if use_gradient else
+                                    (COLOR_ACCENT if name in self._action_favorites else TEXT_MUTED)),
                                 font=('Segoe UI', 13), cursor='hand2', padx=7)
                 star.pack(side=tk.RIGHT)
                 star.bind('<Button-1>', lambda e, n=name: self._toggle_action_favorite(n))
@@ -12122,6 +12162,10 @@ class SidebarButton(tk.Frame):
         super().__init__(parent, bg=BG_SIDEBAR, cursor="hand2", **kwargs)
         self.command = command
         self.active = False
+        self.selection_gradient = SequentSelectionGradient(self, COLOR_ACCENT, COLOR_ACCENT,
+                                                            bg=BG_SIDEBAR)
+        self.selection_gradient.place_forget()
+        self.selection_gradient.bind('<Button-1>', self.on_click)
         
         self.indicator = SequentRoundedAccentBar(
             self, thickness=4, background=BG_SIDEBAR, accent='', inset=5)
@@ -12170,6 +12214,22 @@ class SidebarButton(tk.Frame):
         self.indicator.set_gradient(COLOR_ACCENT if is_active else '',
             getattr(app, 'gradient_second_color', None) if gradient and is_active else None)
         self.indicator.configure(bg=color)
+        if is_active and gradient:
+            end = getattr(app, 'gradient_second_color', COLOR_ACCENT)
+            self.selection_gradient.set_colors(COLOR_ACCENT, end)
+            self.selection_gradient.place(x=0, y=0, relwidth=1, relheight=1)
+            self.selection_gradient.lower()
+            # Match each foreground widget to its position on the gradient.
+            self.update_idletasks()
+            width = max(1, self.winfo_width())
+            inks = sequent_gradient_colors(COLOR_ACCENT, end, 128)
+            def sampled(widget):
+                x = widget.winfo_x() + widget.winfo_width() // 2
+                return inks[min(127, max(0, int(127*x/width)))]
+            self.label.configure(bg=sampled(self.label), fg=accent_text_color(COLOR_ACCENT))
+            self.icon.paint(bg=sampled(self.icon), color=accent_text_color(COLOR_ACCENT))
+        else:
+            self.selection_gradient.place_forget()
 
 class GhostReticle:
     def __init__(self, root):
