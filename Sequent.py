@@ -4919,21 +4919,82 @@ def variable_identity(name, scope=None):
 
 
 def _global_variable_path(app):
-    return os.path.join(app.presets_dir, 'globals.json')
+    """Per-user writable storage; never require write access to installation/presets."""
+    base = (os.environ.get('LOCALAPPDATA') or
+            os.path.join(os.path.expanduser('~'), 'AppData', 'Local'))
+    return os.path.join(base, 'Sequent', 'globals.json')
+
+
+def _retry_global_io(operation):
+    """Windows antivirus/indexers can briefly lock JSON files during replace/read."""
+    for attempt in range(6):
+        try:
+            return operation()
+        except (PermissionError, OSError) as exc:
+            # Only retry Windows sharing/lock/access-denied errors; not arbitrary I/O.
+            if getattr(exc, 'winerror', None) not in (5, 32, 33) and getattr(exc, 'errno', None) not in (13, 16):
+                raise
+            if attempt == 5:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
+def _read_global_file(path):
+    def read():
+        with open(path, 'r', encoding='utf-8') as stream:
+            return json.load(stream)
+    return _retry_global_io(read)
 
 
 def _read_global_values(app):
     path = _global_variable_path(app)
     try:
-        with open(path, 'r', encoding='utf-8') as stream:
-            data = json.load(stream)
+        data = _read_global_file(path)
     except FileNotFoundError:
-        return {}
+        # Migrate once from older Sequent versions which stored globals beside
+        # presets. Never delete or modify the original during migration.
+        legacy = os.path.join(app.presets_dir, 'globals.json')
+        if os.path.normcase(os.path.abspath(legacy)) == os.path.normcase(os.path.abspath(path)):
+            return {}
+        try:
+            data = _read_global_file(legacy)
+        except FileNotFoundError:
+            return {}
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise MacroExecutionError(f'Unable to read legacy global variables: {exc}') from exc
+        if not isinstance(data, dict):
+            raise MacroExecutionError('Legacy global variable file must contain a JSON object')
+        _write_global_values(app, data)
+        return data
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise MacroExecutionError(f'Unable to read global variables: {exc}') from exc
+        raise MacroExecutionError(f'Unable to read global variables at {path}: {exc}') from exc
     if not isinstance(data, dict):
         raise MacroExecutionError('Global variable file must contain a JSON object')
     return data
+
+
+def _write_global_values(app, data):
+    path = _global_variable_path(app)
+    folder = os.path.dirname(path)
+    temporary = None
+    try:
+        os.makedirs(folder, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix='.sequent-global-', suffix='.tmp', dir=folder)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(data, stream, indent=2, ensure_ascii=True)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        _retry_global_io(lambda: os.replace(temporary, path))
+    except (OSError, TypeError, ValueError) as exc:
+        raise MacroExecutionError(f'Unable to save global variables at {path}: {exc}') from exc
+    finally:
+        if temporary is not None:
+            try:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def get_global_var(app, name, default=''):
@@ -4942,36 +5003,11 @@ def get_global_var(app, name, default=''):
 
 
 def set_global_var(app, name, value):
-    """Atomically persist a value so another macro can access it.
-
-    Preserve existing globals if a read fails, rather than overwriting a
-    damaged/unreadable file with only the new variable.
-    """
-    path = _global_variable_path(app)
+    """Save a global value in per-user storage with atomic replacement."""
     with _GLOBAL_VARIABLE_LOCK:
         data = _read_global_values(app)
         data[name] = str(value)
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            fd, temporary = tempfile.mkstemp(prefix='.sequent-global-', suffix='.tmp',
-                                              dir=os.path.dirname(path))
-        except OSError as exc:
-            raise MacroExecutionError(f'Unable to prepare global variable file: {exc}') from exc
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-                # JSON escaping protects embedded double quotes, backslashes,
-                # CR/LF, tabs and all other control characters. Using ASCII
-                # escapes also makes malformed UTF-16 surrogate data from
-                # Windows clipboard input round-trip without a UTF-8 write
-                # error. json.load reconstructs the original Python string.
-                json.dump(data, stream, indent=2, ensure_ascii=True)
-                stream.write('\n')
-            os.replace(temporary, path)
-        except (OSError, TypeError, ValueError) as exc:
-            raise MacroExecutionError(f'Unable to save global variables: {exc}') from exc
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+        _write_global_values(app, data)
 
 
 def get_variable(app, name, scope=None, default=''):
@@ -5191,7 +5227,7 @@ def sequent_text_file_path(app, filename):
         path = os.path.abspath(os.path.join(root, value))
         if os.path.commonpath((root, path)) != root:
             raise MacroExecutionError('Relative text file paths must stay in the presets/text_files folder')
-    if os.path.normcase(path) == os.path.normcase(_global_variable_path(app)):
+    if os.path.basename(path).lower() == 'globals.json':
         raise MacroExecutionError('globals.json is reserved for Sequent variables; select a .txt file')
     return path
 
@@ -14084,7 +14120,7 @@ class BuiltInMacroApp:
                     with _GLOBAL_VARIABLE_LOCK:
                         all_values=_read_global_values(self)
                         all_values.pop(name,None)
-                        self._write_json_atomically(_global_variable_path(self),all_values)
+                        _write_global_values(self, all_values)
                 except (MacroExecutionError,OSError) as exc:
                     messagebox.showerror('Delete variable',str(exc),parent=window);return
             listing.selection_clear(0,tk.END)
