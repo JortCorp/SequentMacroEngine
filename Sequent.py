@@ -4991,6 +4991,52 @@ def set_variable(app, name, value, scope=None):
         app.variables[name] = str(value)
 
 
+
+# Optional Boolean guard for Read Clipboard. Existing actions remain unconditional.
+def sequent_clipboard_condition_passes(app, action):
+    if not action.get('condition_enabled', False):
+        return True
+    conditions = action.get('conditions', [])
+    if not conditions:
+        raise MacroExecutionError('Read Clipboard: enabled condition needs at least one rule')
+    result = None
+    for index, rule in enumerate(conditions):
+        name = str(rule.get('left_name', '')).strip()
+        if not name:
+            raise MacroExecutionError('Read Clipboard: missing source variable name')
+        missing = object()
+        left = get_variable(app, name, rule.get('left_scope', 'local'), default=missing)
+        if left is missing:
+            raise MacroExecutionError(f'Read Clipboard: variable {name!r} is undefined')
+        operator = rule.get('operator', '==')
+        if operator in ('empty', 'not empty', 'exists', 'missing'):
+            matched = dynamic_compare(left, operator, '')
+        else:
+            if rule.get('right_type', 'text') == 'variable':
+                other = str(rule.get('right_name', '')).strip()
+                if not other:
+                    raise MacroExecutionError('Read Clipboard: comparison variable name required')
+                right = get_variable(app, other, rule.get('right_scope', 'local'), default=missing)
+                if right is missing:
+                    raise MacroExecutionError(f'Read Clipboard: variable {other!r} is undefined')
+            else:
+                right = rule.get('right_text', '')
+            matched = dynamic_compare(left, operator, right)
+        if rule.get('negate', False):
+            matched = not matched
+        if result is None:
+            result = matched
+        else:
+            connector = rule.get('join', 'AND')
+            if connector == 'AND':
+                result = result and matched
+            elif connector == 'OR':
+                result = result or matched
+            else:
+                raise MacroExecutionError(f'Read Clipboard: invalid connector {connector!r}')
+    return bool(result)
+
+
 def resolve_find_text_target(app, action):
     """Resolve literal/local/global OCR targets at execution time."""
     source = action.get('text_source', 'Literal')
@@ -6460,28 +6506,31 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter.configure(width=5)
 
     def search_queue(self, query):
-        """Highlights and scrolls to matching text in the action queue."""
+        """Highlight matches and jump the queue scrollbar to the first result."""
         self.code_text.tag_remove("search_highlight", "1.0", "end")
+        query = str(query or "")
         if not query:
             return
-            
-        self.code_text.tag_configure("search_highlight", background=COLOR_ACCENT, foreground=TEXT_ON_ACCENT)
-        
+
+        self.code_text.tag_configure(
+            "search_highlight", background=COLOR_ACCENT, foreground=TEXT_ON_ACCENT)
         start_pos = "1.0"
         first_match = None
         while True:
-            # nocase=True makes the search case-insensitive
-            start_pos = self.code_text.search(query, start_pos, stopindex="end", nocase=True)
-            if not start_pos:
+            match = self.code_text.search(query, start_pos, stopindex="end", nocase=True)
+            if not match:
                 break
-            if not first_match:
-                first_match = start_pos
-            end_pos = f"{start_pos}+{len(query)}c"
-            self.code_text.tag_add("search_highlight", start_pos, end_pos)
+            if first_match is None:
+                first_match = match
+            end_pos = self.code_text.index(f"{match}+{len(query)}c")
+            self.code_text.tag_add("search_highlight", match, end_pos)
             start_pos = end_pos
-            
-        if first_match:
-            self.code_text.see(first_match)
+
+        if first_match is not None:
+            # .see() only guarantees visibility, often leaving the first match
+            # near the bottom. yview(index) moves it to the top of the viewport.
+            self.code_text.yview(first_match)
+            self.gutter.yview_moveto(self.code_text.yview()[0])
 
     def append_line(self, text, color=TEXT_PRIMARY, auto_scroll=True):
         self.line_count += 1
@@ -8179,6 +8228,106 @@ class VSCodeQueueViewer(tk.Frame):
                                  activebackground=COLOR_ACCENT)
         mode_menu.pack(fill=tk.X, pady=(0, 10))
 
+        # Optional guard sits in its own packed container immediately below the operation.
+        condition_enabled = tk.BooleanVar(value=bool(current.get('condition_enabled', False)) if current else False)
+        condition_section = tk.Frame(body, bg=BG_PANEL)
+        condition_section.pack(fill=tk.X, pady=(0, 10))
+        condition_toggle = tk.Checkbutton(
+            condition_section, text='Run only when conditions match',
+            variable=condition_enabled, bg=BG_PANEL, fg=TEXT_PRIMARY,
+            selectcolor=BG_INPUT, activebackground=BG_PANEL)
+        condition_toggle.pack(anchor='w')
+        condition_fields = tk.Frame(condition_section, bg=BG_PANEL)
+        condition_rows = []
+        operators = ('==', '!=', 'contains', 'not contains', 'startswith',
+                     'endswith', '>', '>=', '<', '<=', 'empty', 'not empty', 'regex')
+
+        def condition_menu(parent, variable, options):
+            menu = tk.OptionMenu(parent, variable, *options)
+            menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0,
+                        highlightthickness=1, highlightbackground=BG_BORDER)
+            menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            menu.pack(fill=tk.X, pady=(1, 5))
+            return menu
+
+        def condition_entry(parent, label, initial=''):
+            tk.Label(parent, text=label, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8)).pack(anchor='w')
+            entry = tk.Entry(parent, bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                             highlightbackground=BG_BORDER, highlightthickness=1, bd=0)
+            entry.insert(0, str(initial))
+            entry.pack(fill=tk.X, ipady=3, pady=(1, 5))
+            return entry
+
+        def add_condition(saved=None):
+            saved = saved or {}
+            card = tk.Frame(condition_fields, bg=BG_PANEL,
+                            highlightbackground=BG_BORDER, highlightthickness=1, padx=7, pady=7)
+            card.pack(fill=tk.X, pady=(0, 7))
+            record = {'card': card}
+            if condition_rows:
+                tk.Label(card, text='Combine with previous rule:', bg=BG_PANEL,
+                         fg=TEXT_MUTED).pack(anchor='w')
+                record['join'] = tk.StringVar(value=saved.get('join', 'AND'))
+                condition_menu(card, record['join'], ('AND', 'OR'))
+            else:
+                record['join'] = tk.StringVar(value='AND')
+            record['negate'] = tk.BooleanVar(value=bool(saved.get('negate', False)))
+            tk.Checkbutton(card, text='NOT (invert this condition)', variable=record['negate'],
+                           bg=BG_PANEL, fg=TEXT_PRIMARY, selectcolor=BG_INPUT).pack(anchor='w')
+            record['left_name'] = condition_entry(card, 'Variable Name', saved.get('left_name', ''))
+            tk.Label(card, text='Variable Scope', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+            record['left_scope'] = tk.StringVar(value=saved.get('left_scope', 'local').title())
+            condition_menu(card, record['left_scope'], ('Local', 'Global'))
+            tk.Label(card, text='Comparison', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+            record['operator'] = tk.StringVar(value=saved.get('operator', '=='))
+            condition_menu(card, record['operator'], operators)
+            record['right_type'] = tk.StringVar(value=saved.get('right_type', 'text').title())
+            right_section = tk.Frame(card, bg=BG_PANEL)
+            right_section.pack(fill=tk.X)
+            tk.Label(right_section, text='Compare against', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+            condition_menu(right_section, record['right_type'], ('Text', 'Variable'))
+            text_frame = tk.Frame(right_section, bg=BG_PANEL)
+            record['right_text'] = condition_entry(text_frame, 'Text Value', saved.get('right_text', ''))
+            variable_rhs = tk.Frame(right_section, bg=BG_PANEL)
+            record['right_name'] = condition_entry(variable_rhs, 'Variable Name', saved.get('right_name', ''))
+            tk.Label(variable_rhs, text='Variable Scope', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+            record['right_scope'] = tk.StringVar(value=saved.get('right_scope', 'local').title())
+            condition_menu(variable_rhs, record['right_scope'], ('Local', 'Global'))
+            def refresh_rhs(*_):
+                text_frame.pack_forget()
+                variable_rhs.pack_forget()
+                if record['operator'].get() not in ('empty', 'not empty'):
+                    (variable_rhs if record['right_type'].get() == 'Variable' else text_frame).pack(fill=tk.X)
+            record['right_type'].trace_add('write', refresh_rhs)
+            record['operator'].trace_add('write', refresh_rhs)
+            refresh_rhs()
+            def remove():
+                condition_rows.remove(record)
+                card.destroy()
+            tk.Button(card, text='Remove Condition', command=remove, bg=BG_INPUT,
+                      fg=COLOR_DANGER, bd=0).pack(anchor='e')
+            condition_rows.append(record)
+
+        saved_conditions = current.get('conditions', []) if current else []
+        for rule in saved_conditions:
+            if isinstance(rule, dict):
+                add_condition(rule)
+        if not condition_rows:
+            add_condition()
+        tk.Button(condition_fields, text='+ Add Condition', command=add_condition,
+                  bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0).pack(fill=tk.X, pady=(0, 5))
+        tk.Label(condition_fields, text='Conditions are evaluated before reading the clipboard. '
+                 'A false result skips this action; disabled means normal behavior.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, wraplength=430, justify=tk.LEFT).pack(fill=tk.X)
+        def refresh_condition(*_):
+            if condition_enabled.get():
+                condition_fields.pack(fill=tk.X, pady=(5, 0))
+            else:
+                condition_fields.pack_forget()
+        condition_enabled.trace_add('write', refresh_condition)
+        refresh_condition()
+
         variable_frame = tk.Frame(body, bg=BG_PANEL)
         variable_frame.pack(fill=tk.X)
         tk.Label(variable_frame, text='Default Destination Variable:', font=('Segoe UI', 8, 'bold'),
@@ -8391,6 +8540,35 @@ class VSCodeQueueViewer(tk.Frame):
             scope = scope_var.get().lower()
             mode = next(k for k, v in labels.items() if v == mode_var.get())
             action = {'type': 'read_clipboard', 'mode': mode}
+            if condition_enabled.get():
+                if not condition_rows:
+                    self.app.update_status('Add at least one clipboard condition', COLOR_DANGER)
+                    return
+                rules = []
+                for idx, row in enumerate(condition_rows):
+                    lhs = row['left_name'].get().strip()
+                    rhs_type = row['right_type'].get().lower()
+                    rhs_name = row['right_name'].get().strip()
+                    operator = row['operator'].get()
+                    if not lhs or (operator not in ('empty', 'not empty') and
+                                   rhs_type == 'variable' and not rhs_name):
+                        self.app.update_status('Complete all clipboard condition variable names', COLOR_DANGER)
+                        return
+                    try:
+                        variable_identity(lhs, row['left_scope'].get().lower())
+                        if rhs_type == 'variable' and operator not in ('empty', 'not empty'):
+                            variable_identity(rhs_name, row['right_scope'].get().lower())
+                    except MacroExecutionError as exc:
+                        self.app.update_status(str(exc), COLOR_DANGER)
+                        return
+                    rules.append({
+                        'left_name': lhs, 'left_scope': row['left_scope'].get().lower(),
+                        'operator': operator, 'right_type': rhs_type,
+                        'right_text': row['right_text'].get(), 'right_name': rhs_name,
+                        'right_scope': row['right_scope'].get().lower(),
+                        'negate': row['negate'].get(),
+                        'join': row['join'].get() if idx else 'AND'})
+                action.update(condition_enabled=True, conditions=rules)
             if mode != 'file' or also_set_var.get():
                 try:
                     variable_identity(name, scope)
@@ -15654,6 +15832,9 @@ class BuiltInMacroApp:
             scope_name = variable_identity(var_name, action.get("var_scope"))[1]
             report(f"Saved '{var_name}' as {scope_name.title()} ({len(str(entered_val))} characters)", COLOR_SUCCESS)
         elif act_type == "read_clipboard":
+            if not sequent_clipboard_condition_passes(self, action):
+                report('Read Clipboard skipped: condition was false', SYNTAX_ORANGE)
+                return
             # Pre-existing presets without mode still perform keyword checks.
             mode = action.get('mode', 'keywords')
             if mode == 'capture':
@@ -18197,6 +18378,12 @@ try {{
         if not is_new_source and old_scroll:
             self.queue_viewer.code_text.yview_moveto(old_scroll[0])
             self.queue_viewer.gutter.yview_moveto(old_scroll[0])
+        # Queue redraws replace all text and tags. Reapply the active search
+        # after restoring scroll, so the first match remains in view.
+        if hasattr(self, "queue_search_var"):
+            active_query = self.queue_search_var.get().strip()
+            if active_query:
+                self.queue_viewer.search_queue(active_query)
     
     def _place_settings_page(self):
         """Place the Settings form at rest; never move it per animation frame.
