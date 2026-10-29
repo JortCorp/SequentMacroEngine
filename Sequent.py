@@ -3663,6 +3663,63 @@ class ModernScrollBar(tk.Canvas):
             self.command("moveto", f"{new_first:.6f}")
 
             
+class ModernHorizontalScrollBar(ModernScrollBar):
+    """Transport-style scrollbar with horizontal thumb and drag handling."""
+    def __init__(self, parent, command=None, height=12, **kwargs):
+        super().__init__(parent, command=command, width=height, **kwargs)
+        self.configure(height=height)
+        self.drag_start_x = 0
+
+    def _metrics(self):
+        length = self.winfo_width()
+        span = min(1.0, max(0.0, self.last - self.first))
+        thumb = min(length, max(24, int(span * length)))
+        travel = max(0, length - thumb)
+        max_first = max(0.0, 1.0 - span)
+        start = int((min(self.first, max_first) / max_first) * travel) if max_first and travel else 0
+        return length, thumb, travel, max_first, start
+
+    def draw(self):
+        if not self.winfo_exists():
+            return
+        self.delete('all')
+        length, thumb, travel, max_first, start = self._metrics()
+        height = self.winfo_height()
+        if length <= 2 or height <= 2:
+            return
+        self.create_rectangle(0, 0, length, height, fill=self.bg_trough, outline='')
+        pad = min(5, max(1, height // 4))
+        if thumb > pad * 2:
+            self.create_line(start + pad, height / 2, start + thumb - pad, height / 2,
+                             fill=self.current_color, width=max(2, height - 2 * pad),
+                             capstyle='round')
+
+    def _on_click(self, event):
+        length, thumb, travel, max_first, start = self._metrics()
+        if length <= 2:
+            return
+        if start <= event.x <= start + thumb:
+            self.drag_start_first = self.first
+        else:
+            self.drag_start_first = max(0.0, min(max_first,
+                ((event.x - thumb / 2) / travel) * max_first)) if travel else 0.0
+            if self.command:
+                self.command('moveto', f'{self.drag_start_first:.6f}')
+        self.is_dragging = True
+        self.current_color = self.active_color
+        self.drag_start_x = event.x
+        self.draw()
+
+    def _on_drag(self, event):
+        if not self.is_dragging:
+            return
+        _, _, travel, max_first, _ = self._metrics()
+        new_first = max(0.0, min(max_first,
+            self.drag_start_first + (event.x - self.drag_start_x) / travel * max_first)) if travel else 0.0
+        if self.command:
+            self.command('moveto', f'{new_first:.6f}')
+
+
 # New actions are stored as plain dictionaries alongside legacy recorded actions.
 # Editor field: (key, label, kind, initial[, choice options]).
 DYNAMIC_ACTION_SPECS = {
@@ -13133,8 +13190,8 @@ class StudioTimeline(tk.Frame):
         self.last_drawn_marker_count = 0
         self.canvas = tk.Canvas(self, bg=colors['background'], bd=0,
                                 highlightthickness=0, relief='flat', cursor='crosshair')
-        self.xbar = tk.Scrollbar(self, orient='horizontal', command=self.canvas.xview)
-        self.ybar = tk.Scrollbar(self, orient='vertical', command=self.canvas.yview)
+        self.xbar = ModernHorizontalScrollBar(self, command=self.canvas.xview, height=12, bg_trough=colors['panel'])
+        self.ybar = ModernScrollBar(self, command=self.canvas.yview, width=12, bg_trough=colors['panel'])
         self.canvas.configure(xscrollcommand=self.xbar.set, yscrollcommand=self.ybar.set)
         self.canvas.grid(row=0, column=0, sticky='nsew')
         self.ybar.grid(row=0, column=1, sticky='ns')
@@ -14010,8 +14067,8 @@ class BuiltInMacroApp:
         display = tk.Text(container, wrap='none', bg=BG_INPUT, fg=TEXT_PRIMARY,
                           font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
                           highlightthickness=0, bd=0)
-        vertical = tk.Scrollbar(container, orient='vertical', command=display.yview)
-        horizontal = tk.Scrollbar(container, orient='horizontal', command=display.xview)
+        vertical = ModernScrollBar(container, command=display.yview, width=12, bg_trough=BG_PANEL)
+        horizontal = ModernHorizontalScrollBar(container, command=display.xview, height=12, bg_trough=BG_PANEL)
         display.config(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
         vertical.pack(side=tk.RIGHT, fill=tk.Y)
         horizontal.pack(side=tk.BOTTOM, fill=tk.X)
