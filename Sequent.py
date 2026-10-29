@@ -7419,7 +7419,7 @@ class VSCodeQueueViewer(tk.Frame):
         self._action_picker_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         picker_scroll = ModernScrollBar(
             picker_area, command=self._action_picker_canvas.yview,
-            width=12, bg_trough=BG_SIDEBAR)
+            width=18, bg_trough=BG_SCROLL_TRACK)
         picker_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self._action_picker_canvas.configure(yscrollcommand=picker_scroll.set)
         self._action_picker_inner = tk.Frame(self._action_picker_canvas, bg=BG_SIDEBAR)
@@ -7456,7 +7456,7 @@ class VSCodeQueueViewer(tk.Frame):
         self._action_editor_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         editor_scroll = ModernScrollBar(
             editor_shell, command=self._action_editor_canvas.yview,
-            width=14, bg_trough=BG_PANEL)
+            width=18, bg_trough=BG_SCROLL_TRACK)
         editor_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self._action_editor_canvas.configure(yscrollcommand=editor_scroll.set)
         self.action_content_frame = tk.Frame(self._action_editor_canvas, bg=BG_PANEL,
@@ -12900,7 +12900,7 @@ class SequentIDEWindow:
             highlightthickness=0, font=('Segoe UI', 9), **kwargs), 'check')
 
     def scroll(self, parent, content, side=tk.RIGHT):
-        scroll = self._add(ModernScrollBar(parent, command=content.yview, width=13), 'scroll')
+        scroll = self._add(ModernScrollBar(parent, command=content.yview, width=18, bg_trough=BG_SCROLL_TRACK), 'scroll')
         content.configure(yscrollcommand=scroll.set)
         scroll.pack(side=side, fill=tk.Y)
         return scroll
@@ -13190,11 +13190,12 @@ class StudioTimeline(tk.Frame):
         self.last_drawn_marker_count = 0
         self.canvas = tk.Canvas(self, bg=colors['background'], bd=0,
                                 highlightthickness=0, relief='flat', cursor='crosshair')
-        self.xbar = ModernHorizontalScrollBar(self, command=self.canvas.xview, height=12, bg_trough=colors['panel'])
-        self.ybar = ModernScrollBar(self, command=self.canvas.yview, width=12, bg_trough=colors['panel'])
+        self.xbar = ModernHorizontalScrollBar(self, command=self.canvas.xview, height=18, bg_trough=BG_SCROLL_TRACK)
+        self.ybar = ModernScrollBar(self, command=self.canvas.yview, width=18, bg_trough=BG_SCROLL_TRACK)
         self.canvas.configure(xscrollcommand=self.xbar.set, yscrollcommand=self.ybar.set)
         self.canvas.grid(row=0, column=0, sticky='nsew')
-        self.ybar.grid(row=0, column=1, sticky='ns')
+        self.ybar.grid(row=0, column=2, sticky='ns')
+        tk.Frame(self, bg=BG_BORDER, width=1).grid(row=0, column=1, sticky='ns')
         self.xbar.grid(row=1, column=0, sticky='ew')
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -14067,11 +14068,13 @@ class BuiltInMacroApp:
         display = tk.Text(container, wrap='none', bg=BG_INPUT, fg=TEXT_PRIMARY,
                           font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
                           highlightthickness=0, bd=0)
-        vertical = ModernScrollBar(container, command=display.yview, width=12, bg_trough=BG_PANEL)
-        horizontal = ModernHorizontalScrollBar(container, command=display.xview, height=12, bg_trough=BG_PANEL)
+        vertical = ModernScrollBar(container, command=display.yview, width=18, bg_trough=BG_SCROLL_TRACK)
+        horizontal = ModernHorizontalScrollBar(container, command=display.xview, height=18, bg_trough=BG_SCROLL_TRACK)
         display.config(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
         vertical.pack(side=tk.RIGHT, fill=tk.Y)
+        tk.Frame(container, bg=BG_BORDER, width=1).pack(side=tk.RIGHT, fill=tk.Y)
         horizontal.pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Frame(container, bg=BG_BORDER, height=1).pack(side=tk.BOTTOM, fill=tk.X)
         display.pack(fill=tk.BOTH, expand=True)
         display.insert('1.0', result['diff'] or '(No line differences)')
         display.config(state='disabled')
@@ -15103,7 +15106,7 @@ class BuiltInMacroApp:
         control_canvas = tk.Canvas(scroll_host, bg=BG_PANEL, highlightthickness=0,
                                    bd=0, yscrollincrement=14)
         scrollbar = ModernScrollBar(scroll_host, command=control_canvas.yview,
-                                    width=12, bg_trough=BG_PANEL)
+                                    width=18, bg_trough=BG_SCROLL_TRACK)
         control_canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         control_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
