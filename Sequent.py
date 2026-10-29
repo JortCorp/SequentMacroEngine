@@ -5005,12 +5005,12 @@ def sequent_clipboard_outcome(action, found):
     return behavior, str(action.get(key + '_target', '') or '').strip()
 
 
-def sequent_clipboard_outcome_editor(parent, app, current):
+def sequent_clipboard_outcome_editor(parent, app, current, title="READ CLIPBOARD RESULTS"):
     """Fixed-position controls; preserve target selections when toggling."""
     current = current or {}
     section = tk.Frame(parent, bg=BG_PANEL)
     section.pack(fill=tk.X, pady=(8, 12))
-    tk.Label(section, text='READ CLIPBOARD RESULTS', bg=BG_PANEL,
+    tk.Label(section, text=title, bg=BG_PANEL,
              fg=SYNTAX_BLUE, font=('Segoe UI', 8, 'bold')).pack(anchor='w')
     tk.Label(section, text='Found means clipboard text was captured or a keyword rule matched. '
              'Not Found means empty clipboard text or no keyword rule matched. '
@@ -5237,6 +5237,23 @@ def sequent_clipboard_to_file(app, action):
         set_variable(app, name, value, scope)
     return {'path':path, 'length':len(value), 'variable':name if assign else None,
             'scope':scope if assign else None}
+
+
+def sequent_text_file_is_nonempty(app, action):
+    """Inspect UTF-8 text without modifying the destination on an empty file."""
+    path = sequent_text_file_path(app, action.get('path', 'defect_description.txt'))
+    try:
+        with open(path, 'rb') as stream:
+            data = stream.read(SEQUENT_TEXT_FILE_LIMIT + 1)
+    except OSError as exc:
+        raise MacroExecutionError(f'Unable to open text file {path!r}: {exc}') from exc
+    if len(data) > SEQUENT_TEXT_FILE_LIMIT:
+        raise MacroExecutionError('Text file exceeds the 16 MiB text-file limit')
+    try:
+        value = data.decode('utf-8', errors='surrogatepass')
+    except UnicodeError as exc:
+        raise MacroExecutionError('Text file must contain UTF-8 text') from exc
+    return bool(value)
 
 
 def sequent_text_file_to_variable(app, action):
@@ -6203,6 +6220,35 @@ class SequentDynamicEngine:
                     outcome = 'found' if match['found'] else 'not found'
                     raise MacroExecutionError(f'{name}: {outcome}; configured to stop with error')
                 raise MacroExecutionError(f'Unknown screen branch behavior: {behavior}')
+
+            if typ == 'load_text_variable' and ('if_found' in action or 'if_not_found' in action):
+                # Empty means zero characters, not whitespace-only text.
+                # Missing/unreadable/invalid files remain errors, not empty results.
+                found = sequent_text_file_is_nonempty(self.app, action)
+                if found:
+                    sequent_text_file_to_variable(self.app, action)
+                behavior, target = sequent_clipboard_outcome(action, found)
+                if behavior == 'Continue':
+                    index += 1
+                    continue
+                if behavior == 'Run Saved Macro':
+                    if not target or target not in self.app.get_preset_names():
+                        raise MacroExecutionError(f'Load Text File macro {target!r} is missing')
+                    return {'switch': 'preset', 'target': target}
+                if behavior == 'Jump to Label':
+                    destination = next((i for i, item in enumerate(actions)
+                                        if item.get('type') == 'label' and item.get('name') == target), None)
+                    if destination is None:
+                        raise MacroExecutionError(f'Load Text File label {target!r} is missing')
+                    frames.clear()
+                    index = destination + 1
+                    continue
+                if behavior == 'Stop Macro':
+                    return {'cancelled': True}
+                if behavior == 'Stop with Error':
+                    raise MacroExecutionError('Load Text File: ' + ('nonempty' if found else 'empty') +
+                                              '; configured to stop with error')
+                raise MacroExecutionError(f'Unknown Load Text File branch behavior: {behavior}')
 
             if typ == 'read_clipboard':
                 # Keep the existing optional variable guard. False means skip,
@@ -9883,6 +9929,12 @@ class VSCodeQueueViewer(tk.Frame):
                          'empty, or invalid file leaves the variable unchanged.',
                      bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
                      wraplength=460, justify='left').pack(fill=tk.X, pady=4)
+        load_text_outcomes = None
+        if type_name == 'load_text_variable':
+            tk.Label(body, text='IF FOUND = file has text. IF NOT FOUND = file is empty. '
+                     'Missing or unreadable files remain errors.', bg=BG_PANEL,
+                     fg=TEXT_MUTED, wraplength=460, justify='left').pack(fill=tk.X, pady=(3, 5))
+            load_text_outcomes = sequent_clipboard_outcome_editor(body, self.app, old, title="LOAD TEXT FILE RESULTS")
         if type_name=='trigger_start':
             tk.Label(body,text='Place this as the FIRST action in the sequence to arm auto-start. '
                          'Sequent checks for a new window, changed clipboard, or a new/modified file '
@@ -9966,6 +10018,8 @@ class VSCodeQueueViewer(tk.Frame):
                         val=json.loads(val)
                         if not isinstance(val,list):raise ValueError(f'{key}: expected a JSON list')
                     action[key]=val
+                if load_text_outcomes is not None:
+                    action.update(load_text_outcomes())
                 if 'var_scope' in action:
                     action['var_scope'] = str(action['var_scope']).lower()
                 if 'var_name' in action and action.get('var_scope') == 'global':
