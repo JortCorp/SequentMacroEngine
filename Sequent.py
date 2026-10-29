@@ -6936,7 +6936,8 @@ class VSCodeQueueViewer(tk.Frame):
             "wait_text": "Wait for Text",
             "find_color": "Find Color & Click",
             "find_text": "Find Text & Click",
-            "click": "Smart UI Element & Click",  # Edit any recorded click to make it adaptive.
+            "click": "Mouse Action",
+            "move": "Mouse Action",
             **{spec[0]: label for label,spec in DYNAMIC_ACTION_SPECS.items()},
             "label": "Label Marker",
             "goto": "Jump to Label",
@@ -7315,6 +7316,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Gate Check": self._render_gate_check_view,
             "Label Marker": self._render_label_view,
             "Jump to Label": self._render_goto_view,
+            "Mouse Action": self._render_mouse_action_view,
         }
         renderers.get(action_type, self._render_dynamic_action_view)(line_num, edit_idx=edit_idx)
         self._action_editor_canvas.yview_moveto(0)
@@ -8600,6 +8602,109 @@ class VSCodeQueueViewer(tk.Frame):
         ModernButton(body, text=label, bg_color=COLOR_SUCCESS if edit_idx is not None
                      else COLOR_ACCENT, hover_color='#1d8a4b' if edit_idx is not None
                      else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+
+    def _render_mouse_action_view(self, line_num, edit_idx=None):
+        """Edit recorded mouse coordinates and click type without UIA conversion."""
+        body = self.action_content_frame
+        old = (self.app.recorded_actions[edit_idx] if edit_idx is not None else {})
+        def caption(label):
+            tk.Label(body, text=label, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 9, 'bold'), anchor='w').pack(fill=tk.X, pady=(8, 3))
+        caption('Mouse Action')
+        initial = old.get('mouse_action', 'Hover' if old.get('type') == 'move' else
+                          ('Right Click' if old.get('btn') == 'right' else 'Left Click'))
+        kind = tk.StringVar(value=initial)
+        options = ('Left Click', 'Right Click', 'Double Click', 'Hover')
+        menu = tk.OptionMenu(body, kind, *options)
+        menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, highlightthickness=1,
+                    highlightbackground=BG_BORDER)
+        menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
+        menu.pack(fill=tk.X)
+        axes = {}
+        for axis in ('x', 'y'):
+            caption(f'{axis.upper()} Coordinate Source')
+            source = tk.StringVar(value=old.get(f'{axis}_source', 'Fixed'))
+            selector = tk.OptionMenu(body, source, 'Fixed', 'Variable')
+            selector.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0)
+            selector['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
+            selector.pack(fill=tk.X)
+            fixed_frame = tk.Frame(body, bg=BG_PANEL)
+            variable_frame = tk.Frame(body, bg=BG_PANEL)
+            tk.Label(fixed_frame, text=f'{axis.upper()} Position', bg=BG_PANEL,
+                     fg=TEXT_MUTED).pack(anchor='w')
+            fixed = tk.Entry(fixed_frame, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                             insertbackground=TEXT_PRIMARY)
+            fixed.insert(0, str(old.get(axis, 0)))
+            fixed.pack(fill=tk.X, ipady=4)
+            tk.Label(variable_frame, text='Variable Name', bg=BG_PANEL,
+                     fg=TEXT_MUTED).pack(anchor='w')
+            name = tk.Entry(variable_frame, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            insertbackground=TEXT_PRIMARY)
+            name.insert(0, old.get(f'{axis}_var', ''))
+            name.pack(fill=tk.X, ipady=4)
+            tk.Label(variable_frame, text='Variable Scope', bg=BG_PANEL,
+                     fg=TEXT_MUTED).pack(anchor='w', pady=(5, 2))
+            scope = tk.StringVar(value=old.get(f'{axis}_scope', 'local').title())
+            sm = tk.OptionMenu(variable_frame, scope, 'Local', 'Global')
+            sm.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0)
+            sm['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
+            sm.pack(fill=tk.X)
+            def refresh(*_, src=source, ff=fixed_frame, vf=variable_frame):
+                ff.pack_forget()
+                vf.pack_forget()
+                (vf if src.get() == 'Variable' else ff).pack(fill=tk.X, pady=(4, 5))
+            source.trace_add('write', refresh)
+            refresh()
+            axes[axis] = (source, fixed, name, scope)
+        if edit_idx is None:
+            caption('Insert Position')
+            position = tk.StringVar(value=f'Before Line {line_num}')
+            pm = tk.OptionMenu(body, position, f'Before Line {line_num}', f'After Line {line_num}')
+            pm.config(bg=BG_INPUT, fg=TEXT_PRIMARY)
+            pm.pack(fill=tk.X)
+        def save():
+            action = dict(old)
+            action.pop('win_title', None)
+            action.pop('rel_x', None)
+            action.pop('rel_y', None)
+            action['type'] = 'move' if kind.get() == 'Hover' else 'click'
+            action['mouse_action'] = kind.get()
+            action['btn'] = 'right' if kind.get() == 'Right Click' else 'left'
+            for axis, (source, fixed, name, scope) in axes.items():
+                action[f'{axis}_source'] = source.get()
+                if source.get() == 'Variable':
+                    value = name.get().strip()
+                    if not value:
+                        messagebox.showerror('Missing Variable', f'Enter a {axis.upper()} variable name.', parent=self.sub_menu)
+                        return
+                    try:
+                        value, _ = variable_identity(value, scope.get().lower())
+                    except MacroExecutionError as exc:
+                        messagebox.showerror('Invalid Variable', str(exc), parent=self.sub_menu)
+                        return
+                    action[f'{axis}_var'] = value
+                    action[f'{axis}_scope'] = scope.get().lower()
+                else:
+                    try:
+                        action[axis] = int(fixed.get().strip())
+                    except ValueError:
+                        messagebox.showerror('Invalid Coordinate', f'{axis.upper()} must be an integer.', parent=self.sub_menu)
+                        return
+                    action.pop(f'{axis}_var', None)
+                    action.pop(f'{axis}_scope', None)
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = action
+                idx = edit_idx
+            else:
+                idx = max(0, min(len(self.app.recorded_actions),
+                    line_num - (1 if 'After' in position.get() else 2)))
+                self.app.recorded_actions.insert(idx, action)
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.set_active_action_index(idx)
+            self.close_sub_menu()
+        ModernButton(body, text='Save Changes' if edit_idx is not None else 'Add Mouse Action',
+                     bg_color=COLOR_SUCCESS, hover_color=COLOR_ACCENT_HOV,
+                     command=save).pack(fill=tk.X, pady=(14, 4))
 
     def _render_type_variable_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
@@ -15461,37 +15566,56 @@ class BuiltInMacroApp:
 
         Thread(target=worker, daemon=True).start()
 
+    def _mouse_action_position(self, action):
+        coordinates = []
+        for axis in ('x', 'y'):
+            if action.get(f'{axis}_source') == 'Variable':
+                name = action.get(f'{axis}_var', '')
+                scope = action.get(f'{axis}_scope', 'local')
+                sentinel = object()
+                value = get_variable(self, name, scope, sentinel)
+                if value is sentinel:
+                    raise MacroExecutionError(f'Mouse {axis.upper()} variable {name!r} ({scope}) is not defined')
+                try:
+                    number = float(value)
+                    if not math.isfinite(number):
+                        raise ValueError('nonfinite')
+                    coordinates.append(round(number))
+                except (ValueError, TypeError, OverflowError):
+                    raise MacroExecutionError(f'Mouse {axis.upper()} variable {name!r} must contain a number')
+            else:
+                coordinates.append(int(action.get(axis, 0)))
+        tx, ty = coordinates
+        if (action.get('win_title') and
+                not any(action.get(f'{axis}_source') == 'Variable' for axis in ('x', 'y'))):
+            hwnd = find_window_by_title_substr(action['win_title'])
+            if hwnd:
+                tx, ty = client_to_screen_pos(hwnd, action.get('rel_x', tx), action.get('rel_y', ty))
+        return tx, ty
+
     def execute_single_action(self, action, *, idle=False):
         act_type = action.get("type")
         def report(message,color):
             self.root.after(0,lambda m=message,c=color:self.update_status(m,c))
         if act_type in DYNAMIC_ACTION_TYPES:
             return self.dynamic_engine.execute(action, idle=idle)
-        if act_type == "move":
-            tx,ty=action.get('x',0),action.get('y',0)
-            if action.get('win_title'):
-                hwnd=find_window_by_title_substr(action['win_title'])
-                if hwnd:tx,ty=client_to_screen_pos(hwnd,action.get('rel_x',tx),action.get('rel_y',ty))
+        if act_type in ('move', 'click'):
+            tx, ty = self._mouse_action_position(action)
             if self.human_bezier:
-                for x,y in calculate_bezier_trajectory(get_mouse_pos(),(tx,ty),18):
-                    move_mouse(x,y)
-                    time.sleep(max(0.001,0.008/self.playback_speed))
+                steps = 18 if act_type == 'move' else 14
+                for x, y in calculate_bezier_trajectory(get_mouse_pos(), (tx, ty), steps):
+                    move_mouse(x, y)
+                    time.sleep(max(0.001, 0.008 / self.playback_speed))
             else:
                 move_mouse(tx, ty)
-                if self.fluid_mouse:
+                if act_type == 'move' and self.fluid_mouse:
                     time.sleep(max(0.001, 0.010 / max(0.1, self.playback_speed)))
-        elif act_type == "click":
-            tx, ty = action.get("x", 0), action.get("y", 0)
-            if action.get('win_title'):
-                hwnd=find_window_by_title_substr(action['win_title'])
-                if hwnd:tx,ty=client_to_screen_pos(hwnd,action.get('rel_x',tx),action.get('rel_y',ty))
-            if self.human_bezier:
-                for x,y in calculate_bezier_trajectory(get_mouse_pos(),(tx,ty),14):
-                    move_mouse(x,y)
-                    time.sleep(max(0.001,0.006/self.playback_speed))
-            else:move_mouse(tx, ty)
-            wait_for_cursor_settled(tx, ty)
-            click(action.get("btn", "left"))
+            if act_type == 'click':
+                wait_for_cursor_settled(tx, ty)
+                click(action.get('btn', 'left'))
+                if action.get('mouse_action') == 'Double Click':
+                    time.sleep(0.08)
+                    click('left')
         elif act_type == "scroll":
             tx,ty=action.get('x',0),action.get('y',0)
             if action.get('win_title'):
