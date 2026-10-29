@@ -4962,6 +4962,45 @@ def set_variable(app, name, value, scope=None):
         app.variables[name] = str(value)
 
 
+def resolve_find_text_target(app, action):
+    """Resolve literal/local/global OCR targets at execution time."""
+    source = action.get('text_source', 'Literal')
+    if source == 'Literal':
+        value = str(action.get('text', '')).strip()
+    elif source in ('Local', 'Global'):
+        name = str(action.get('text_variable', '')).strip()
+        if not name:
+            raise MacroExecutionError('Find Text variable name is empty')
+        scope = source.lower()
+        bare, _ = variable_identity(name, scope)
+        sentinel = object()
+        value = get_variable(app, bare, scope, sentinel)
+        if value is sentinel:
+            raise MacroExecutionError(f'Find Text {source.lower()} variable {bare!r} does not exist')
+        value = str(value).strip()
+    else:
+        raise MacroExecutionError(f'Unknown Find Text source: {source!r}')
+    if not value:
+        raise MacroExecutionError('Find Text search value is empty')
+    return value
+
+
+def save_find_text_coordinates(app, action, box):
+    """Save matched anchor coordinates and click coordinates independently."""
+    if not box:
+        return
+    x, y = color_anchor_position(box, action.get('anchor', 'Center'))
+    click_x, click_y = color_click_target(action, box)
+    scope = str(action.get('coordinate_scope', 'Local')).lower()
+    if scope not in ('local', 'global'):
+        raise MacroExecutionError('Invalid Find Text coordinate scope')
+    for field, value in (('save_x_variable', x), ('save_y_variable', y),
+                         ('save_click_x_variable', click_x), ('save_click_y_variable', click_y)):
+        name = str(action.get(field, '')).strip()
+        if name:
+            set_variable(app, name, str(value), scope)
+
+
 def capture_clipboard_variable(app, action):
     """Save current Unicode clipboard text to the selected variable namespace.
 
@@ -5539,14 +5578,14 @@ class SequentDynamicEngine:
                 for attempt in range(attempts):
                     if not idle and not self.app.playing:
                         raise MacroCancelled('Text search cancelled')
-                    box = self.app.find_text_rect(*area, action.get('text', ''), **opts)
+                    box = self.app.find_text_rect(*area, resolve_find_text_target(self.app, action), **opts)
                     if box is not None:
                         break
                     if attempt + 1 < attempts:
                         self._pause(0.15, idle=idle)
                 if box is not None and action.get('confirm_match', False):
                     self._pause(0.12, idle=idle)
-                    second = self.app.find_text_rect(*area, action.get('text', ''), **opts)
+                    second = self.app.find_text_rect(*area, resolve_find_text_target(self.app, action), **opts)
                     if not idle and not self.app.playing:
                         raise MacroCancelled('Text confirmation cancelled')
                     if second is None:
@@ -5565,6 +5604,8 @@ class SequentDynamicEngine:
                 raise MacroCancelled('Screen search cancelled after detection')
             result = {'type':typ, 'found': bool(box), 'success':True}
             if box:
+                if typ == 'find_text':
+                    save_find_text_coordinates(self.app, action, box)
                 result.update(self._click_box(action, box))
         # Stop can also happen while a click/hover is being dispatched.
         if not idle and not self.app.playing:
@@ -11516,7 +11557,7 @@ class GhostReticle:
                             found_box = app.search_color_in_area(*area, act.get("color", "#FFFFFF"), tolerance=act.get("tolerance", 8))
                         elif act.get('type') == 'find_text':
                             found_box = app.find_text_rect(
-                                *area, act.get("text", ""),
+                                *area, resolve_find_text_target(app, act),
                                 match_mode=act.get('match_mode','Contains'),
                                 scan_mode=act.get('scan_mode','Balanced'),
                                 occurrence=act.get('occurrence','First'))
@@ -15494,7 +15535,7 @@ class BuiltInMacroApp:
                 raise MacroExecutionError(f"Color {hex_color} not found in search area")
         elif act_type == "find_text":
             area = action.get("area", [0, 0, 100, 100])
-            target_text = action.get("text", "")
+            target_text = resolve_find_text_target(self, action)
             found_box = self.find_text_rect(
                 *area, target_text,
                 match_mode=action.get('match_mode','Contains'),
@@ -15504,6 +15545,7 @@ class BuiltInMacroApp:
             if not idle and not self.playing:
                 raise MacroCancelled('Playback stopped during target search')
             if found_box:
+                save_find_text_coordinates(self, action, found_box)
                 mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
                 self.root.after(0, lambda b=found_box: self.draw_highlight_box(*b, COLOR_SUCCESS, 800))
                 self.root.after(0, lambda m=mode, x=tx, y=ty: self._report_text_execution(m, x, y))
