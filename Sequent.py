@@ -4998,16 +4998,16 @@ def sequent_clipboard_condition_passes(app, action):
         return True
     conditions = action.get('conditions', [])
     if not conditions:
-        raise MacroExecutionError('Read Clipboard: enabled condition needs at least one rule')
+        raise MacroExecutionError('Conditional action: enabled condition needs at least one rule')
     result = None
     for index, rule in enumerate(conditions):
         name = str(rule.get('left_name', '')).strip()
         if not name:
-            raise MacroExecutionError('Read Clipboard: missing source variable name')
+            raise MacroExecutionError('Conditional action: missing source variable name')
         missing = object()
         left = get_variable(app, name, rule.get('left_scope', 'local'), default=missing)
         if left is missing:
-            raise MacroExecutionError(f'Read Clipboard: variable {name!r} is undefined')
+            raise MacroExecutionError(f'Conditional action: variable {name!r} is undefined')
         operator = rule.get('operator', '==')
         if operator in ('empty', 'not empty', 'exists', 'missing'):
             matched = dynamic_compare(left, operator, '')
@@ -5015,10 +5015,10 @@ def sequent_clipboard_condition_passes(app, action):
             if rule.get('right_type', 'text') == 'variable':
                 other = str(rule.get('right_name', '')).strip()
                 if not other:
-                    raise MacroExecutionError('Read Clipboard: comparison variable name required')
+                    raise MacroExecutionError('Conditional action: comparison variable name required')
                 right = get_variable(app, other, rule.get('right_scope', 'local'), default=missing)
                 if right is missing:
-                    raise MacroExecutionError(f'Read Clipboard: variable {other!r} is undefined')
+                    raise MacroExecutionError(f'Conditional action: variable {other!r} is undefined')
             else:
                 right = rule.get('right_text', '')
             matched = dynamic_compare(left, operator, right)
@@ -5033,7 +5033,7 @@ def sequent_clipboard_condition_passes(app, action):
             elif connector == 'OR':
                 result = result or matched
             else:
-                raise MacroExecutionError(f'Read Clipboard: invalid connector {connector!r}')
+                raise MacroExecutionError(f'Conditional action: invalid connector {connector!r}')
     return bool(result)
 
 
@@ -9218,6 +9218,107 @@ class VSCodeQueueViewer(tk.Frame):
         prompt_entry.insert(0, curr_act.get("prompt", "Enter value:") if (curr_act and curr_act.get("type") == "prompt_input") else "Enter value:")
         prompt_entry.focus_set()
 
+        # Optional guard sits in its own packed container immediately below the operation.
+        condition_enabled = tk.BooleanVar(value=bool(curr_act.get('condition_enabled', False)) if curr_act else False)
+        condition_section = tk.Frame(body, bg=BG_PANEL)
+        condition_section.pack(fill=tk.X, pady=(8, 10))
+        condition_toggle = tk.Checkbutton(
+            condition_section, text='Run only when conditions match',
+            variable=condition_enabled, bg=BG_PANEL, fg=TEXT_PRIMARY,
+            selectcolor=BG_INPUT, activebackground=BG_PANEL)
+        condition_toggle.pack(anchor='w')
+        condition_fields = tk.Frame(condition_section, bg=BG_PANEL)
+        condition_rows = []
+        operators = ('==', '!=', 'contains', 'not contains', 'startswith',
+                     'endswith', '>', '>=', '<', '<=', 'empty', 'not empty', 'regex')
+
+        def condition_menu(parent, variable, options):
+            menu = tk.OptionMenu(parent, variable, *options)
+            menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0,
+                        highlightthickness=1, highlightbackground=BG_BORDER)
+            menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            menu.pack(fill=tk.X, pady=(1, 5))
+            return menu
+
+        def condition_entry(parent, label, initial=''):
+            tk.Label(parent, text=label, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8)).pack(anchor='w')
+            entry = tk.Entry(parent, bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                             highlightbackground=BG_BORDER, highlightthickness=1, bd=0)
+            entry.insert(0, str(initial))
+            entry.pack(fill=tk.X, ipady=3, pady=(1, 5))
+            return entry
+
+        def add_condition(saved=None):
+            saved = saved or {}
+            card = tk.Frame(condition_fields, bg=BG_PANEL,
+                            highlightbackground=BG_BORDER, highlightthickness=1, padx=7, pady=7)
+            card.pack(fill=tk.X, pady=(0, 7))
+            record = {'card': card}
+            if condition_rows:
+                tk.Label(card, text='Combine with previous rule:', bg=BG_PANEL,
+                         fg=TEXT_MUTED).pack(anchor='w')
+                record['join'] = tk.StringVar(value=saved.get('join', 'AND'))
+                condition_menu(card, record['join'], ('AND', 'OR'))
+            else:
+                record['join'] = tk.StringVar(value='AND')
+            record['negate'] = tk.BooleanVar(value=bool(saved.get('negate', False)))
+            tk.Checkbutton(card, text='NOT (invert this condition)', variable=record['negate'],
+                           bg=BG_PANEL, fg=TEXT_PRIMARY, selectcolor=BG_INPUT).pack(anchor='w')
+            record['left_name'] = condition_entry(card, 'Variable Name', saved.get('left_name', ''))
+            tk.Label(card, text='Variable Scope', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+            record['left_scope'] = tk.StringVar(value=saved.get('left_scope', 'local').title())
+            condition_menu(card, record['left_scope'], ('Local', 'Global'))
+            tk.Label(card, text='Comparison', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+            record['operator'] = tk.StringVar(value=saved.get('operator', '=='))
+            condition_menu(card, record['operator'], operators)
+            record['right_type'] = tk.StringVar(value=saved.get('right_type', 'text').title())
+            right_section = tk.Frame(card, bg=BG_PANEL)
+            right_section.pack(fill=tk.X)
+            tk.Label(right_section, text='Compare against', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+            condition_menu(right_section, record['right_type'], ('Text', 'Variable'))
+            text_frame = tk.Frame(right_section, bg=BG_PANEL)
+            record['right_text'] = condition_entry(text_frame, 'Text Value', saved.get('right_text', ''))
+            variable_rhs = tk.Frame(right_section, bg=BG_PANEL)
+            record['right_name'] = condition_entry(variable_rhs, 'Variable Name', saved.get('right_name', ''))
+            tk.Label(variable_rhs, text='Variable Scope', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+            record['right_scope'] = tk.StringVar(value=saved.get('right_scope', 'local').title())
+            condition_menu(variable_rhs, record['right_scope'], ('Local', 'Global'))
+            def refresh_rhs(*_):
+                text_frame.pack_forget()
+                variable_rhs.pack_forget()
+                if record['operator'].get() not in ('empty', 'not empty'):
+                    (variable_rhs if record['right_type'].get() == 'Variable' else text_frame).pack(fill=tk.X)
+            record['right_type'].trace_add('write', refresh_rhs)
+            record['operator'].trace_add('write', refresh_rhs)
+            refresh_rhs()
+            def remove():
+                condition_rows.remove(record)
+                card.destroy()
+            tk.Button(card, text='Remove Condition', command=remove, bg=BG_INPUT,
+                      fg=COLOR_DANGER, bd=0).pack(anchor='e')
+            condition_rows.append(record)
+
+        saved_conditions = curr_act.get('conditions', []) if curr_act and curr_act.get('type') == 'prompt_input' else []
+        for rule in saved_conditions:
+            if isinstance(rule, dict):
+                add_condition(rule)
+        if not condition_rows:
+            add_condition()
+        tk.Button(condition_fields, text='+ Add Condition', command=add_condition,
+                  bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0).pack(fill=tk.X, pady=(0, 5))
+        tk.Label(condition_fields, text='Conditions are evaluated before requesting input. '
+                 'A false result skips this action; disabled means normal behavior.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, wraplength=430, justify=tk.LEFT).pack(fill=tk.X)
+        def refresh_condition(*_):
+            if condition_enabled.get():
+                condition_fields.pack(fill=tk.X, pady=(5, 0))
+            else:
+                condition_fields.pack_forget()
+        condition_enabled.trace_add('write', refresh_condition)
+        refresh_condition()
+
+
         var_row = tk.Frame(body, bg=BG_PANEL)
         var_row.pack(fill=tk.X, pady=(0, 6))
 
@@ -9243,10 +9344,39 @@ class VSCodeQueueViewer(tk.Frame):
             pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
             pos_menu.pack(fill=tk.X, pady=(4, 8))
 
+        def collect_input_conditions():
+            if not condition_enabled.get():
+                return {'condition_enabled': False, 'conditions': []}
+            if not condition_rows:
+                raise MacroExecutionError('Add at least one Request Input condition')
+            rules = []
+            for idx, row in enumerate(condition_rows):
+                lhs = row['left_name'].get().strip()
+                rhs_type = row['right_type'].get().lower()
+                rhs_name = row['right_name'].get().strip()
+                operator = row['operator'].get()
+                if not lhs or (operator not in ('empty', 'not empty') and rhs_type == 'variable' and not rhs_name):
+                    raise MacroExecutionError('Complete all condition variable names')
+                variable_identity(lhs, row['left_scope'].get().lower())
+                if rhs_type == 'variable' and operator not in ('empty', 'not empty'):
+                    variable_identity(rhs_name, row['right_scope'].get().lower())
+                rules.append({
+                    'left_name': lhs, 'left_scope': row['left_scope'].get().lower(),
+                    'operator': operator, 'right_type': rhs_type,
+                    'right_text': row['right_text'].get(), 'right_name': rhs_name,
+                    'right_scope': row['right_scope'].get().lower(),
+                    'negate': row['negate'].get(), 'join': row['join'].get() if idx else 'AND'})
+            return {'condition_enabled': True, 'conditions': rules}
+
         def submit():
             p_text = prompt_entry.get().strip() or "Enter value:"
             v_name = var_entry.get().strip() or "user_data"
             d_val = def_entry.get()
+            try:
+                guard = collect_input_conditions()
+            except MacroExecutionError as exc:
+                self.app.update_status(str(exc), COLOR_DANGER)
+                return
 
             if edit_idx is not None:
                 self.app.recorded_actions[edit_idx] = {
@@ -9254,7 +9384,8 @@ class VSCodeQueueViewer(tk.Frame):
                     "prompt": p_text,
                     "var_name": v_name,
                     "var_scope": scope_var.get().lower(),
-                    "default": d_val
+                    "default": d_val,
+                    **guard
                 }
                 self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.app.set_active_action_index(edit_idx)
@@ -9269,7 +9400,8 @@ class VSCodeQueueViewer(tk.Frame):
                     "prompt": p_text,
                     "var_name": v_name,
                     "var_scope": scope_var.get().lower(),
-                    "default": d_val
+                    "default": d_val,
+                    **guard
                 })
                 self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.app.update_status(f"Added Request Input for '{v_name}'", COLOR_SUCCESS)
@@ -15820,6 +15952,9 @@ class BuiltInMacroApp:
             else:
                 report("Disclaimer accepted", COLOR_SUCCESS)
         elif act_type == "prompt_input":
+            if not sequent_clipboard_condition_passes(self, action):
+                report('Request Input skipped: condition was false', SYNTAX_ORANGE)
+                return
             prompt_txt = action.get("prompt", "Enter input:")
             default_val = action.get("default", "")
             var_name = action.get("var_name", "user_data")
