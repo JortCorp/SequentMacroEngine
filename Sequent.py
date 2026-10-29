@@ -31,6 +31,39 @@ CUSTOM_SOUND_PATHS = {
     "start": ""  
 }
 
+def sequent_gradient_colors(first, second, steps=64):
+    """Smooth two-color interpolation; pure stdlib and Tk-compatible hex colors."""
+    first, second = normalize_accent_color(first), normalize_accent_color(second)
+    a = [int(first[i:i+2], 16) for i in (1, 3, 5)]
+    b = [int(second[i:i+2], 16) for i in (1, 3, 5)]
+    return ['#' + ''.join(f'{round(x + (y-x)*t/(steps-1)):02X}'
+                        for x,y in zip(a,b)) for t in range(steps)]
+
+
+class SequentGradientStrip(tk.Canvas):
+    """Resizing, non-interactive accent gradient preview/header strip."""
+    def __init__(self, parent, start, end, height=10, **kwargs):
+        super().__init__(parent, height=height, bd=0, highlightthickness=0,
+                         takefocus=0, **kwargs)
+        self.start, self.end = start, end
+        self.bind('<Configure>', self._redraw, add='+')
+
+    def set_colors(self, start, end):
+        self.start, self.end = start, end
+        self._redraw()
+
+    def _redraw(self, event=None):
+        self.delete('all')
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 2 or h < 2:
+            return
+        colors = sequent_gradient_colors(self.start, self.end, max(2, min(256, w)))
+        n = len(colors)
+        for i, color in enumerate(colors):
+            self.create_rectangle(round(i*w/n), 0, round((i+1)*w/n)+1, h,
+                                  fill=color, outline='')
+
+
 class MacroExecutionError(Exception):
     """Expected macro failure, such as an unmet verification condition."""
 
@@ -13640,6 +13673,8 @@ class BuiltInMacroApp:
         self.theme_mode = "Dark"
         self.light_mode = False  # Kept for backward-compatible settings files.
         self.accent_color = DEFAULT_ACCENT_COLOR
+        self.gradient_enabled = False
+        self.gradient_second_color = "#00D4FF"
         self._effective_theme = "dark"
         self._system_theme_job = None
         self.entertain_me = True
@@ -14605,6 +14640,13 @@ class BuiltInMacroApp:
         top_bar = tk.Frame(self.main_container, bg=BG_HEADER, height=49)
         top_bar.pack(fill=tk.X)
         top_bar.pack_propagate(False)
+        # A slim gradient edge provides a real dual-color surface without
+        # replacing native Tk button backgrounds or reducing text contrast.
+        self.header_gradient = SequentGradientStrip(
+            self.main_container, self.accent_color,
+            self.gradient_second_color if self.gradient_enabled else self.accent_color,
+            height=4, bg=BG_HEADER)
+        self.header_gradient.pack(fill=tk.X)
         top_bar.bind("<Button-1>", self.start_drag)
         top_bar.bind("<B1-Motion>", self.drag_window)
 
@@ -17662,6 +17704,12 @@ try {{
                     self.accent_color = normalize_accent_color(config.get("accent_color", DEFAULT_ACCENT_COLOR))
                 except ValueError:
                     self.accent_color = DEFAULT_ACCENT_COLOR
+                self.gradient_enabled = bool(config.get("gradient_enabled", False))
+                try:
+                    self.gradient_second_color = normalize_accent_color(
+                        config.get("gradient_second_color", "#00D4FF"))
+                except ValueError:
+                    self.gradient_second_color = "#00D4FF"
                 self.entertain_me = config.get("entertain_me", True)
                 BuiltInMacroApp.entertain_mode = self.entertain_me
                 self.playback_speed = config.get("playback_speed", 1.0)
@@ -17689,6 +17737,8 @@ try {{
             "light_mode": self.theme_mode == "Light",  # Compatibility with older Sequent versions
             "theme_mode": self.theme_mode,
             "accent_color": self.accent_color,
+            "gradient_enabled": self.gradient_enabled,
+            "gradient_second_color": self.gradient_second_color,
             "entertain_me": self.entertain_me,
             "playback_speed": self.playback_speed,
             "action_delay": self.action_delay,
@@ -18298,6 +18348,28 @@ try {{
         sequent_toolbar_button(accent_row, "Apply", self.apply_accent_hex).pack(side=tk.LEFT, padx=(0, 6))
         sequent_toolbar_button(accent_row, "Customize...", self.choose_accent_color).pack(side=tk.LEFT)
 
+        gradient_row = tk.Frame(parent, bg=BG_PANEL)
+        gradient_row.pack(fill=tk.X, pady=(8, 3))
+        self.gradient_enabled_var = tk.BooleanVar(value=self.gradient_enabled)
+        tk.Checkbutton(gradient_row, text="Two-color gradient accents",
+                       variable=self.gradient_enabled_var, command=self.apply_gradient_settings,
+                       bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_PANEL,
+                       selectcolor=BG_INPUT).pack(side=tk.LEFT)
+        second_row = tk.Frame(parent, bg=BG_PANEL)
+        second_row.pack(fill=tk.X, pady=(2, 4))
+        tk.Label(second_row, text="Second Gradient Color", bg=BG_PANEL,
+                 fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        self.gradient_second_var = tk.StringVar(value=self.gradient_second_color)
+        tk.Entry(second_row, textvariable=self.gradient_second_var, width=10,
+                 bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                 relief="flat").pack(side=tk.LEFT, padx=(0, 6), ipady=4)
+        sequent_toolbar_button(second_row, "Apply Gradient",
+                               self.apply_gradient_settings).pack(side=tk.LEFT)
+        self.gradient_preview = SequentGradientStrip(
+            parent, self.accent_color, self.gradient_second_color, height=9, bg=BG_PANEL)
+        self.gradient_preview.pack(fill=tk.X, pady=(2, 8))
+        self.gradient_second_var.trace_add('write', lambda *_: self._preview_gradient_settings())
+
         presets_row = tk.Frame(parent, bg=BG_PANEL)
         presets_row.pack(fill=tk.X, pady=(0, 9))
         tk.Label(presets_row, text="Quick Colors", font=("Segoe UI", 9),
@@ -18338,6 +18410,8 @@ try {{
                 "theme_mode": self.theme_mode,
                 "light_mode": self.theme_mode == "Light",
                 "accent_color": self.accent_color,
+            "gradient_enabled": self.gradient_enabled,
+            "gradient_second_color": self.gradient_second_color,
             })
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=".",
                                              prefix="sequent_settings_", suffix=".tmp",
@@ -18382,6 +18456,27 @@ try {{
             return
         self._accent_color_dialog = SequentAccentColorDialog(self)
 
+    def _preview_gradient_settings(self):
+        if not hasattr(self, 'gradient_preview'):
+            return
+        try:
+            color = normalize_accent_color(self.gradient_second_var.get())
+            self.gradient_preview.set_colors(self.accent_color, color)
+        except ValueError:
+            pass
+
+    def apply_gradient_settings(self):
+        try:
+            second = normalize_accent_color(self.gradient_second_var.get())
+        except ValueError as exc:
+            self.update_status(str(exc), COLOR_DANGER)
+            return
+        self.gradient_enabled = bool(self.gradient_enabled_var.get())
+        self.gradient_second_color = second
+        self._persist_appearance()
+        self.apply_theme(self.resolve_theme_mode())
+        self.update_status("Gradient accents updated", COLOR_SUCCESS)
+
     def set_accent_color(self, value):
         color = normalize_accent_color(value)
         if self.accent_color == color:
@@ -18389,6 +18484,7 @@ try {{
                 self.accent_hex_var.set(color)
             return
         self.accent_color = color
+        self._preview_gradient_settings()
         self._persist_appearance()
         self.apply_theme(self.resolve_theme_mode())
         self.update_status(f"Accent color: {color}", COLOR_SUCCESS)
@@ -18515,6 +18611,13 @@ try {{
         self._theme_rebuilding = True
 
         self._update_theme_tokens(theme_name)
+        if getattr(self, 'header_gradient', None) is not None:
+            try:
+                self.header_gradient.set_colors(
+                    self.accent_color,
+                    self.gradient_second_color if self.gradient_enabled else self.accent_color)
+            except tk.TclError:
+                pass
         sequent_retheme_ide_windows(self)
         if getattr(self, 'native_chrome', None) is not None:
             self.native_chrome.refresh_dwm_frame()
