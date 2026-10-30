@@ -18407,82 +18407,151 @@ try {{
         return window
 
     def build_appearance_settings(self, parent):
-        """Persistent, easy-to-read theme selector and shared accent picker."""
+        """GitHub-inspired theme cards, accent swatches, and independent light/dark presets."""
+        heading = tk.Frame(parent, bg=BG_PANEL)
+        heading.pack(fill=tk.X, pady=(2, 12))
+        tk.Label(heading, text="Appearance", font=("Segoe UI", 16, "bold"),
+                 bg=BG_PANEL, fg=TEXT_PRIMARY).pack(anchor="w")
+        tk.Label(heading, text="Choose a theme and accent. Changes are saved automatically.",
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 0))
+
         theme_row = tk.Frame(parent, bg=BG_PANEL)
-        theme_row.pack(fill=tk.X, pady=(0, 10))
-        tk.Label(theme_row, text="Application Theme", font=("Segoe UI", 9, "bold"),
-                 bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        theme_row.pack(fill=tk.X, pady=(0, 12))
+        tk.Label(theme_row, text="Theme mode", bg=BG_PANEL, fg=TEXT_PRIMARY,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
         self.theme_mode_var = tk.StringVar(value=self.theme_mode)
-        theme_menu = tk.OptionMenu(theme_row, self.theme_mode_var,
-                                   "Dark", "Light", "Match System", command=self.set_theme_mode)
-        theme_menu.configure(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
-                             activeforeground=TEXT_PRIMARY, font=("Segoe UI", 9),
-                             highlightthickness=1, highlightbackground=BG_BORDER,
-                             bd=0, relief="flat", width=16, anchor="w")
-        theme_menu["menu"].configure(bg=BG_INPUT, fg=TEXT_PRIMARY,
-                                      activebackground=COLOR_ACCENT,
-                                      activeforeground=TEXT_ON_ACCENT, bd=1, relief="flat")
-        theme_menu.pack(side=tk.LEFT)
+        menu = tk.OptionMenu(theme_row, self.theme_mode_var, "Match System", "Light", "Dark",
+                             command=self.set_theme_mode)
+        menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, relief="flat",
+                    highlightthickness=1, highlightbackground=BG_BORDER, width=20)
+        menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
+        menu.pack(anchor="w", pady=(5, 0))
 
-        accent_row = tk.Frame(parent, bg=BG_PANEL)
-        accent_row.pack(fill=tk.X, pady=(3, 5))
-        tk.Label(accent_row, text="Accent Color", font=("Segoe UI", 9, "bold"),
-                 bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
-        self.accent_swatch = tk.Label(accent_row, text="  ", width=3,
-                                       bg=self.accent_color, relief="flat",
-                                       highlightbackground=BG_BORDER, highlightthickness=1)
-        self.accent_swatch.pack(side=tk.LEFT, padx=(0, 7))
-        self.accent_hex_var = tk.StringVar(value=self.accent_color)
-        entry = tk.Entry(accent_row, textvariable=self.accent_hex_var, width=10,
-                         bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
-                         highlightthickness=1, highlightbackground=BG_BORDER,
-                         font=("Consolas", 10), relief="flat")
-        entry.pack(side=tk.LEFT, padx=(0, 6), ipady=4)
-        entry.bind("<Return>", lambda event: self.apply_accent_hex())
-        sequent_toolbar_button(accent_row, "Apply", self.apply_accent_hex).pack(side=tk.LEFT, padx=(0, 6))
-        sequent_toolbar_button(accent_row, "Customize...", self.choose_accent_color).pack(side=tk.LEFT)
+        tk.Label(parent, text="THEMES", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(4, 6))
+        cards = tk.Frame(parent, bg=BG_PANEL)
+        cards.pack(fill=tk.X, pady=(0, 12))
+        self.appearance_theme_cards = {}
+        for theme in ("Light", "Dark"):
+            frame = tk.Frame(cards, bg=BG_PANEL, highlightthickness=2,
+                             highlightbackground=BG_BORDER)
+            frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                       padx=(0, 8) if theme == "Light" else (0, 0))
+            title = tk.Frame(frame, bg=BG_PANEL)
+            title.pack(fill=tk.X, padx=10, pady=(9, 4))
+            tk.Label(title, text=theme + " theme", bg=BG_PANEL, fg=TEXT_PRIMARY,
+                     font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+            preview = tk.Canvas(frame, height=100, bg="#F4F5F8" if theme == "Light" else "#171A22",
+                                highlightthickness=0, cursor="hand2")
+            preview.pack(fill=tk.X, padx=8, pady=(5, 6))
+            def paint(event=None, canvas=preview, mode=theme):
+                canvas.delete("all")
+                w = max(40, canvas.winfo_width())
+                dark = mode == "Dark"
+                panel = "#272B36" if dark else "#FFFFFF"
+                ink = "#C4CBD7" if dark else "#636C7A"
+                color = self.accent_color
+                canvas.create_rectangle(0, 0, w, 100, fill=panel, outline="")
+                canvas.create_rectangle(0, 0, w, 18, fill="#353A46" if dark else "#E5E9F0", outline="")
+                for x in (12, 37, 62):
+                    canvas.create_line(x, 9, x+14, 9, fill=ink, width=4, capstyle="round")
+                canvas.create_rectangle(9, 27, w*.30, 91, fill="#20242E" if dark else "#EEF0F5", outline="")
+                canvas.create_rectangle(15, 35, w*.30-6, 42, fill=color, outline="")
+                canvas.create_line(w*.37, 36, w*.72, 36, fill=ink, width=5, capstyle="round")
+                canvas.create_rectangle(w*.37, 50, w-10, 68, fill=color, outline="")
+                canvas.create_line(w*.37, 81, w*.80, 81, fill=ink, width=4, capstyle="round")
+            preview.bind("<Configure>", paint)
+            preview.bind("<Button-1>", lambda e, mode=theme: self.set_theme_mode(mode))
+            bottom = tk.Frame(frame, bg=BG_PANEL)
+            bottom.pack(fill=tk.X, padx=10, pady=(2, 9))
+            tk.Label(bottom, text=theme + " default", bg=BG_PANEL,
+                     fg=TEXT_PRIMARY).pack(side=tk.LEFT)
+            self.appearance_theme_cards[theme] = frame
 
-        gradient_row = tk.Frame(parent, bg=BG_PANEL)
-        gradient_row.pack(fill=tk.X, pady=(8, 3))
+        tk.Label(parent, text="ACCENT COLORS", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(4, 6))
+        swatches = tk.Frame(parent, bg=BG_PANEL)
+        swatches.pack(fill=tk.X, pady=(0, 12))
+        choices = [
+            ("Purple", "#9361FF", None), ("Blue", "#378CF5", None),
+            ("Emerald", "#00B88C", None), ("Purple / Cyan", "#9361FF", "#00D4FF"),
+            ("Sunset", "#FF6B81", "#FFB347"), ("Aurora", "#00C896", "#5E79FF"),
+            ("Rose", "#FF58B4", "#A05CFF")]
+        for name, first, second in choices:
+            sw = tk.Canvas(swatches, width=38, height=38, bg=BG_PANEL,
+                           highlightthickness=0, cursor="hand2")
+            sw.pack(side=tk.LEFT, padx=(0, 6))
+            def draw(event=None, canvas=sw, a=first, b=second):
+                canvas.delete("all")
+                canvas.create_oval(2, 2, 36, 36, fill=a, outline=BG_BORDER, width=2)
+                if b:
+                    canvas.create_arc(2, 2, 36, 36, start=270, extent=180,
+                                      fill=b, outline="")
+                selected = (self.accent_color == a and
+                            self.gradient_enabled == bool(b) and
+                            (not b or self.gradient_second_color == b))
+                if selected:
+                    canvas.create_oval(0, 0, 38, 38, outline=TEXT_PRIMARY, width=2)
+            sw.bind("<Expose>", draw)
+            sw.after_idle(draw)
+            sw.bind("<Button-1>", lambda e, a=first, b=second:
+                    self.select_appearance_preset(a, b))
+            ModernTooltip(sw, name)
+
         self.gradient_enabled_var = tk.BooleanVar(value=self.gradient_enabled)
-        tk.Checkbutton(gradient_row, text="Two-color gradient accents",
+        tk.Checkbutton(parent, text="Use two-color gradient",
                        variable=self.gradient_enabled_var, command=self.apply_gradient_settings,
                        bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_PANEL,
-                       selectcolor=BG_INPUT).pack(side=tk.LEFT)
-        second_row = tk.Frame(parent, bg=BG_PANEL)
-        second_row.pack(fill=tk.X, pady=(2, 4))
-        tk.Label(second_row, text="Second Gradient Color", bg=BG_PANEL,
-                 fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
-        self.gradient_second_var = tk.StringVar(value=self.gradient_second_color)
-        tk.Entry(second_row, textvariable=self.gradient_second_var, width=10,
-                 bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
-                 relief="flat").pack(side=tk.LEFT, padx=(0, 6), ipady=4)
-        sequent_toolbar_button(second_row, "Apply Gradient",
-                               self.apply_gradient_settings).pack(side=tk.LEFT, padx=(0, 6))
-        sequent_toolbar_button(second_row, "Customize...",
-                               self.choose_gradient_second_color).pack(side=tk.LEFT)
+                       selectcolor=BG_INPUT).pack(anchor="w", pady=(0, 8))
+        for label, attr, initial, callback in (
+                ("Primary color", "accent_hex_var", self.accent_color, self.apply_accent_hex),
+                ("Secondary color", "gradient_second_var", self.gradient_second_color,
+                 self.apply_gradient_settings)):
+            row = tk.Frame(parent, bg=BG_PANEL)
+            row.pack(fill=tk.X, pady=(0, 7))
+            tk.Label(row, text=label, width=19, anchor="w", bg=BG_PANEL,
+                     fg=TEXT_PRIMARY).pack(side=tk.LEFT)
+            var = tk.StringVar(value=initial)
+            setattr(self, attr, var)
+            tk.Entry(row, textvariable=var, width=10, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                     insertbackground=TEXT_PRIMARY, bd=0).pack(side=tk.LEFT, padx=(0, 8), ipady=4)
+            sequent_toolbar_button(row, "Apply", callback).pack(side=tk.LEFT, padx=(0, 6))
+            picker = self.choose_accent_color if attr == "accent_hex_var" else self.choose_gradient_second_color
+            sequent_toolbar_button(row, "Customize...", picker).pack(side=tk.LEFT)
+        self.accent_swatch = tk.Label(parent, bg=self.accent_color, height=0)
         self.gradient_preview = SequentGradientStrip(
-            parent, self.accent_color, self.gradient_second_color, height=9, bg=BG_PANEL)
-        self.gradient_preview.pack(fill=tk.X, pady=(2, 8))
-        self.gradient_second_var.trace_add('write', lambda *_: self._preview_gradient_settings())
+            parent, self.accent_color,
+            self.gradient_second_color if self.gradient_enabled else self.accent_color,
+            height=12, bg=BG_PANEL)
+        self.gradient_preview.pack(fill=tk.X, pady=(7, 13))
+        self.gradient_second_var.trace_add("write", lambda *_: self._preview_gradient_settings())
+        sequent_toolbar_button(parent, "Restore default appearance",
+                               lambda: self.select_appearance_preset(DEFAULT_ACCENT_COLOR, None)
+                               ).pack(anchor="w", pady=(0, 10))
+        self._refresh_appearance_cards()
 
-        presets_row = tk.Frame(parent, bg=BG_PANEL)
-        presets_row.pack(fill=tk.X, pady=(0, 9))
-        tk.Label(presets_row, text="Quick Colors", font=("Segoe UI", 9),
-                 bg=BG_PANEL, fg=TEXT_MUTED, width=24, anchor="w").pack(side=tk.LEFT)
-        for name, value in ACCENT_PRESETS:
-            selected = (value.upper() == self.accent_color)
-            swatch = tk.Button(presets_row, text="", width=2, height=1,
-                               bg=value, activebackground=value, relief="flat",
-                               bd=0, cursor="hand2", takefocus=True,
-                               highlightthickness=2 if selected else 1,
-                               highlightbackground=TEXT_PRIMARY if selected else BG_BORDER,
-                               command=lambda chosen=value: self.set_accent_color(chosen))
-            swatch.pack(side=tk.LEFT, padx=(0, 5))
-            ModernTooltip(swatch, name)
-        sequent_toolbar_button(presets_row, "Reset", lambda: self.set_accent_color(DEFAULT_ACCENT_COLOR)).pack(side=tk.LEFT, padx=(7, 0))
-        tk.Label(parent, text="Saved automatically. Match System follows Windows app theme.",
-                 bg=BG_PANEL, fg=TEXT_MUTED, font=("Segoe UI", 8), anchor="w").pack(fill=tk.X, pady=(0, 9))
+    def _refresh_appearance_cards(self):
+        for name, card in getattr(self, "appearance_theme_cards", {}).items():
+            try:
+                card.config(highlightbackground=COLOR_ACCENT if
+                            self.resolve_theme_mode().lower() == name.lower() else BG_BORDER)
+            except tk.TclError:
+                pass
+
+    def select_appearance_preset(self, primary, secondary=None):
+        self.accent_color = normalize_accent_color(primary)
+        if secondary:
+            self.gradient_second_color = normalize_accent_color(secondary)
+        self.gradient_enabled = bool(secondary)
+        if hasattr(self, "accent_hex_var"):
+            self.accent_hex_var.set(self.accent_color)
+        if hasattr(self, "gradient_second_var"):
+            self.gradient_second_var.set(self.gradient_second_color)
+        if hasattr(self, "gradient_enabled_var"):
+            self.gradient_enabled_var.set(self.gradient_enabled)
+        self._persist_appearance()
+        self.apply_theme(self.resolve_theme_mode())
+        self.update_status("Appearance preset applied", COLOR_SUCCESS)
 
     def resolve_theme_mode(self):
         if self.theme_mode == "Light":
@@ -18531,6 +18600,7 @@ try {{
         desired = self.resolve_theme_mode()
         if desired != self._effective_theme:
             self.apply_theme(desired)
+        self._refresh_appearance_cards()
         self.update_status(f"Theme: {value}", COLOR_SUCCESS)
 
     def set_light_mode(self, enabled):
