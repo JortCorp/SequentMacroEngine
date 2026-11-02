@@ -6653,6 +6653,7 @@ class VSCodeQueueViewer(tk.Frame):
         self._move_group_starts = []
         self._expanded_move_groups = set()
         self.hovered_line = None
+        self._hover_breakpoint_line = None
         self.interactive_enabled = True
         self.sub_menu = None
         # Queue gestures are independent of the OS input recorder.
@@ -6673,7 +6674,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter_frame.pack(side=tk.LEFT, fill=tk.Y)
 
         self.gutter_margin = tk.Canvas(
-            self.gutter_frame, width=62, bg=BG_GUTTER,
+            self.gutter_frame, width=54, bg=BG_GUTTER,
             highlightthickness=0, bd=0, cursor="hand2"
         )
         self.gutter_margin.pack(side=tk.LEFT, fill=tk.Y)
@@ -6966,6 +6967,7 @@ class VSCodeQueueViewer(tk.Frame):
 
     def redraw_breakpoints(self):
         self.gutter_margin.delete("bp_dot")
+        self.gutter_margin.delete("bp_hover")
         displayed_lines = set()
         for act_idx in self.app.breakpoints:
             group = self.folded_input_at(act_idx)
@@ -6983,6 +6985,25 @@ class VSCodeQueueViewer(tk.Frame):
                     cx - r, cy - r, cx + r, cy + r,
                     fill=COLOR_DANGER, outline="#ff7b7b", width=1, tags="bp_dot"
                 )
+        # Only the dedicated leftmost breakpoint lane previews an inactive dot.
+        hovered = self._hover_breakpoint_line
+        if hovered is not None and self.interactive_enabled:
+            action_idx = hovered - 2
+            if 0 <= action_idx < len(self.app.recorded_actions):
+                group = self.folded_input_at(action_idx)
+                target_idx = group[0] if group else action_idx
+                has_breakpoint = any(
+                    (self.folded_input_at(bp) or (bp,))[0] == target_idx
+                    for bp in self.app.breakpoints
+                )
+                if not has_breakpoint:
+                    dinfo = self.gutter.dlineinfo(f'{target_idx + 2}.0')
+                    if dinfo:
+                        cy = dinfo[1] + dinfo[3] / 2
+                        self.gutter_margin.create_oval(
+                            4.5, cy - 4.5, 13.5, cy + 4.5,
+                            fill='#777B85', outline='#A0A4AE', width=1,
+                            tags='bp_hover')
         self.redraw_typing_disclosures()
 
     def _on_gutter_margin_click(self, event):
@@ -7003,6 +7024,7 @@ class VSCodeQueueViewer(tk.Frame):
                 if event.x < 18:
                     # Leftmost lane: breakpoint only.
                     self.app.toggle_breakpoint(action_idx)
+                    self.redraw_breakpoints()
                 # Rightmost lane belongs to the hover + label; do not
                 # accidentally toggle a breakpoint when the + is hidden.
         except (tk.TclError, ValueError, IndexError):
@@ -7410,6 +7432,19 @@ class VSCodeQueueViewer(tk.Frame):
         return "break"
     
     def _on_viewer_motion(self, event):
+        # The inactive breakpoint preview belongs to the leftmost 18px only.
+        hover_line = None
+        if event.widget == self.gutter_margin and 0 <= event.x < 18 and self.interactive_enabled:
+            try:
+                rel_y = event.y_root - self.gutter.winfo_rooty()
+                line = int(self.gutter.index(f'@0,{rel_y}').split('.')[0])
+                if 2 <= line <= self.line_count:
+                    hover_line = line
+            except (tk.TclError, ValueError):
+                pass
+        if hover_line != self._hover_breakpoint_line:
+            self._hover_breakpoint_line = hover_line
+            self.redraw_breakpoints()
         if not self.interactive_enabled or self.line_count == 0:
             self.plus_btn.place_forget()
             return
@@ -7431,12 +7466,15 @@ class VSCodeQueueViewer(tk.Frame):
         gx, gy, gw, gh, gbase = dinfo
         btn_size = 14
         btn_y = gy + (gh - btn_size) // 2
-        btn_x = 62 - btn_size - 3
+        btn_x = 54 - btn_size - 2
 
         self.hovered_line = line_num
         self.plus_btn.place(x=btn_x, y=btn_y, width=btn_size, height=btn_size)
 
     def _on_viewer_leave(self, event):
+        if event.widget == self.gutter_margin and self._hover_breakpoint_line is not None:
+            self._hover_breakpoint_line = None
+            self.redraw_breakpoints()
         x, y = self.winfo_pointerxy()
         widget = self.winfo_containing(x, y)
         if widget != self.plus_btn and widget not in (self.gutter_margin, self.gutter, self.code_text):
