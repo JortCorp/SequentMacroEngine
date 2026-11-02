@@ -6644,6 +6644,10 @@ class VSCodeQueueViewer(tk.Frame):
         super().__init__(parent, bg=bg, highlightbackground=BG_BORDER, highlightthickness=1, **kwargs)
         self.app = app_instance
         self.line_count = 0
+        self._text_groups = []
+        self._text_group_by_index = {}
+        self._text_group_starts = []
+        self._expanded_text_groups = set()
         self.hovered_line = None
         self.interactive_enabled = True
         self.sub_menu = None
@@ -6748,13 +6752,87 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter.tag_raise("active_line")
 
 
+    def fold_typed_text(self, actions):
+        """Collapse consecutive keys in both Tk Text widgets, keeping line indices.
+
+        Elided lines still exist in the underlying Text buffers: every Playback
+        command, edit index, breakpoint and scrubber keeps its original action ID.
+        """
+        self._text_groups = list(sequent_typed_text_groups(actions))
+        self._text_group_by_index = {start: (start, end, text)
+                                     for start, end, text in self._text_groups}
+        self._text_group_starts = [start for start, _, _ in self._text_groups]
+        self._expanded_text_groups.clear()
+        self.code_text.tag_configure('typed_fold_hidden', elide=True)
+        self.gutter.tag_configure('typed_fold_hidden', elide=True)
+        self.code_text.tag_configure('typed_fold_title', foreground=SYNTAX_ORANGE)
+        for start, end, text in self._text_groups:
+            line = start + 2
+            title = f'keyboard.type_text({sequent_typed_text_preview(text)})  [{end-start:,} keys; double-click to expand]'
+            self.code_text.delete(f'{line}.0', f'{line}.end')
+            self.code_text.insert(f'{line}.0', title, 'typed_fold_title')
+            # End index is the next *visible* action line, excluding its data.
+            first_hidden = start + 3
+            final_hidden = end + 2
+            if first_hidden < final_hidden:
+                for widget in (self.code_text, self.gutter):
+                    widget.tag_add('typed_fold_hidden', f'{first_hidden}.0', f'{final_hidden}.0')
+
+    def folded_text_at(self, index):
+        """Return containing collapsed run, including indexes inside it."""
+        if index is None or not self._text_groups:
+            return None
+        from bisect import bisect_right
+        k = bisect_right(self._text_group_starts, index) - 1
+        if k < 0:
+            return None
+        group = self._text_groups[k]
+        if index >= group[1] or group[0] in self._expanded_text_groups:
+            return None
+        return group
+
+    def expand_typed_text(self, index):
+        """Expand a run prior to individual editing or detailed inspection."""
+        group = self.folded_text_at(index)
+        if group is None:
+            return False
+        start, end, text = group
+        self._expanded_text_groups.add(start)
+        line = start + 2
+        self.code_text.delete(f'{line}.0', f'{line}.end')
+        self.code_text.insert(f'{line}.0', self.app.get_action_summary(self.app.recorded_actions[start]), 'typed_fold_title')
+        for widget in (self.code_text, self.gutter):
+            widget.tag_remove('typed_fold_hidden', f'{start+3}.0', f'{end+2}.0')
+        return True
+
+    def collapse_typed_text(self, index):
+        # Restore visual folding without reloading or changing the queue.
+        from bisect import bisect_right
+        if not self._text_groups:
+            return False
+        k = bisect_right(self._text_group_starts, index) - 1
+        if k < 0:
+            return False
+        start, end, text = self._text_groups[k]
+        if index >= end or start not in self._expanded_text_groups:
+            return False
+        self._expanded_text_groups.remove(start)
+        line = start + 2
+        title = f'keyboard.type_text({sequent_typed_text_preview(text)})  [{end-start:,} keys; double-click to expand]'
+        self.code_text.delete(f'{line}.0', f'{line}.end')
+        self.code_text.insert(f'{line}.0', title, 'typed_fold_title')
+        for widget in (self.code_text, self.gutter):
+            widget.tag_add('typed_fold_hidden', f'{start+3}.0', f'{end+2}.0')
+        return True
+
     def highlight_action(self, index):
         self.code_text.tag_remove("active_line", "1.0", "end")
         self.gutter.tag_remove("active_line", "1.0", "end")
         if index is None or index < 0 or not self.app.recorded_actions or index >= len(self.app.recorded_actions):
             return
 
-        line_num = index + 2
+        folded = self.folded_text_at(index)
+        line_num = (folded[0] if folded else index) + 2
         if line_num <= self.line_count:
             self.code_text.tag_add("active_line", f"{line_num}.0", f"{line_num}.end+1c")
             self.gutter.tag_add("active_line", f"{line_num}.0", f"{line_num}.end+1c")
@@ -6763,8 +6841,13 @@ class VSCodeQueueViewer(tk.Frame):
 
     def redraw_breakpoints(self):
         self.gutter_margin.delete("bp_dot")
+        displayed_lines = set()
         for act_idx in self.app.breakpoints:
-            line_num = act_idx + 2
+            group = self.folded_text_at(act_idx)
+            line_num = (group[0] if group else act_idx) + 2
+            if line_num in displayed_lines:
+                continue
+            displayed_lines.add(line_num)
             dinfo = self.gutter.dlineinfo(f"{line_num}.0")
             if dinfo:
                 gx, gy, gw, gh, gbase = dinfo
@@ -6868,6 +6951,10 @@ class VSCodeQueueViewer(tk.Frame):
 
 
     def clear(self):
+        self._text_groups = []
+        self._text_group_by_index = {}
+        self._text_group_starts = []
+        self._expanded_text_groups.clear()
         self._cancel_queue_drag()
         self.close_sub_menu()
         self.plus_btn.place_forget()
@@ -7089,6 +7176,16 @@ class VSCodeQueueViewer(tk.Frame):
             act_type = act.get("type", "Action")
             is_bp = act_idx in self.app.breakpoints
             bp_label = f"Remove Breakpoint (Line {line_num})" if is_bp else f"Toggle Breakpoint (Line {line_num})"
+            folded = self.folded_text_at(act_idx)
+            if folded:
+                menu.add_command(label=f'Expand Typed Text ({folded[1]-folded[0]} keys)',
+                                 command=lambda idx=act_idx: self.expand_typed_text(idx))
+                menu.add_separator()
+            elif any(start <= act_idx < end and start in self._expanded_text_groups
+                     for start, end, _ in self._text_groups):
+                menu.add_command(label='Collapse Typed Text',
+                                 command=lambda idx=act_idx: self.collapse_typed_text(idx))
+                menu.add_separator()
 
             # Copy the full highlighted range when the context row is selected.
             selected = self.selected_action_indices()
@@ -7100,9 +7197,13 @@ class VSCodeQueueViewer(tk.Frame):
                                  command=lambda idx=act_idx + 1: self.app.paste_queue_actions(idx))
             menu.add_separator()
             # Direct edit option
-            menu.add_command(label=f"Edit Action '{act_type}' (Line {line_num})...", command=lambda: self.open_action_submenu(line_num, event, edit_idx=act_idx))
+            edit_label = (f"Edit First Keystroke (Line {line_num})..." if folded else
+                          f"Edit Action '{act_type}' (Line {line_num})...")
+            delete_label = (f"Delete First Keystroke (Line {line_num})" if folded else
+                            f"Delete Action '{act_type}' (Line {line_num})")
+            menu.add_command(label=edit_label, command=lambda: self.open_action_submenu(line_num, event, edit_idx=act_idx))
             menu.add_command(label=bp_label, command=lambda: self.app.toggle_breakpoint(act_idx))
-            menu.add_command(label=f"Delete Action '{act_type}' (Line {line_num})", command=lambda: self.app.delete_action(act_idx))
+            menu.add_command(label=delete_label, command=lambda: self.app.delete_action(act_idx))
             if act_type == "move":
                 menu.add_command(label="Delete All Mouse Movements", command=self.app.remove_all_mouse_moves)
             menu.add_separator()
@@ -7328,6 +7429,8 @@ class VSCodeQueueViewer(tk.Frame):
             if line_num >= 2:
                 act_idx = line_num - 2
                 if 0 <= act_idx < len(self.app.recorded_actions):
+                    if self.expand_typed_text(act_idx):
+                        return 'break'
                     self.open_action_submenu(line_num, event, edit_idx=act_idx)
                     return "break"
         except Exception:
@@ -7342,6 +7445,8 @@ class VSCodeQueueViewer(tk.Frame):
         self.close_sub_menu()
         if not self.interactive_enabled:
             return
+        if line_num >= 2:
+            self.expand_typed_text(line_num - 2)
 
         type_to_label = {
             "delay": "Delay",
@@ -14313,11 +14418,42 @@ class SequentStudioGraph(tk.Frame):
 
 
 
-class SequentPlaybackGraph(SequentStudioGraph):
-    """Playback-synchronized graph with a lossless, condensed *display* model.
+def sequent_typed_text_groups(actions, minimum=2):
+    """Yield (start, end, text) of consecutive unmodified printable key events.
 
-    Mouse moves and wheel ticks are grouped in the canvas only. All original
-    actions, their order, and their indices remain authoritative in Playback.
+    This is a display projection only: no saved actions or execution timing change.
+    Non-text actions (including shortcuts, Enter, Tab, waits, and branches)
+    always terminate a text run, even when separated only by one action.
+    """
+    start = None
+    chars = []
+    for i, action in enumerate(actions):
+        char = action.get('key') if isinstance(action, dict) and action.get('type') == 'key' else None
+        plain = (isinstance(char, str) and len(char) == 1 and
+                 char.isprintable() and char not in ('\r', '\n', '\t'))
+        if plain:
+            if start is None:
+                start = i
+            chars.append(char)
+        else:
+            if start is not None and len(chars) >= minimum:
+                yield start, i, ''.join(chars)
+            start, chars = None, []
+    if start is not None and len(chars) >= minimum:
+        yield start, len(actions), ''.join(chars)
+
+
+def sequent_typed_text_preview(text, limit=72):
+    """Escape newlines/quotes and limit long user strings in one-line labels."""
+    visible = repr(text)
+    return visible if len(visible) <= limit else visible[:limit - 4] + "..." + visible[-1]
+
+
+class SequentPlaybackGraph(SequentStudioGraph):
+    """Playback-synchronized graph with a lossless, condensed display model.
+
+    Mouse movement, wheel ticks and consecutive typing are grouped visually.
+    All original actions, ordering and indices stay authoritative in Playback.
     """
     INPUT_NOISE = frozenset(('move', 'scroll', 'wheel'))
     NODE_Y_STEP = 110
@@ -14352,6 +14488,25 @@ class SequentPlaybackGraph(SequentStudioGraph):
                     nodes.append({'start': i, 'end': j, 'kind': 'input_group',
                                   'moves': moves, 'scrolls': scrolls,
                                   'scroll_delta': scroll_delta})
+                else:
+                    nodes.append({'start': i, 'end': j, 'kind': kind})
+                i = j
+            elif kind == 'key':
+                j = i + 1
+                chars = [actions[i].get('key')]
+                if not (isinstance(chars[0], str) and len(chars[0]) == 1 and chars[0].isprintable()):
+                    nodes.append({'start': i, 'end': j, 'kind': kind})
+                    i = j
+                    continue
+                while j < n and actions[j].get('type') == 'key':
+                    char = actions[j].get('key')
+                    if not isinstance(char, str) or len(char) != 1 or not char.isprintable():
+                        break
+                    chars.append(char)
+                    j += 1
+                if j - i > 1:
+                    nodes.append({'start': i, 'end': j, 'kind': 'text_group',
+                                  'text': ''.join(chars)})
                 else:
                     nodes.append({'start': i, 'end': j, 'kind': kind})
                 i = j
@@ -14467,13 +14622,13 @@ class SequentPlaybackGraph(SequentStudioGraph):
 
     def _selected_group(self):
         node = self._node_for_action(self.selected_action)
-        return node if node is not None and node['kind'] == 'input_group' else None
+        return node if node is not None and node['kind'] in ('input_group', 'text_group') else None
 
     def _guard_group_edit(self):
         if self._selected_group() is None:
             return False
         messagebox.showinfo('Condensed input node',
-            'This node represents multiple original movement/scroll actions. '
+            'This node represents multiple original recorded actions. '
             'Edit those individual actions in Playback. Studio never replaces '
             'or deletes the underlying recording when grouping the graph.',
             parent=self.winfo_toplevel())
@@ -14536,6 +14691,9 @@ class SequentPlaybackGraph(SequentStudioGraph):
                 count=node['end']-start
                 title=f'{start+1}–{node["end"]}  RECORDED INPUT ×{count:,}'
                 summary=f'{node["moves"]:,} moves  •  {node["scrolls"]:,} scrolls'
+            elif typ=='text_group':
+                title=f'{start+1}–{node["end"]}  TYPE TEXT ×{node["end"]-start:,}'
+                summary=sequent_typed_text_preview(node['text'], 35)
             else:
                 act=self.actions[start]
                 title=f'{start+1:03}  {str(typ).replace("_"," ").upper()}'
@@ -14595,15 +14753,20 @@ class SequentPlaybackGraph(SequentStudioGraph):
             widget.destroy()
         self.property_entries={}
         start,end=group['start'],group['end']
-        facts=(('ACTION RANGE',f'{start+1:,}–{end:,}'),
-               ('RECORDED ACTIONS',f'{end-start:,}'),
-               ('MOUSE MOVEMENTS',f'{group["moves"]:,}'),
-               ('SCROLL EVENTS',f'{group["scrolls"]:,}'),
-               ('SCROLL DELTA',str(group['scroll_delta'])))
+        if group['kind']=='text_group':
+            facts=(('ACTION RANGE',f'{start+1:,}–{end:,}'),
+                   ('RECORDED KEYSTROKES',f'{end-start:,}'),
+                   ('TYPED TEXT',sequent_typed_text_preview(group['text'], 100)))
+        else:
+            facts=(('ACTION RANGE',f'{start+1:,}–{end:,}'),
+                   ('RECORDED ACTIONS',f'{end-start:,}'),
+                   ('MOUSE MOVEMENTS',f'{group["moves"]:,}'),
+                   ('SCROLL EVENTS',f'{group["scrolls"]:,}'),
+                   ('SCROLL DELTA',str(group['scroll_delta'])))
         for name,value in facts:
             tk.Label(self.property_fields,text=name,bg='#202633',fg='#A9BBD1',font=('Segoe UI',8,'bold')).pack(anchor='w',pady=(12,2))
             tk.Label(self.property_fields,text=value,bg='#202633',fg='white',font=('Segoe UI',11)).pack(anchor='w')
-        tk.Label(self.property_fields, text='Visual-only grouping. The full input sequence remains unchanged in Playback.',
+        tk.Label(self.property_fields, text='Visual-only grouping. Original actions and timing are unchanged. Double-click a folded text entry in Playback to expand it.',
                  bg='#202633',fg='#A9BBD1',wraplength=218,justify='left').pack(anchor='w',pady=(16,8))
         tk.Button(self.property_fields,text='Select First Action in Playback',
                   command=lambda:self.app.set_active_action_index(start),
@@ -20218,6 +20381,9 @@ try {{
             color = self.get_action_color(act)
             self.queue_viewer.append_line(desc, color, auto_scroll=False)
 
+        # Fold text visually in Playback but retain the original one-line-per-action
+        # Text indices, which are used by edit, breakpoints and the scrubber.
+        self.queue_viewer.fold_typed_text(actions)
         self.update_action_count_badge()
         self.update_scrubber_ui()
         self.queue_viewer.redraw_breakpoints()
