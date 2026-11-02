@@ -14438,12 +14438,30 @@ def sequent_typed_text_groups(actions, minimum=2, pause_seconds=SEQUENT_TYPING_P
     def printable(action):
         if not isinstance(action, dict):
             return None
-        if action.get('type') == 'key':
+        kind = action.get('type')
+        if kind == 'key':
             char = action.get('key')
-        elif action.get('type') == 'combo' and action.get('mods') == [VK_SHIFT]:
-            # Only newly recorded Shift-only printable combos have this
-            # captured character; never guess an old hotkey's meaning.
+        elif kind == 'combo':
+            # Shift is a text modifier when used *alone* with a printable key.
+            # Ctrl/Alt/Win combinations, navigation keys, etc. remain separate.
+            mods = action.get('mods', [])
+            if isinstance(mods, int):
+                mods = [mods]
+            if not isinstance(mods, (list, tuple)) or len(mods) != 1 or mods[0] not in (VK_SHIFT, 0xA0, 0xA1):
+                return None
+            vk = action.get('vk')
+            if vk in SPECIAL_KEY_NAMES or vk in (VK_RETURN, VK_BACK, VK_ESCAPE, VK_DELETE):
+                return None
             char = action.get('typed_char')
+            if not (isinstance(char, str) and len(char) == 1 and char.isprintable()):
+                # Older Sequent recordings didn't save typed_char on Shift
+                # combos. VK_A..VK_Z are unambiguous letters in Windows;
+                # only infer those, not layout-dependent punctuation/hotkeys.
+                # This changes *only* the visual summary, not the combo action.
+                if isinstance(vk, int) and VK_A <= vk <= ord('Z'):
+                    char = chr(vk)
+                else:
+                    return None
         else:
             return None
         if isinstance(char, str) and len(char) == 1 and char.isprintable() and char not in ('\r', '\n', '\t'):
@@ -21593,6 +21611,11 @@ try {{
             # Keep the original 'combo' action so playback semantics are intact.
             if active_mods == [VK_SHIFT] and vk not in SPECIAL_KEY_NAMES and vk not in (VK_RETURN, VK_BACK):
                 typed_char = get_char_from_vk(vk)
+                if not (isinstance(typed_char, str) and len(typed_char) == 1 and typed_char.isprintable()):
+                    # ToUnicode can fail for some layouts/dead-key states.
+                    # Preserve the Shift+letter as a typing-session character.
+                    if VK_A <= vk <= ord('Z'):
+                        typed_char = chr(vk)
                 if isinstance(typed_char, str) and len(typed_char) == 1 and typed_char.isprintable():
                     action['typed_char'] = typed_char
                     self._sequent_mark_typed_character(action)
