@@ -14924,7 +14924,8 @@ class SequentPlaybackGraph(SequentStudioGraph):
     All original actions, ordering and indices stay authoritative in Playback.
     """
     INPUT_NOISE = frozenset(('move', 'scroll', 'wheel'))
-    NODE_Y_STEP = 110
+    NODE_X_STEP = 310
+    NODE_Y_STEP = 135
 
     @staticmethod
     def build_projection(actions):
@@ -15058,10 +15059,15 @@ class SequentPlaybackGraph(SequentStudioGraph):
         self._node_starts = starts
         self._node_by_start = {n['start']: n for n in nodes}
         self.positions = {n['start']: old_positions.get(n['start'],
-                          (80, k * self.NODE_Y_STEP))
+                          (80 + k * self.NODE_X_STEP, 120))
                           for k, n in enumerate(nodes)}
         self._layout_source = name
+        if not hasattr(self, 'section_boxes') or getattr(self, '_sections_source', None) != name:
+            self.section_boxes = []
+            self._sections_source = name
         self._view_edges = self.projected_edges(nodes, actions)
+        self._wire_preview = None
+        self._wire_source = None
         if self.selected_action is not None and self.selected_action >= len(actions):
             self.selected_action = None
         self._draw()
@@ -15114,15 +15120,36 @@ class SequentPlaybackGraph(SequentStudioGraph):
                 continue
             x,y = positions[a]
             xx,yy = positions[b]
-            x1,y1 = pt(x+self.NODE_W/2,y+self.NODE_H)
-            x2,y2 = pt(xx+self.NODE_W/2,yy)
+            x1,y1 = pt(x+self.NODE_W,y+self.NODE_H/2)
+            x2,y2 = pt(xx,yy+self.NODE_H/2)
             if max(x1,x2)<-pad or min(x1,x2)>w+pad or max(y1,y2)<-pad or min(y1,y2)>h+pad:
                 continue
             col = '#58C9D0' if label in ('TRUE','LOOP') else '#D5A76C' if label else '#63718A'
-            mid=(y1+y2)/2
-            c.create_line(x1,y1,x1,mid,x2,mid,x2,y2,fill=col,width=2,smooth=True,arrow='last')
+            mid=(x1+x2)/2
+            c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,fill=col,width=2,smooth=True,arrow='last')
             if label:
-                c.create_text((x1+x2)/2+12,mid-8,text=label,fill=col,font=('Segoe UI',8,'bold'))
+                c.create_text(mid,(y1+y2)/2-12,text=label,fill=col,font=('Segoe UI',8,'bold'))
+        if getattr(self, '_wire_preview', None):
+            start, (mx, my) = self._wire_preview
+            if start in positions:
+                sx, sy = positions[start]
+                x1,y1=pt(sx+self.NODE_W,sy+self.NODE_H/2)
+                x2,y2=mx,my
+                mid=(x1+x2)/2
+                c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,
+                              fill='#FBBF24',width=2,dash=(4,3),smooth=True)
+        # Visual-only sections: they do not alter Playback execution.
+        for section in self.section_boxes:
+            x1,y1=pt(section['x1'],section['y1'])
+            x2,y2=pt(section['x2'],section['y2'])
+            c.create_rectangle(x1,y1,x2,y2,fill='',outline='#64748B',
+                               dash=(6,4),width=2,tags=('section',))
+            c.create_text(x1+8,y1+8,anchor='nw',text=section['name'],
+                          fill='#CBD5E1',font=('Segoe UI',10,'bold'))
+        if getattr(self,'_section_preview',None):
+            a,b=self._section_preview
+            x1,y1=pt(*a);x2,y2=pt(*b)
+            c.create_rectangle(x1,y1,x2,y2,outline='#38BDF8',dash=(3,3),width=2)
         running_index = getattr(self.app, 'current_action_idx', -1) if self.app is not None and self.app.playing else -1
         running_node = self._node_for_action(running_index)
         running_start = running_node['start'] if running_node is not None else None
@@ -15144,6 +15171,15 @@ class SequentPlaybackGraph(SequentStudioGraph):
             c.create_rectangle(x1,y1,x1+5*scale,y2,
                                fill=self.app.studio_node_color(node),
                                outline='',tags=(f'n{start}','node'))
+            # Dedicated input/output sockets on the horizontal node edges.
+            port_r=max(3,5*scale)
+            cy=(y1+y2)/2
+            c.create_oval(x1-port_r,cy-port_r,x1+port_r,cy+port_r,
+                          fill='#38BDF8',outline='#111827',width=1,
+                          tags=(f'n{start}','node','input-port'))
+            c.create_oval(x2-port_r,cy-port_r,x2+port_r,cy+port_r,
+                          fill='#34D399',outline='#111827',width=1,
+                          tags=(f'n{start}','node','output-port'))
             if typ=='input_group':
                 count=node['end']-start
                 title=f'{start+1}–{node["end"]}  {"MOUSE MOVEMENT" if node["moves"] else "SCROLL EVENTS"} ×{count:,}'
@@ -15155,6 +15191,8 @@ class SequentPlaybackGraph(SequentStudioGraph):
                 act=self.actions[start]
                 title=f'{start+1:03}  {str(typ).replace("_"," ").upper()}'
                 summary=str(act.get('name') or act.get('label') or act.get('mode') or act.get('text') or typ)
+                if typ in SCREEN_RECOGNITION_TYPES:
+                    summary=self._conditional_node_summary(act)
             # Tk canvas cannot elide text itself: keep rendering bounded.
             c.create_text(x1+12*scale,y1+20*scale,anchor='w',text=title[:37],fill='#ACBED5',font=('Segoe UI',max(7,int(9*scale))),tags=(f'n{start}','node'))
             c.create_text(x1+12*scale,y1+44*scale,anchor='w',text=summary[:37],fill='white',font=('Segoe UI',max(8,int(10*scale)),'bold'),tags=(f'n{start}','node'))
@@ -15166,6 +15204,24 @@ class SequentPlaybackGraph(SequentStudioGraph):
                           fill='#AABBD3',font=('Segoe UI',9,'bold'))
 
     def _press(self,e):
+        if e.state & 0x0001:  # Shift + left drag: create a visual section.
+            self._section_preview=(self._world(e.x,e.y),self._world(e.x,e.y))
+            self._drag=self._pan=None
+            self._draw()
+            return
+        wx,wy=self._world(e.x,e.y)
+        for node in reversed(getattr(self,'nodes',())):
+            start=node['start']
+            nx,ny=self.positions[start]
+            if abs(wx-(nx+self.NODE_W))<13/max(.4,self.scale) and abs(wy-(ny+self.NODE_H/2))<13/max(.4,self.scale):
+                self._wire_source=start
+                self._wire_preview=(start,(e.x,e.y))
+                self._drag=self._pan=None
+                self._draw()
+                return
+        return self._press_node(e)
+
+    def _press_node(self,e):
         x,y = self._world(e.x,e.y)
         hit = None
         # Only visible nodes need hit testing; avoids scanning raw actions.
@@ -15187,12 +15243,43 @@ class SequentPlaybackGraph(SequentStudioGraph):
                 self.app.set_active_action_index(hit)
             self.show_properties()
         else:
-            self._pan=(e.x,e.y,self.pan_x,self.pan_y)
+            frame=self._section_at(e.x,e.y)
+            if frame is not None:
+                self._frame_drag=(frame,x,y,
+                                  {n['start']:self.positions[n['start']]
+                                   for n in self.nodes
+                                   if frame['x1']<=self.positions[n['start']][0] and
+                                      self.positions[n['start']][0]+self.NODE_W<=frame['x2'] and
+                                      frame['y1']<=self.positions[n['start']][1] and
+                                      self.positions[n['start']][1]+self.NODE_H<=frame['y2']},
+                                  (frame['x1'],frame['y1'],frame['x2'],frame['y2']))
+                self._pan=None
+            else:
+                self._pan=(e.x,e.y,self.pan_x,self.pan_y)
             self._drag=None
         self._draw()
 
     def _motion(self,e):
-        if self._drag:
+        if getattr(self,'_wire_preview',None):
+            self._wire_preview=(self._wire_source,(e.x,e.y))
+            self._draw()
+            return
+        if getattr(self,'_section_preview',None):
+            first,_=self._section_preview
+            self._section_preview=(first,self._world(e.x,e.y))
+            self._draw()
+            return
+        return self._motion_node(e)
+
+    def _motion_node(self,e):
+        if getattr(self,'_frame_drag',None):
+            frame,x0,y0,members,bounds=self._frame_drag
+            x,y=self._world(e.x,e.y)
+            dx,dy=x-x0,y-y0
+            frame['x1'],frame['y1'],frame['x2'],frame['y2']=(bounds[0]+dx,bounds[1]+dy,bounds[2]+dx,bounds[3]+dy)
+            for key,(nx,ny) in members.items():
+                self.positions[key]=(nx+dx,ny+dy)
+        elif self._drag:
             i,dx,dy=self._drag
             x,y=self._world(e.x,e.y)
             self.positions[i]=(x-dx,y-dy)
@@ -15201,6 +15288,98 @@ class SequentPlaybackGraph(SequentStudioGraph):
             self.pan_x=px+e.x-x
             self.pan_y=py+e.y-y
         self._draw()
+
+    def _release(self):
+        if getattr(self,'_wire_source',None) is not None:
+            source=self._wire_source
+            self._wire_source=None
+            self._wire_preview=None
+            px=self.canvas.winfo_pointerx()-self.canvas.winfo_rootx()
+            py=self.canvas.winfo_pointery()-self.canvas.winfo_rooty()
+            wx,wy=self._world(px,py)
+            destination=None
+            for node in reversed(getattr(self,'nodes',())):
+                start=node['start']
+                nx,ny=self.positions[start]
+                if abs(wx-nx)<15/max(.4,self.scale) and abs(wy-(ny+self.NODE_H/2))<15/max(.4,self.scale):
+                    destination=start
+                    break
+            if destination is not None:
+                self._connect_sockets(source,destination)
+            self._draw()
+            return
+        preview=getattr(self,'_section_preview',None)
+        if preview:
+            (x1,y1),(x2,y2)=preview
+            self._section_preview=None
+            if abs(x2-x1)>40 and abs(y2-y1)>30:
+                self.section_boxes.append({'x1':min(x1,x2),'y1':min(y1,y2),
+                                           'x2':max(x1,x2),'y2':max(y1,y2),
+                                           'name':f'Section {len(self.section_boxes)+1}'})
+            self._draw()
+            return
+        self._drag=self._pan=None
+        self._frame_drag=None
+
+    def _connect_sockets(self, source, destination):
+        """Only GOTO->LABEL can be written safely to the existing action model.
+
+        Other edges are computed from sequential/structured control flow, and
+        cannot be arbitrarily rewired without changing the macro engine.
+        """
+        if self.app is None or self.app.playing or self.app.recording:
+            messagebox.showwarning('Studio connections',
+                                   'Stop recording and playback before editing connections.',
+                                   parent=self.winfo_toplevel())
+            return
+        src=self.actions[source]
+        dst=self.actions[destination]
+        if src.get('type')!='goto' or dst.get('type')!='label' or not dst.get('name'):
+            messagebox.showinfo('Studio connections',
+                'Only GOTO output → named LABEL input can be rewired safely. '
+                'Sequential, conditional, and loop connections follow the '
+                'macro engine’s control-flow instructions.',
+                parent=self.winfo_toplevel())
+            return
+        target=dst['name']
+        if src.get('target')==target:
+            return
+        if not messagebox.askyesno('Change GOTO connection',
+                f'Change action {source+1} to jump to label "{target}"?',
+                parent=self.winfo_toplevel()):
+            return
+        before=self.app._begin_queue_deletion()
+        src['target']=target
+        self.app._finish_queue_deletion(before,'Studio: change GOTO target')
+        self.redraw()
+
+    def _section_at(self, x, y):
+        wx,wy=self._world(x,y)
+        for section in reversed(getattr(self,'section_boxes',())):
+            if section['x1'] <= wx <= section['x2'] and section['y1'] <= wy <= section['y2']:
+                return section
+        return None
+
+    def _section_menu(self, event):
+        section=self._section_at(event.x,event.y)
+        if section is None:
+            return
+        menu=tk.Menu(self,tearoff=False)
+        def rename():
+            from tkinter import simpledialog
+            name=simpledialog.askstring('Rename section','Section name:',
+                                        initialvalue=section['name'],parent=self)
+            if name and name.strip():
+                section['name']=name.strip()
+                self._draw()
+        def delete():
+            self.section_boxes.remove(section)
+            self._draw()
+        menu.add_command(label='Rename section',command=rename)
+        menu.add_command(label='Delete section',command=delete)
+        menu.add_separator()
+        menu.add_command(label='Drag inside frame to move contained nodes',state='disabled')
+        menu.tk_popup(event.x_root,event.y_root)
 
     def show_properties(self):
         group = self._selected_group()
@@ -15234,8 +15413,68 @@ class SequentPlaybackGraph(SequentStudioGraph):
         if not self._guard_group_edit():
             return super().apply_properties()
     def edit_node(self):
-        if not self._guard_group_edit():
+        if self._guard_group_edit():
+            return
+        i=self.selected_action
+        if i is None or not 0<=i<len(self.actions):
+            return
+        action=self.actions[i]
+        if action.get('type') not in SCREEN_RECOGNITION_TYPES:
             return super().edit_node()
+        if self.app.playing or self.app.recording or getattr(self.app,'chain_running',False):
+            messagebox.showwarning('Studio','Stop recording and playback before editing.',parent=self)
+            return
+        win=tk.Toplevel(self)
+        win.title('Conditional outcomes — '+str(action['type']).replace('_',' ').title())
+        win.geometry('500x390')
+        win.configure(bg='#202633')
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        tk.Label(win,text='Edit conditional subactions',bg='#202633',fg='white',
+                 font=('Segoe UI',13,'bold')).pack(anchor='w',padx=16,pady=(14,6))
+        fields={}
+        for found,caption in ((True,'IF FOUND'),(False,'IF NOT FOUND')):
+            behavior,target=sequent_screen_outcome_config(action,found)
+            frame=tk.LabelFrame(win,text=caption,bg='#202633',fg='#A9BBD1',padx=10,pady=8)
+            frame.pack(fill='x',padx=16,pady=7)
+            options=list(SCREEN_OUTCOME_OPTIONS)
+            if found and action['type']=='find_text':
+                options.append('Save Coordinates to Variables')
+            var=tk.StringVar(value=behavior)
+            opt=tk.OptionMenu(frame,var,*options)
+            opt.configure(bg='#303D52',fg='white',highlightthickness=0)
+            opt.pack(fill='x')
+            target_var=tk.StringVar(value=target)
+            tk.Entry(frame,textvariable=target_var,bg='#151B27',fg='white',
+                     insertbackground='white').pack(fill='x',pady=(8,0))
+            tk.Label(frame,text='Target macro or label (when applicable)',
+                     bg='#202633',fg='#A9BBD1').pack(anchor='w')
+            fields[found]=(var,target_var)
+        def save():
+            updated=copy.deepcopy(action)
+            for found,(var,target_var) in fields.items():
+                key='if_found' if found else 'if_not_found'
+                updated[key]=var.get()
+                updated[key+'_target']=target_var.get().strip()
+                if updated[key] in ('Jump to Label','Run Saved Macro') and not updated[key+'_target']:
+                    messagebox.showerror('Missing target',f'{key}: specify a target.',parent=win)
+                    return
+            actions=copy.deepcopy(self.actions)
+            actions[i]=updated
+            if self._write(actions):
+                win.destroy()
+        tk.Button(win,text='Save conditional outcomes',command=save,
+                  bg='#377F83',fg='white').pack(fill='x',padx=16,pady=10)
+
+    def _conditional_node_summary(self, action):
+        try:
+            a,_=sequent_screen_outcome_config(action,True)
+            b,_=sequent_screen_outcome_config(action,False)
+            return 'Found: '+a+'  |  Not found: '+b
+        except (ValueError,MacroExecutionError):
+            return 'Edit conditional outcomes'
+
+
     def delete_node(self):
         if not self._guard_group_edit():
             return super().delete_node()
@@ -16902,6 +17141,8 @@ class BuiltInMacroApp:
 
     def _place_stage_builder_dock(self):
         """Keep Stage Builder pinned to the application's right edge."""
+        if getattr(self, 'current_tab_name', None) == 'sequencer':
+            return
         dock = getattr(self, "stage_builder_dock", None)
         if dock is None or not dock.winfo_exists():
             return
@@ -16924,17 +17165,17 @@ class BuiltInMacroApp:
             sidebar_width = self._sidebar_visible_width
         left = int(sidebar_width) + 13
         self.seq_timeline_viewport.place(
-            x=left, y=76, relwidth=1.0, width=-(left + 311),
+            x=left, y=76, relwidth=1.0, width=-(left + 13),
             relheight=1.0, height=-89
         )
         if resize_content:
-            target_width = self._queue_available_width(sidebar_width)
+            target_width = max(1, self.workspace.winfo_width() - left - 13)
             if self._seq_timeline_content_width != target_width:
                 self._seq_timeline_content_width = target_width
                 dock.place_configure(width=target_width)
         self.seq_timeline_viewport.lift()
         if hasattr(self, "stage_builder_dock") and self.stage_builder_dock.winfo_exists():
-            self.stage_builder_dock.lift()
+            self.stage_builder_dock.place_forget()
 
     def _prepare_queue_for_transition(self):
         """Mark the animation active without jumping the Queue's width."""
@@ -17017,7 +17258,8 @@ class BuiltInMacroApp:
                 self._sidebar_visible_width,
                 resize_content=not self._queue_animation_active
             )
-            self._place_stage_builder_dock()
+            if hasattr(self, "stage_builder_dock"):
+                self.stage_builder_dock.place_forget()
         else:
             if hasattr(self, "control_dock"):
                 self.control_dock.place_forget()
@@ -17231,7 +17473,6 @@ class BuiltInMacroApp:
         self.studio_selected_action = None
         self.stage_builder_dock = ModernCard(self.workspace, bg_card=BG_PANEL)
         self.stage_builder_dock.pack_propagate(False)
-        self._place_stage_builder_dock()
         sequent_dock_header(self.stage_builder_dock, 'Graph Inspector', 'LIVE PLAYBACK ACTIONS')
         tk.Label(self.stage_builder_dock, text='Select a node to inspect its properties.\n'
                  'Changes update the loaded Playback queue.', bg=BG_PANEL,
@@ -17242,7 +17483,7 @@ class BuiltInMacroApp:
         self.studio_status_label.pack(fill=tk.X, padx=12, pady=8)
         self.seq_timeline_dock = ModernCard(self.seq_timeline_viewport, bg_card=BG_PANEL)
         left = self.seq_timeline_dock
-        width = self._queue_available_width(self._sidebar_visible_width)
+        width = max(1, self.workspace.winfo_width() - int(self._sidebar_visible_width) - 26)
         left.place(relx=1.0, x=0, y=-1, anchor='ne', width=width,
                    relheight=1.0, height=2)
         self._seq_timeline_content_width = width
@@ -17253,6 +17494,14 @@ class BuiltInMacroApp:
             colors_getter=lambda: {}, on_select=self._studio_graph_select,
             on_scrub=lambda *_: None, app=self)
         self.studio_timeline.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.studio_timeline.canvas.bind('<Button-3>', self.studio_timeline._section_menu)
+        self.studio_timeline.canvas.bind('<Double-Button-1>', lambda e: self.studio_timeline.edit_node())
+        # Properties remain instantiated for existing edit commands but are not
+        # shown permanently. The canvas now uses the full Studio width.
+        self.studio_timeline.inspector.pack_forget()
+        self.stage_builder_dock.place_forget()
+        tk.Label(left, text='Shift + drag: create section   •   Right-click section: rename/delete   •   Drag: move node   •   Wheel: zoom',
+                 bg=BG_PANEL, fg=TEXT_MUTED, anchor='w').pack(side='bottom', fill='x', padx=10)
         self.studio_timeline.redraw()
 
     def _studio_graph_select(self, stage, action_index):
