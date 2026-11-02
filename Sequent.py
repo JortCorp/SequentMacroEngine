@@ -5065,7 +5065,11 @@ def _global_variable_path(app):
     """Per-user writable storage; never require write access to installation/presets."""
     base = (os.environ.get('LOCALAPPDATA') or
             os.path.join(os.path.expanduser('~'), 'AppData', 'Local'))
-    return os.path.join(base, 'Sequent', 'globals.json')
+    default_path = os.path.join(base, 'Sequent', 'globals.json')
+    configured = getattr(app, 'global_variables_file', None)
+    if configured and isinstance(configured, str):
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(configured)))
+    return default_path
 
 
 def _retry_global_io(operation):
@@ -5096,6 +5100,8 @@ def _read_global_values(app):
     except FileNotFoundError:
         # Migrate once from older Sequent versions which stored globals beside
         # presets. Never delete or modify the original during migration.
+        if getattr(app, 'global_variables_file', None):
+            return {}
         legacy = os.path.join(app.presets_dir, 'globals.json')
         if os.path.normcase(os.path.abspath(legacy)) == os.path.normcase(os.path.abspath(path)):
             return {}
@@ -19981,6 +19987,7 @@ try {{
             play_cue("start")
 
     def load_settings(self):
+        self.global_variables_file = None
         global ACTIVE_SOUND_THEME, CUSTOM_SOUND_PATHS
         try:
             if os.path.exists("settings.json"):
@@ -20033,6 +20040,9 @@ try {{
                 self.window_relative = config.get("window_relative", False)
                 self.audio_cues = config.get("audio_cues", True)
                 self.autosave_presets = bool(config.get("autosave_presets", True))
+                custom_globals = config.get("global_variables_file", "")
+                self.global_variables_file = (custom_globals if isinstance(custom_globals, str)
+                                              and custom_globals.strip() else None)
                 self.delay_jitter = config.get("delay_jitter", False)
                 self.natural_timing = config.get("natural_timing", False)
                 ACTIVE_SOUND_THEME = config.get("sound_theme", "Classic")
@@ -20043,6 +20053,63 @@ try {{
                         CUSTOM_SOUND_PATHS[k] = saved_sounds[k]
         except Exception as e:
             print(f"Error loading settings: {e}")
+
+    def choose_global_variables_file(self):
+        """Choose a writable JSON file; copy existing globals when creating a new location."""
+        previous = _global_variable_path(self)
+        selected = filedialog.asksaveasfilename(
+            parent=self.root, title="Choose Global Variables JSON File",
+            initialdir=os.path.dirname(previous),
+            initialfile=os.path.basename(previous),
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")])
+        if not selected:
+            return
+        selected = os.path.abspath(os.path.expanduser(os.path.expandvars(selected)))
+        if not selected.lower().endswith('.json'):
+            messagebox.showerror("Invalid file", "Choose a .json file.", parent=self.root)
+            return
+        try:
+            if os.path.isfile(selected):
+                existing = _read_global_file(selected)
+                if not isinstance(existing, dict):
+                    raise ValueError("The selected file must contain a JSON object.")
+            else:
+                # Retain existing values when relocating, without modifying the original.
+                with _GLOBAL_VARIABLE_LOCK:
+                    existing = _read_global_values(self)
+                folder = os.path.dirname(selected)
+                os.makedirs(folder, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(prefix='.sequent-global-', suffix='.tmp', dir=folder)
+                try:
+                    with os.fdopen(fd, 'w', encoding='utf-8') as out:
+                        json.dump(existing, out, indent=2, ensure_ascii=True)
+                        out.write('\\n')
+                        out.flush()
+                        os.fsync(out.fileno())
+                    # Never overwrite a file created concurrently.
+                    if os.path.exists(selected):
+                        raise FileExistsError("The destination was created while selecting it.")
+                    os.replace(tmp, selected)
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+            # Verify file is writable before switching paths.
+            with open(selected, 'r+', encoding='utf-8') as test:
+                pass
+        except (OSError, ValueError, UnicodeError, json.JSONDecodeError, MacroExecutionError) as exc:
+            messagebox.showerror("Global variables file", str(exc), parent=self.root)
+            return
+        self.global_variables_file = selected
+        self.global_file_display.configure(text=self.shorten_path(selected))
+        self.save_settings()
+        self.update_status("Global variables file location updated", COLOR_SUCCESS)
+
+    def reset_global_variables_file(self):
+        self.global_variables_file = None
+        self.global_file_display.configure(text=self.shorten_path(_global_variable_path(self)))
+        self.save_settings()
+        self.update_status("Global variables location restored to default", COLOR_SUCCESS)
 
     def save_settings(self):
         global ACTIVE_SOUND_THEME, CUSTOM_SOUND_PATHS
@@ -20065,6 +20132,7 @@ try {{
             "window_relative": self.window_relative,
             "audio_cues": self.audio_cues,
             "autosave_presets": self.autosave_presets,
+            "global_variables_file": getattr(self, 'global_variables_file', None) or "", 
             "delay_jitter": self.delay_jitter,
             "natural_timing": self.natural_timing,
             "sound_theme": ACTIVE_SOUND_THEME,
@@ -20290,6 +20358,28 @@ try {{
         )
         btn_browse_folder.pack(side=tk.RIGHT)
         btn_browse_folder.bind("<Button-1>", lambda e: self.choose_presets_folder())
+
+        globals_row = tk.Frame(f_sys, bg=BG_PANEL)
+        globals_row.pack(fill=tk.X, pady=(10, 0))
+        tk.Label(globals_row, text="Global Variables File",
+                 font=("Segoe UI", 9, "bold"), bg=BG_PANEL,
+                 fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        globals_controls = tk.Frame(globals_row, bg=BG_PANEL)
+        globals_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.global_file_display = tk.Label(
+            globals_controls, text=self.shorten_path(_global_variable_path(self)),
+            font=("Consolas", 8), bg=BG_INPUT, fg=TEXT_MUTED,
+            anchor="w", padx=8, pady=4, highlightbackground=BG_BORDER,
+            highlightthickness=1)
+        self.global_file_display.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        sequent_toolbar_button(globals_controls, "Browse...",
+                               self.choose_global_variables_file).pack(side=tk.LEFT, padx=(0, 5))
+        sequent_toolbar_button(globals_controls, "Default",
+                               self.reset_global_variables_file).pack(side=tk.LEFT)
+        tk.Label(f_sys, text="All Global variable reads and writes use this JSON file. "
+                 "Choosing a new file copies current values if it does not exist.",
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=("Segoe UI", 8),
+                 wraplength=510, justify=tk.LEFT).pack(anchor="w", pady=(4, 0))
 
         # --- SECTION 5: GLOBAL KEYBINDINGS ---
         tk.Label(scroll_container, text="GLOBAL HOTKEYS", font=("Segoe UI", 8, "bold"), bg=BG_APP, fg=TEXT_MUTED).pack(anchor="w", padx=22, pady=(0, 4))
