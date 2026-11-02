@@ -14616,6 +14616,11 @@ def sequent_typed_text_groups(actions, minimum=2, pause_seconds=SEQUENT_TYPING_P
         kind = action.get('type')
         if kind == 'key':
             char = action.get('key')
+        elif kind == 'press' and action.get('vk') == VK_SPACE:
+            # Space was historically recorded as a physical key press,
+            # rather than a ``key`` character. Keep its original playback
+            # action and include it in the display-only typing session.
+            return ' '
         elif kind == 'combo':
             # Shift is a text modifier when used *alone* with a printable key.
             # Ctrl/Alt/Win combinations, navigation keys, etc. remain separate.
@@ -14625,8 +14630,10 @@ def sequent_typed_text_groups(actions, minimum=2, pause_seconds=SEQUENT_TYPING_P
             if not isinstance(mods, (list, tuple)) or len(mods) != 1 or mods[0] not in (VK_SHIFT, 0xA0, 0xA1):
                 return None
             vk = action.get('vk')
-            if vk in SPECIAL_KEY_NAMES or vk in (VK_RETURN, VK_BACK, VK_ESCAPE, VK_DELETE):
+            if (vk in SPECIAL_KEY_NAMES and vk != VK_SPACE) or vk in (VK_RETURN, VK_BACK, VK_ESCAPE, VK_DELETE):
                 return None
+            if vk == VK_SPACE:
+                return ' '
             char = action.get('typed_char')
             if not (isinstance(char, str) and len(char) == 1 and char.isprintable()):
                 # Older Sequent recordings didn't save typed_char on Shift
@@ -21804,8 +21811,10 @@ try {{
             action = {"type": "combo", "mods": active_mods, "vk": vk, "name": combo_name}
             # Shift + a printable character is text, not a navigation shortcut.
             # Keep the original 'combo' action so playback semantics are intact.
-            if active_mods == [VK_SHIFT] and vk not in SPECIAL_KEY_NAMES and vk not in (VK_RETURN, VK_BACK):
-                typed_char = get_char_from_vk(vk)
+            if (active_mods == [VK_SHIFT] and
+                    (vk not in SPECIAL_KEY_NAMES or vk == VK_SPACE) and
+                    vk not in (VK_RETURN, VK_BACK)):
+                typed_char = ' ' if vk == VK_SPACE else get_char_from_vk(vk)
                 if not (isinstance(typed_char, str) and len(typed_char) == 1 and typed_char.isprintable()):
                     # ToUnicode can fail for some layouts/dead-key states.
                     # Preserve the Shift+letter as a typing-session character.
@@ -21833,7 +21842,12 @@ try {{
 
         if vk in SPECIAL_KEY_NAMES:
             name = SPECIAL_KEY_NAMES[vk]
-            self.recorded_actions.append({"type": "press", "vk": vk, "name": name})
+            action = {"type": "press", "vk": vk, "name": name}
+            if vk == VK_SPACE:
+                # Preserve physical Space-key playback while allowing the
+                # visual typing-session detector to recognize word spacing.
+                self._sequent_mark_typed_character(action)
+            self.recorded_actions.append(action)
             self.root.after(0, self.queue_viewer.append_line, f"keyboard.press('{name}')", SYNTAX_ORANGE)
             self.root.after(0, self.update_action_count_badge)
             return
