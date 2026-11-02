@@ -6657,6 +6657,7 @@ class VSCodeQueueViewer(tk.Frame):
         self._scroll_group_starts = []
         self._expanded_scroll_groups = set()
         self.hovered_line = None
+        self._wheel_remainder = 0.0
         self._hover_breakpoint_line = None
         self.interactive_enabled = True
         self.sub_menu = None
@@ -6721,6 +6722,9 @@ class VSCodeQueueViewer(tk.Frame):
         self.plus_btn.bind("<Enter>", lambda e: self.plus_btn.config(fg=TEXT_ON_ACCENT, bg=COLOR_ACCENT))
         self.plus_btn.bind("<Leave>", lambda e: self.plus_btn.config(fg=TEXT_MUTED, bg=BG_GUTTER))
         self.plus_btn.bind("<Button-1>", self._on_plus_btn_click)
+        self.plus_btn.bind("<MouseWheel>", self._on_mousewheel)
+        self.plus_btn.bind("<Button-4>", self._on_mousewheel)
+        self.plus_btn.bind("<Button-5>", self._on_mousewheel)
 
         self.gutter.bind("<Key>", lambda e: "break")
         self.code_text.bind("<KeyPress>", self._on_key_press)
@@ -6729,6 +6733,8 @@ class VSCodeQueueViewer(tk.Frame):
             w.bind("<Motion>", self._on_viewer_motion)
             w.bind("<Leave>", self._on_viewer_leave)
             w.bind("<MouseWheel>", self._on_mousewheel)
+            w.bind("<Button-4>", self._on_mousewheel)
+            w.bind("<Button-5>", self._on_mousewheel)
             w.bind("<Button-3>", self._on_right_click)
 
         self.gutter_margin.bind("<Button-1>", self._on_gutter_margin_click)
@@ -6736,6 +6742,8 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter.bind("<Button-1>", self._on_gutter_click)
         self.code_text.bind("<Button-1>", self._on_code_click)
         self.bind("<MouseWheel>", self._on_mousewheel)
+        self.bind("<Button-4>", self._on_mousewheel)
+        self.bind("<Button-5>", self._on_mousewheel)
 
         self.gutter.bind("<Double-Button-1>", self._on_double_click)
         self.code_text.bind("<Double-Button-1>", self._on_double_click)
@@ -7510,14 +7518,38 @@ class VSCodeQueueViewer(tk.Frame):
         self.redraw_breakpoints()
 
     def _on_mousewheel(self, event):
+        """Scroll the queue from any of its panes, including the floating + control.
+
+        Use the code Text widget as the sole scroll authority; its yscrollcommand
+        synchronizes the gutter.  Independently scrolling both widgets can cause
+        their views to drift, especially with folded/elided action groups.
+        """
         self.plus_btn.place_forget()
-        if self.scrollbar.winfo_ismapped():
-            delta = int(-1 * (event.delta / 120))
-            self.code_text.yview_scroll(delta, "units")
-            self.gutter.yview_scroll(delta, "units")
+        try:
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta:
+                # Windows usually sends multiples of 120, but touchpads and
+                # high-resolution wheels can send smaller deltas.
+                self._wheel_remainder += -delta / 120.0
+                steps = int(self._wheel_remainder)
+                self._wheel_remainder -= steps
+                if steps == 0:
+                    return "break"
+            else:
+                # Linux/X11 wheel events (and some Tk environments).
+                num = getattr(event, "num", None)
+                if num == 4:
+                    steps = -1
+                elif num == 5:
+                    steps = 1
+                else:
+                    return "break"
+            self.code_text.yview_scroll(steps, "units")
             self.redraw_breakpoints()
+        except tk.TclError:
+            pass
         return "break"
-    
+
     def _on_viewer_motion(self, event):
         # The inactive breakpoint preview belongs to the leftmost 18px only.
         hover_line = None
