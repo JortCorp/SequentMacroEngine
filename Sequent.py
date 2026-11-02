@@ -15090,6 +15090,44 @@ class SequentPlaybackGraph(SequentStudioGraph):
         except (OSError,ValueError,TypeError):
             pass  # Layout metadata must never interrupt recording/playback.
 
+    @classmethod
+    def _automatic_positions(cls, nodes, actions):
+        """Compact, section-aware layout; presentation only, never changes flow."""
+        visible=[n for n in nodes if n['kind']!='label']
+        if not visible:
+            return {}
+        positions={}
+        groups=[]
+        current=[]
+        for n in nodes:
+            if n['kind']=='label':
+                if current:
+                    groups.append(current)
+                current=[]
+            else:
+                current.append(n)
+        if current:
+            groups.append(current)
+        # Each labeled section gets its own band. Within a band, show a
+        # short left-to-right flow with rows, instead of an endless strip.
+        band_y=100
+        cols=5
+        for group in groups:
+            rows=(len(group)+cols-1)//cols
+            for i,node in enumerate(group):
+                row,col=divmod(i,cols)
+                kind=node['kind']
+                x=90+col*cls.NODE_X_STEP
+                y=band_y+row*cls.NODE_Y_STEP
+                # Conditional/loop nodes sit above the main flow so that
+                # alternate paths have visible breathing room.
+                if kind in ('if_dynamic','loop_start','find_image','find_color',
+                            'find_text','search_area'):
+                    y-=22
+                positions[node['start']]=(x,y)
+            band_y+=max(1,rows)*cls.NODE_Y_STEP+115
+        return positions
+
     def redraw(self):
         name, actions = self._load()
         self._preset, self.actions = name, actions
@@ -15103,14 +15141,9 @@ class SequentPlaybackGraph(SequentStudioGraph):
         self.nodes = nodes
         self._node_starts = starts
         self._node_by_start = {n['start']: n for n in nodes}
-        self.positions = {}
-        visual_index=0
-        for n in nodes:
-            if n['kind']=='label':
-                continue
-            self.positions[n['start']]=old_positions.get(n['start'],
-                                        (80+visual_index*self.NODE_X_STEP,120))
-            visual_index+=1
+        automatic=self._automatic_positions(nodes,actions)
+        self.positions={key:old_positions.get(key,xy)
+                        for key,xy in automatic.items()}
         self._layout_source = name
         layout_key=self._layout_key(name,actions)
         if getattr(self,'_layout_key_current',None)!=layout_key:
