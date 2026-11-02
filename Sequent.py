@@ -15103,9 +15103,14 @@ class SequentPlaybackGraph(SequentStudioGraph):
         self.nodes = nodes
         self._node_starts = starts
         self._node_by_start = {n['start']: n for n in nodes}
-        self.positions = {n['start']: old_positions.get(n['start'],
-                          (80 + k * self.NODE_X_STEP, 120))
-                          for k, n in enumerate(nodes)}
+        self.positions = {}
+        visual_index=0
+        for n in nodes:
+            if n['kind']=='label':
+                continue
+            self.positions[n['start']]=old_positions.get(n['start'],
+                                        (80+visual_index*self.NODE_X_STEP,120))
+            visual_index+=1
         self._layout_source = name
         layout_key=self._layout_key(name,actions)
         if getattr(self,'_layout_key_current',None)!=layout_key:
@@ -15134,7 +15139,34 @@ class SequentPlaybackGraph(SequentStudioGraph):
         if not hasattr(self, 'section_boxes'):
             self.section_boxes = []
         self._sections_source = name
-        self._view_edges = self.projected_edges(nodes, actions)
+        raw_edges = self.projected_edges(nodes, actions)
+        # Labels are execution anchors, rendered as group frames instead of
+        # ordinary action nodes. Preserve raw label actions for Playback/GOTO.
+        self._label_regions = []
+        label_positions = [k for k,n in enumerate(nodes) if n['kind']=='label']
+        for j,k in enumerate(label_positions):
+            stop = label_positions[j+1] if j+1<len(label_positions) else len(nodes)
+            members = [n['start'] for n in nodes[k+1:stop] if n['kind']!='label']
+            self._label_regions.append((nodes[k]['start'],
+                                        str(actions[nodes[k]['start']].get('name') or 'Unnamed label'),
+                                        members))
+        next_visible={}
+        successor=None
+        for n in reversed(nodes):
+            if n['kind']!='label':
+                successor=n['start']
+            else:
+                next_visible[n['start']]=successor
+        edges=[]
+        for a,b,label in raw_edges:
+            if a in next_visible:
+                # A label does not consume a node in the visual graph.
+                continue
+            if b in next_visible:
+                b=next_visible[b]
+            if b is not None and a!=b:
+                edges.append((a,b,label))
+        self._view_edges=edges
         self.disabled_edges = getattr(self,'disabled_edges',set())
         self.app._studio_disabled_edges=set(self.disabled_edges)
         self.app._studio_graph_signature=self._layout_key_current
@@ -15187,6 +15219,33 @@ class SequentPlaybackGraph(SequentStudioGraph):
             return self.pan_x+x*scale,self.pan_y+y*scale
         positions = self.positions
         pad = 80
+        # Label regions: visual organization only. They do not change GOTO
+        # semantics, and their names remain editable through Playback.
+        for label_index, name, members in getattr(self,'_label_regions',()):
+            pts=[positions[i] for i in members if i in positions]
+            if not pts:
+                continue
+            left=min(x for x,y in pts)-22
+            top=min(y for x,y in pts)-44
+            right=max(x+self.NODE_W for x,y in pts)+22
+            bottom=max(y+self.NODE_H for x,y in pts)+22
+            x1,y1=pt(left,top);x2,y2=pt(right,bottom)
+            if x2<0 or x1>w or y2<0 or y1>h:
+                continue
+            # Highlight the real execution entry at the first action socket.
+            first=members[0]
+            if first in positions:
+                ex,ey=positions[first]
+                sx,sy=pt(ex,ey+self.NODE_H/2)
+                c.create_oval(sx-8*scale,sy-8*scale,sx+8*scale,sy+8*scale,
+                              fill='#A78BFA',outline='#DDD6FE',width=2,
+                              tags=('label-entry',))
+            c.create_rectangle(x1,y1,x2,y2,outline='#A78BFA',
+                               dash=(6,4),width=2,tags=('label-frame',))
+            c.create_text(x1+10,y1+12,anchor='nw',
+                          text='LABEL  •  '+name[:55],fill='#C4B5FD',
+                          font=('Segoe UI',max(8,int(10*scale)),'bold'),
+                          tags=('label-frame',))
         for a,b,label in getattr(self, '_view_edges', ()):
             if a not in positions or b not in positions:
                 continue
@@ -15242,6 +15301,8 @@ class SequentPlaybackGraph(SequentStudioGraph):
         selected_node = self._node_for_action(self.selected_action)
         selected_start = selected_node['start'] if selected_node is not None else None
         for node in getattr(self, 'nodes', ()):
+            if node['kind']=='label':
+                continue
             start = node['start']
             x,y = positions[start]
             x1,y1 = pt(x,y)
@@ -15310,6 +15371,7 @@ class SequentPlaybackGraph(SequentStudioGraph):
             return
         wx,wy=self._world(e.x,e.y)
         for node in reversed(getattr(self,'nodes',())):
+            if node['kind']=='label':continue
             start=node['start']
             nx,ny=self.positions[start]
             if node['kind'] in ('if_dynamic','loop_start') or node['kind'] in SCREEN_RECOGNITION_TYPES:
@@ -15327,6 +15389,7 @@ class SequentPlaybackGraph(SequentStudioGraph):
         hit = None
         # Only visible nodes need hit testing; avoids scanning raw actions.
         for node in reversed(getattr(self,'nodes',())):
+            if node['kind']=='label':continue
             key = node['start']
             nx,ny = self.positions[key]
             if nx<=x<=nx+self.NODE_W and ny<=y<=ny+self.NODE_H:
@@ -15348,7 +15411,7 @@ class SequentPlaybackGraph(SequentStudioGraph):
             if frame is not None:
                 self._frame_drag=(frame,x,y,
                                   {n['start']:self.positions[n['start']]
-                                   for n in self.nodes
+                                   for n in self.nodes if n['start'] in self.positions
                                    if frame['x1']<=self.positions[n['start']][0] and
                                       self.positions[n['start']][0]+self.NODE_W<=frame['x2'] and
                                       frame['y1']<=self.positions[n['start']][1] and
@@ -15400,6 +15463,8 @@ class SequentPlaybackGraph(SequentStudioGraph):
             wx,wy=self._world(px,py)
             destination=None
             for node in reversed(getattr(self,'nodes',())):
+                if node['kind']=='label':
+                    continue
                 start=node['start']
                 nx,ny=self.positions[start]
                 if abs(wx-nx)<15/max(.4,self.scale) and abs(wy-(ny+self.NODE_H/2))<15/max(.4,self.scale):
@@ -15425,36 +15490,49 @@ class SequentPlaybackGraph(SequentStudioGraph):
         self._frame_drag=None
         self._save_layout()
 
-    def _connect_sockets(self, source, destination):
-        """Only GOTO->LABEL can be written safely to the existing action model.
+    def _label_entry_for_node(self, destination):
+        """Only the FIRST visible node after a label is a label entry."""
+        for label_index, name, members in getattr(self, '_label_regions', ()):
+            if members and members[0] == destination:
+                return label_index
+        return None
 
-        Other edges are computed from sequential/structured control flow, and
-        cannot be arbitrarily rewired without changing the macro engine.
-        """
+    def _connect_sockets(self, source, destination):
+        """Connect a GOTO output to the first node of a labeled region."""
         if self.app is None or self.app.playing or self.app.recording:
             messagebox.showwarning('Studio connections',
-                                   'Stop recording and playback before editing connections.',
-                                   parent=self.winfo_toplevel())
-            return
-        src=self.actions[source]
-        dst=self.actions[destination]
-        if src.get('type')!='goto' or dst.get('type')!='label' or not dst.get('name'):
-            messagebox.showinfo('Studio connections',
-                'Only GOTO output → named LABEL input can be rewired safely. '
-                'Sequential, conditional, and loop connections follow the '
-                'macro engine’s control-flow instructions.',
+                'Stop recording and playback before rewiring.',
                 parent=self.winfo_toplevel())
             return
-        target=dst['name']
-        if src.get('target')==target:
+        if not (0 <= source < len(self.actions) and
+                0 <= destination < len(self.actions)):
             return
-        if not messagebox.askyesno('Change GOTO connection',
-                f'Change action {source+1} to jump to label "{target}"?',
+        label_index=self._label_entry_for_node(destination)
+        if self.actions[source].get('type') != 'goto' or label_index is None:
+            messagebox.showinfo('Studio connections',
+                'Connect a GOTO output to the first node inside a label frame. '
+                'Other connections require the future graph execution engine.',
+                parent=self.winfo_toplevel())
+            return
+        target=str(self.actions[label_index].get('name') or '').strip()
+        matches=[i for i,a in enumerate(self.actions)
+                 if a.get('type')=='label' and
+                 str(a.get('name') or '').strip()==target]
+        if not target or len(matches)!=1:
+            messagebox.showerror('Invalid label target',
+                'The target label must have a nonempty, unique name. '
+                'Rename duplicate or unnamed labels in Playback first.',
+                parent=self.winfo_toplevel())
+            return
+        if self.actions[source].get('target')==target:
+            return
+        if not messagebox.askyesno('Rewire GOTO',
+                f'Change GOTO at action {source+1} to label "{target}"?',
                 parent=self.winfo_toplevel()):
             return
         before=self.app._begin_queue_deletion()
-        src['target']=target
-        self.app._finish_queue_deletion(before,'Studio: change GOTO target')
+        self.actions[source]['target']=target
+        self.app._finish_queue_deletion(before,'Studio: rewire GOTO to label')
         self.redraw()
 
     def zoom(self, direction, x=None, y=None):
