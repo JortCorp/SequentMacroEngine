@@ -6768,7 +6768,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.tag_configure('typed_fold_title', foreground=SYNTAX_ORANGE)
         for start, end, text in self._text_groups:
             line = start + 2
-            title = f'keyboard.type_text({sequent_typed_text_preview(text)})  [{end-start:,} keys; double-click to expand]'
+            title = sequent_typed_group_caption(start, end, text)
             self.code_text.delete(f'{line}.0', f'{line}.end')
             self.code_text.insert(f'{line}.0', title, 'typed_fold_title')
             # End index is the next *visible* action line, excluding its data.
@@ -6818,7 +6818,7 @@ class VSCodeQueueViewer(tk.Frame):
             return False
         self._expanded_text_groups.remove(start)
         line = start + 2
-        title = f'keyboard.type_text({sequent_typed_text_preview(text)})  [{end-start:,} keys; double-click to expand]'
+        title = sequent_typed_group_caption(start, end, text)
         self.code_text.delete(f'{line}.0', f'{line}.end')
         self.code_text.insert(f'{line}.0', title, 'typed_fold_title')
         for widget in (self.code_text, self.gutter):
@@ -14418,29 +14418,102 @@ class SequentStudioGraph(tk.Frame):
 
 
 
-def sequent_typed_text_groups(actions, minimum=2):
-    """Yield (start, end, text) of consecutive unmodified printable key events.
+# Display-only typing-session detection. Real keystroke/delay actions are
+# never merged, removed, or replaced in the underlying macro.
+SEQUENT_TYPING_PAUSE_SECONDS = 0.90
 
-    This is a display projection only: no saved actions or execution timing change.
-    Non-text actions (including shortcuts, Enter, Tab, waits, and branches)
-    always terminate a text run, even when separated only by one action.
+
+def sequent_typed_text_groups(actions, minimum=2, pause_seconds=SEQUENT_TYPING_PAUSE_SECONDS):
+    """Yield (start, exclusive_end, text) for distinct typing sessions.
+
+    A physical mouse move, click, scroll, shortcut, Enter, Tab, Backspace,
+    branch, or any other action ends the session. A *short* recorded natural
+    delay between printable keys is allowed *inside* a session, preserving it
+    as an original action; a delay above ``pause_seconds`` ends the session.
+
+    New recordings also store ``typing_gap_s`` per key, so an idle pause is
+    detectable even with natural-timing delays turned off. Older recordings
+    without that metadata still group on their visible action boundaries.
     """
-    start = None
-    chars = []
-    for i, action in enumerate(actions):
-        char = action.get('key') if isinstance(action, dict) and action.get('type') == 'key' else None
-        plain = (isinstance(char, str) and len(char) == 1 and
-                 char.isprintable() and char not in ('\r', '\n', '\t'))
-        if plain:
-            if start is None:
-                start = i
-            chars.append(char)
+    def printable(action):
+        if not isinstance(action, dict):
+            return None
+        if action.get('type') == 'key':
+            char = action.get('key')
+        elif action.get('type') == 'combo' and action.get('mods') == [VK_SHIFT]:
+            # Only newly recorded Shift-only printable combos have this
+            # captured character; never guess an old hotkey's meaning.
+            char = action.get('typed_char')
         else:
-            if start is not None and len(chars) >= minimum:
-                yield start, i, ''.join(chars)
-            start, chars = None, []
-    if start is not None and len(chars) >= minimum:
-        yield start, len(actions), ''.join(chars)
+            return None
+        if isinstance(char, str) and len(char) == 1 and char.isprintable() and char not in ('\r', '\n', '\t'):
+            return char
+        return None
+
+    def permissible_gap(action):
+        if action.get('typing_mouse_moved'):
+            return False
+        gap = action.get('typing_gap_s')
+        if gap is None:  # Backward compatibility with older saved presets.
+            return True
+        try:
+            gap = float(gap)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return math.isfinite(gap) and 0 <= gap <= pause_seconds
+
+    n = len(actions)
+    i = 0
+    while i < n:
+        first = printable(actions[i])
+        if first is None:
+            i += 1
+            continue
+        chars = [first]
+        j = i + 1
+        while j < n:
+            char = printable(actions[j])
+            if char is not None:
+                if not permissible_gap(actions[j]):
+                    break
+                chars.append(char)
+                j += 1
+                continue
+            # Natural-timing mode saves delays as separate actions. Look ahead
+            # but never consume a trailing delay unless another key follows it.
+            k = j
+            elapsed = 0.0
+            while k < n and isinstance(actions[k], dict) and actions[k].get('type') == 'delay':
+                try:
+                    seconds = float(actions[k].get('seconds', 0))
+                except (ValueError, TypeError, OverflowError):
+                    break
+                if not math.isfinite(seconds) or seconds < 0:
+                    break
+                elapsed += seconds
+                if elapsed > pause_seconds:
+                    break
+                k += 1
+            if (k > j and elapsed <= pause_seconds and k < n and
+                    printable(actions[k]) is not None and permissible_gap(actions[k])):
+                chars.append(printable(actions[k]))
+                j = k + 1
+                continue
+            break
+        if len(chars) >= minimum:
+            yield i, j, ''.join(chars)
+            i = j
+        else:
+            i += 1
+
+
+def sequent_typed_group_caption(start, end, text):
+    """Consistent Playback caption for a typing session that may include delays."""
+    pauses = (end - start) - len(text)
+    detail = f'{len(text):,} keys'
+    if pauses:
+        detail += f', {pauses:,} timing delays'
+    return f'keyboard.type_text({sequent_typed_text_preview(text)})  [{detail}; double-click to expand]'
 
 
 def sequent_typed_text_preview(text, limit=72):
@@ -14462,6 +14535,7 @@ class SequentPlaybackGraph(SequentStudioGraph):
     def build_projection(actions):
         """Linear-time, lossless graph projection; each node covers [start,end)."""
         nodes = []
+        typed_sessions = {start: (end, text) for start, end, text in sequent_typed_text_groups(actions)}
         n = len(actions)
         i = 0
         while i < n:
@@ -14491,25 +14565,12 @@ class SequentPlaybackGraph(SequentStudioGraph):
                 else:
                     nodes.append({'start': i, 'end': j, 'kind': kind})
                 i = j
-            elif kind == 'key':
-                j = i + 1
-                chars = [actions[i].get('key')]
-                if not (isinstance(chars[0], str) and len(chars[0]) == 1 and chars[0].isprintable()):
-                    nodes.append({'start': i, 'end': j, 'kind': kind})
-                    i = j
-                    continue
-                while j < n and actions[j].get('type') == 'key':
-                    char = actions[j].get('key')
-                    if not isinstance(char, str) or len(char) != 1 or not char.isprintable():
-                        break
-                    chars.append(char)
-                    j += 1
-                if j - i > 1:
-                    nodes.append({'start': i, 'end': j, 'kind': 'text_group',
-                                  'text': ''.join(chars)})
-                else:
-                    nodes.append({'start': i, 'end': j, 'kind': kind})
-                i = j
+            elif i in typed_sessions:
+                end, text = typed_sessions[i]
+                nodes.append({'start': i, 'end': end, 'kind': 'text_group',
+                              'text': text, 'keys': len(text),
+                              'timing_delays': end - i - len(text)})
+                i = end
             else:
                 nodes.append({'start': i, 'end': i+1, 'kind': kind})
                 i += 1
@@ -14692,7 +14753,7 @@ class SequentPlaybackGraph(SequentStudioGraph):
                 title=f'{start+1}–{node["end"]}  RECORDED INPUT ×{count:,}'
                 summary=f'{node["moves"]:,} moves  •  {node["scrolls"]:,} scrolls'
             elif typ=='text_group':
-                title=f'{start+1}–{node["end"]}  TYPE TEXT ×{node["end"]-start:,}'
+                title=f'{start+1}–{node["end"]}  TYPE TEXT ×{node["keys"]:,}'
                 summary=sequent_typed_text_preview(node['text'], 35)
             else:
                 act=self.actions[start]
@@ -14755,7 +14816,8 @@ class SequentPlaybackGraph(SequentStudioGraph):
         start,end=group['start'],group['end']
         if group['kind']=='text_group':
             facts=(('ACTION RANGE',f'{start+1:,}–{end:,}'),
-                   ('RECORDED KEYSTROKES',f'{end-start:,}'),
+                   ('RECORDED KEYSTROKES',f'{group["keys"]:,}'),
+                   ('TIMING DELAYS',f'{group["timing_delays"]:,}'),
                    ('TYPED TEXT',sequent_typed_text_preview(group['text'], 100)))
         else:
             facts=(('ACTION RANGE',f'{start+1:,}–{end:,}'),
@@ -21167,6 +21229,8 @@ try {{
 
         self._clear_queue_undo()  # Recording starts a fresh editable sequence.
         self.recorded_actions.clear()
+        self._last_typed_key_at = None
+        self._last_typed_mouse_pos = None
         self.breakpoints.clear()
         self.current_action_idx = 0
         self.update_action_count_badge()
@@ -21464,6 +21528,28 @@ try {{
 
             time.sleep(0.005)
 
+    def _sequent_mark_typed_character(self, action):
+        """Record optional typing-session clues, never executable commands.
+
+        The cursor comparison also detects typing breaks when recording is in
+        'Clicks and Keys Only' mode and mouse movements aren't saved at all.
+        """
+        now_key = time.perf_counter()
+        previous = getattr(self, '_last_typed_key_at', None)
+        if previous is not None:
+            action['typing_gap_s'] = round(max(0.0, now_key - previous), 3)
+        self._last_typed_key_at = now_key
+        try:
+            current_position = get_mouse_pos()
+        except MacroExecutionError:
+            current_position = None
+        previous_position = getattr(self, '_last_typed_mouse_pos', None)
+        if (previous_position is not None and current_position is not None and
+                math.hypot(current_position[0] - previous_position[0],
+                           current_position[1] - previous_position[1]) >= 8):
+            action['typing_mouse_moved'] = True
+        self._last_typed_mouse_pos = current_position
+
     def handle_input_event(self, vk, win_pressed, ctrl_pressed, alt_pressed, shift_pressed):
         if vk == VK_ESCAPE:
             self.root.after(0, self.stop_recording)
@@ -21502,7 +21588,15 @@ try {{
                     key_name = char.upper() if char else f"Key_{vk}"
 
             combo_name = " + ".join(mod_names + [key_name])
-            self.recorded_actions.append({"type": "combo", "mods": active_mods, "vk": vk, "name": combo_name})
+            action = {"type": "combo", "mods": active_mods, "vk": vk, "name": combo_name}
+            # Shift + a printable character is text, not a navigation shortcut.
+            # Keep the original 'combo' action so playback semantics are intact.
+            if active_mods == [VK_SHIFT] and vk not in SPECIAL_KEY_NAMES and vk not in (VK_RETURN, VK_BACK):
+                typed_char = get_char_from_vk(vk)
+                if isinstance(typed_char, str) and len(typed_char) == 1 and typed_char.isprintable():
+                    action['typed_char'] = typed_char
+                    self._sequent_mark_typed_character(action)
+            self.recorded_actions.append(action)
             self.root.after(0, self.queue_viewer.append_line, f"keyboard.hotkey('{combo_name}')", SYNTAX_PURPLE)
             self.root.after(0, self.update_action_count_badge)
             return
@@ -21528,7 +21622,9 @@ try {{
 
         char = get_char_from_vk(vk)
         if char and char.isprintable():
-            self.recorded_actions.append({"type": "key", "key": char})
+            action = {"type": "key", "key": char}
+            self._sequent_mark_typed_character(action)
+            self.recorded_actions.append(action)
             self.root.after(0, self.queue_viewer.append_line, f"keyboard.type('{char}')", SYNTAX_ORANGE)
             self.root.after(0, self.update_action_count_badge)
     
