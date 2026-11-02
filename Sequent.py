@@ -4969,6 +4969,28 @@ def dynamic_compare(actual, op, expected):
     raise MacroExecutionError(f'Unsupported comparison operator: {op}')
 
 
+def sequent_if_text_match(actual, operator, expected):
+    """Match pasted JSON newline escapes against real CR/LF values.
+
+    Literal backslash sequences still compare literally first; only retry
+    decoded CR/LF escapes when the variable contains actual line breaks.
+    """
+    if dynamic_compare(actual, operator, expected):
+        return True
+    if operator not in ('==', 'equals', 'contains', 'startswith', 'endswith'):
+        return False
+    if not isinstance(expected, str) or not isinstance(actual, str):
+        return False
+    if not ('\\r' in expected or '\\n' in expected):
+        return False
+    if '\r' not in actual and '\n' not in actual:
+        return False
+    decoded = expected.replace('\\r', '\r').replace('\\n', '\n')
+    if decoded == expected:
+        return False
+    return dynamic_compare(actual, operator, decoded)
+
+
 def sequent_if_variable_match(app, action, interpolate):
     """Evaluate legacy IF-variable conditions and new variable-to-variable ones.
 
@@ -4996,8 +5018,8 @@ def sequent_if_variable_match(app, action, interpolate):
         return dynamic_compare(actual, operator, expected)
     if source != 'text':
         raise MacroExecutionError(f'IF Variable: unsupported comparison source {source!r}')
-    return dynamic_compare(get_variable(app, lhs, scope),
-                           action.get('op', '=='), interpolate(action.get('val', '')))
+    return sequent_if_text_match(get_variable(app, lhs, scope),
+                                 action.get('op', '=='), interpolate(action.get('val', '')))
 
 
 def sequent_if_set_value(app, action):
