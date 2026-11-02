@@ -20253,7 +20253,11 @@ try {{
         self.btn_tab_debug.set_active(tab_name == 'debug_tools')
         self.btn_tab_settings.set_active(tab_name == "settings")
         if tab_name == "sequencer":
-            self.refresh_sequencer_preset_dropdown()
+            # Node Studio no longer creates the legacy preset dropdown.
+            # Refresh the graph from the live Playback queue instead.
+            graph = getattr(self, "studio_timeline", None)
+            if graph is not None and graph.winfo_exists():
+                graph.redraw()
 
         self.current_tab_name = tab_name
         tab_frames = {
