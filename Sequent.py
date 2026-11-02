@@ -6648,6 +6648,10 @@ class VSCodeQueueViewer(tk.Frame):
         self._text_group_by_index = {}
         self._text_group_starts = []
         self._expanded_text_groups = set()
+        self._move_groups = []
+        self._move_group_by_index = {}
+        self._move_group_starts = []
+        self._expanded_move_groups = set()
         self.hovered_line = None
         self.interactive_enabled = True
         self.sub_menu = None
@@ -6843,38 +6847,108 @@ class VSCodeQueueViewer(tk.Frame):
         return False
 
     def redraw_typing_disclosures(self):
-        """Draw arrows only for group headers visible in the scrolled gutter.
-
-        This is independent of per-keystroke data: even extremely long groups
-        require just one triangle, and hidden lines never get a triangle.
-        """
+        """Draw visible disclosure arrows for both typed and mouse-move groups."""
         self.gutter_margin.delete('typing_disclosure')
-        if not self._text_group_starts or self.line_count <= 1:
+        if self.line_count <= 1:
             return
         from bisect import bisect_left
         try:
             first = max(0, int(self.gutter.index('@0,0').split('.')[0]) - 2)
             last = int(self.gutter.index(f'@0,{max(1, self.gutter.winfo_height())}').split('.')[0]) - 1
-            pos = bisect_left(self._text_group_starts, first)
-            for start in self._text_group_starts[pos:]:
-                if start > last:
-                    break
-                dinfo = self.gutter.dlineinfo(f'{start + 2}.0')
-                if dinfo is None:
-                    continue
-                _x, y, _w, h, _base = dinfo
-                cy = y + h / 2
-                # Left of the breakpoint dot, pointing right when collapsed
-                # and down when expanded. No emoji/font fallback differences.
-                if start in self._expanded_text_groups:
-                    coords = (5, cy-3, 15, cy-3, 10, cy+3)
-                else:
-                    coords = (7, cy-5, 7, cy+5, 13, cy)
-                self.gutter_margin.create_polygon(
-                    *coords, fill=TEXT_MUTED, outline='',
-                    tags=('typing_disclosure', f'typing_group_{start}'))
+            for starts, expanded, kind in (
+                (self._text_group_starts, self._expanded_text_groups, 'text'),
+                (self._move_group_starts, self._expanded_move_groups, 'mouse'),
+            ):
+                for start in starts[bisect_left(starts, first):]:
+                    if start > last:
+                        break
+                    dinfo = self.gutter.dlineinfo(f'{start + 2}.0')
+                    if dinfo is None:
+                        continue
+                    _x, y, _w, h, _base = dinfo
+                    cy = y + h / 2
+                    if start in expanded:
+                        coords = (5, cy-3, 15, cy-3, 10, cy+3)
+                    else:
+                        coords = (7, cy-5, 7, cy+5, 13, cy)
+                    self.gutter_margin.create_polygon(
+                        *coords, fill=TEXT_MUTED, outline='',
+                        tags=('typing_disclosure', f'{kind}_group_{start}'))
         except tk.TclError:
             pass
+
+    def fold_mouse_movements(self, actions, expanded_groups=()):
+        """Fold contiguous moves in Playback, keeping the original action lines.
+
+        This is the same gutter disclosure interaction as typed text, but a
+        mouse click (or any other non-move action) separates movement runs.
+        """
+        self._move_groups = list(sequent_mouse_movement_groups(actions))
+        self._move_group_by_index = {start: (start, end, count)
+                                     for start, end, count in self._move_groups}
+        self._move_group_starts = [start for start, _, _ in self._move_groups]
+        preserved = set(expanded_groups)
+        self._expanded_move_groups = {
+            start for start, end, count in self._move_groups
+            if (start, end, count) in preserved
+        }
+        self.code_text.tag_configure('move_fold_title', foreground=SYNTAX_BLUE)
+        for start, end, count in self._move_groups:
+            if start in self._expanded_move_groups:
+                continue
+            line = start + 2
+            self.code_text.delete(f'{line}.0', f'{line}.end')
+            self.code_text.insert(f'{line}.0', sequent_move_group_caption(start, end), 'move_fold_title')
+            # Keep every raw action in the Tk buffers, just elide its row.
+            for widget in (self.code_text, self.gutter):
+                widget.tag_add('typed_fold_hidden', f'{start+3}.0', f'{end+2}.0')
+
+    def _mouse_group_at(self, index, include_expanded=False):
+        if index is None or not self._move_groups:
+            return None
+        from bisect import bisect_right
+        k = bisect_right(self._move_group_starts, index) - 1
+        if k < 0:
+            return None
+        group = self._move_groups[k]
+        if index >= group[1] or (not include_expanded and group[0] in self._expanded_move_groups):
+            return None
+        return group
+
+    def folded_input_at(self, index):
+        """Find the header representing any *collapsed* keystroke/move action."""
+        return self.folded_text_at(index) or self._mouse_group_at(index)
+
+    def expand_mouse_movements(self, index):
+        group = self._mouse_group_at(index)
+        if group is None:
+            return False
+        start, end, count = group
+        self._expanded_move_groups.add(start)
+        line = start + 2
+        self.code_text.delete(f'{line}.0', f'{line}.end')
+        self.code_text.insert(f'{line}.0', self.app.get_action_summary(self.app.recorded_actions[start]), 'move_fold_title')
+        for widget in (self.code_text, self.gutter):
+            widget.tag_remove('typed_fold_hidden', f'{start+3}.0', f'{end+2}.0')
+        self.redraw_breakpoints()
+        return True
+
+    def collapse_mouse_movements(self, index):
+        group = self._mouse_group_at(index, include_expanded=True)
+        if group is None or group[0] not in self._expanded_move_groups:
+            return False
+        start, end, count = group
+        self._expanded_move_groups.remove(start)
+        line = start + 2
+        self.code_text.delete(f'{line}.0', f'{line}.end')
+        self.code_text.insert(f'{line}.0', sequent_move_group_caption(start, end), 'move_fold_title')
+        for widget in (self.code_text, self.gutter):
+            widget.tag_add('typed_fold_hidden', f'{start+3}.0', f'{end+2}.0')
+        self.redraw_breakpoints()
+        return True
+
+    def toggle_mouse_movements(self, index):
+        return self.collapse_mouse_movements(index) or self.expand_mouse_movements(index)
 
     def highlight_action(self, index):
         self.code_text.tag_remove("active_line", "1.0", "end")
@@ -6882,7 +6956,7 @@ class VSCodeQueueViewer(tk.Frame):
         if index is None or index < 0 or not self.app.recorded_actions or index >= len(self.app.recorded_actions):
             return
 
-        folded = self.folded_text_at(index)
+        folded = self.folded_input_at(index)
         line_num = (folded[0] if folded else index) + 2
         if line_num <= self.line_count:
             self.code_text.tag_add("active_line", f"{line_num}.0", f"{line_num}.end+1c")
@@ -6894,7 +6968,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter_margin.delete("bp_dot")
         displayed_lines = set()
         for act_idx in self.app.breakpoints:
-            group = self.folded_text_at(act_idx)
+            group = self.folded_input_at(act_idx)
             line_num = (group[0] if group else act_idx) + 2
             if line_num in displayed_lines:
                 continue
@@ -6923,6 +6997,8 @@ class VSCodeQueueViewer(tk.Frame):
                     # Dedicated disclosure zone: no breakpoint toggling.
                     if action_idx in self._text_group_by_index:
                         self.toggle_typed_text(action_idx)
+                    elif action_idx in self._move_group_by_index:
+                        self.toggle_mouse_movements(action_idx)
                     return 'break'
                 self.app.toggle_breakpoint(action_idx)
         except (tk.TclError, ValueError, IndexError):
@@ -7014,6 +7090,10 @@ class VSCodeQueueViewer(tk.Frame):
         self._text_group_by_index = {}
         self._text_group_starts = []
         self._expanded_text_groups.clear()
+        self._move_groups = []
+        self._move_group_by_index = {}
+        self._move_group_starts = []
+        self._expanded_move_groups.clear()
         self.gutter_margin.delete('typing_disclosure')
         self.gutter_margin.delete('bp_dot')
         self._cancel_queue_drag()
@@ -7237,16 +7317,27 @@ class VSCodeQueueViewer(tk.Frame):
             act_type = act.get("type", "Action")
             is_bp = act_idx in self.app.breakpoints
             bp_label = f"Remove Breakpoint (Line {line_num})" if is_bp else f"Toggle Breakpoint (Line {line_num})"
-            folded = self.folded_text_at(act_idx)
-            if folded:
-                menu.add_command(label=f'Expand Typed Text ({folded[1]-folded[0]} keys)',
+            folded_text = self.folded_text_at(act_idx)
+            folded_move = self._mouse_group_at(act_idx)
+            expanded_move = self._mouse_group_at(act_idx, include_expanded=True)
+            if folded_text:
+                menu.add_command(label=f'Expand Typed Text ({folded_text[1]-folded_text[0]} actions)',
                                  command=lambda idx=act_idx: self.expand_typed_text(idx))
+                menu.add_separator()
+            elif folded_move:
+                menu.add_command(label=f'Expand Mouse Movements ({folded_move[2]:,} moves)',
+                                 command=lambda idx=act_idx: self.expand_mouse_movements(idx))
                 menu.add_separator()
             elif any(start <= act_idx < end and start in self._expanded_text_groups
                      for start, end, _ in self._text_groups):
                 menu.add_command(label='Collapse Typed Text',
                                  command=lambda idx=act_idx: self.collapse_typed_text(idx))
                 menu.add_separator()
+            elif expanded_move and expanded_move[0] in self._expanded_move_groups:
+                menu.add_command(label='Collapse Mouse Movements',
+                                 command=lambda idx=act_idx: self.collapse_mouse_movements(idx))
+                menu.add_separator()
+            folded = folded_text or folded_move
 
             # Copy the full highlighted range when the context row is selected.
             selected = self.selected_action_indices()
@@ -7490,7 +7581,7 @@ class VSCodeQueueViewer(tk.Frame):
             if line_num >= 2:
                 act_idx = line_num - 2
                 if 0 <= act_idx < len(self.app.recorded_actions):
-                    if self.expand_typed_text(act_idx):
+                    if self.expand_typed_text(act_idx) or self.expand_mouse_movements(act_idx):
                         return 'break'
                     self.open_action_submenu(line_num, event, edit_idx=act_idx)
                     return "break"
@@ -7508,6 +7599,7 @@ class VSCodeQueueViewer(tk.Frame):
             return
         if line_num >= 2:
             self.expand_typed_text(line_num - 2)
+            self.expand_mouse_movements(line_num - 2)
 
         type_to_label = {
             "delay": "Delay",
@@ -14479,6 +14571,28 @@ class SequentStudioGraph(tk.Frame):
 
 
 
+# Playback-only mouse-movement folding. A click ends the movement run; other
+# non-movement actions also end it so no visible action can be reordered.
+def sequent_mouse_movement_groups(actions, minimum=2):
+    """Yield (start, end, count) for contiguous recorded mouse movements.
+
+    The ranges are half-open and preserve every underlying action/index. A
+    click, keyboard action, scroll, drag, delay or control-flow marker ends
+    the current run. Consecutive mouse movements after a click start a new run.
+    """
+    start = None
+    for i, action in enumerate(actions):
+        if isinstance(action, dict) and action.get('type') == 'move':
+            if start is None:
+                start = i
+        elif start is not None:
+            if i - start >= minimum:
+                yield start, i, i - start
+            start = None
+    if start is not None and len(actions) - start >= minimum:
+        yield start, len(actions), len(actions) - start
+
+
 # Display-only typing-session detection. Real keystroke/delay actions are
 # never merged, removed, or replaced in the underlying macro.
 SEQUENT_TYPING_PAUSE_SECONDS = 0.90
@@ -14586,6 +14700,11 @@ def sequent_typed_text_groups(actions, minimum=2, pause_seconds=SEQUENT_TYPING_P
             i += 1
 
 
+def sequent_move_group_caption(start, end):
+    """Show a readable movement entry while retaining original queue indices."""
+    return f'mouse.move_path(...)  [{end-start:,} movements; actions {start+1:,}–{end:,}]'
+
+
 def sequent_typed_group_caption(start, end, text):
     """Consistent Playback caption for a typing session that may include delays."""
     pauses = (end - start) - len(text)
@@ -14626,7 +14745,8 @@ class SequentPlaybackGraph(SequentStudioGraph):
                 scroll_delta = actions[i].get('delta', 0) if kind in ('scroll', 'wheel') else 0
                 if not isinstance(scroll_delta, (int, float)):
                     scroll_delta = 0
-                while j < n and actions[j].get('type') in SequentPlaybackGraph.INPUT_NOISE:
+                while (j < n and actions[j].get('type') in SequentPlaybackGraph.INPUT_NOISE
+                       and ((kind == 'move') == (actions[j].get('type') == 'move'))):
                     item = actions[j]
                     t = item.get('type')
                     if t == 'move':
@@ -14829,7 +14949,7 @@ class SequentPlaybackGraph(SequentStudioGraph):
                                outline='',tags=(f'n{start}','node'))
             if typ=='input_group':
                 count=node['end']-start
-                title=f'{start+1}–{node["end"]}  RECORDED INPUT ×{count:,}'
+                title=f'{start+1}–{node["end"]}  {"MOUSE MOVEMENT" if node["moves"] else "SCROLL EVENTS"} ×{count:,}'
                 summary=f'{node["moves"]:,} moves  •  {node["scrolls"]:,} scrolls'
             elif typ=='text_group':
                 title=f'{start+1}–{node["end"]}  TYPE TEXT ×{node["keys"]:,}'
@@ -14907,7 +15027,7 @@ class SequentPlaybackGraph(SequentStudioGraph):
         for name,value in facts:
             tk.Label(self.property_fields,text=name,bg='#202633',fg='#A9BBD1',font=('Segoe UI',8,'bold')).pack(anchor='w',pady=(12,2))
             tk.Label(self.property_fields,text=value,bg='#202633',fg='white',font=('Segoe UI',11)).pack(anchor='w')
-        tk.Label(self.property_fields, text='Visual-only grouping. Original actions and timing are unchanged. Double-click a folded text entry in Playback to expand it.',
+        tk.Label(self.property_fields, text='Visual-only grouping. Original actions and timing are unchanged. Use the gutter arrow in Playback to expand typed text or recorded movements.',
                  bg='#202633',fg='#A9BBD1',wraplength=218,justify='left').pack(anchor='w',pady=(16,8))
         tk.Button(self.property_fields,text='Select First Action in Playback',
                   command=lambda:self.app.set_active_action_index(start),
@@ -20518,6 +20638,11 @@ try {{
              if start in self.queue_viewer._expanded_text_groups}
             if not is_new_source else set()
         )
+        expanded_moves = (
+            {(start, end, count) for start, end, count in self.queue_viewer._move_groups
+             if start in self.queue_viewer._expanded_move_groups}
+            if not is_new_source else set()
+        )
 
         self.current_source_label = source_label
 
@@ -20532,6 +20657,7 @@ try {{
         # Fold text visually in Playback but retain the original one-line-per-action
         # Text indices, which are used by edit, breakpoints and the scrubber.
         self.queue_viewer.fold_typed_text(actions, expanded_groups)
+        self.queue_viewer.fold_mouse_movements(actions, expanded_moves)
         self.update_action_count_badge()
         self.update_scrubber_ui()
         self.queue_viewer.redraw_breakpoints()
