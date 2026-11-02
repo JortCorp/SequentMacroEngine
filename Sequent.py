@@ -14451,11 +14451,7 @@ class SequentStudioGraph(tk.Frame):
             x2,y2=pt(xx,yy+self.NODE_H/2)
             mid=(x1+x2)/2
             col='#58C9D0' if label in ('TRUE','LOOP') else '#D5A76C' if label else '#63718A'
-            broken=(a,b) in getattr(self,'disabled_edges',set())
-            if broken:col='#EF4444'
-            c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,fill=col,width=2,
-                          dash=(5,5) if broken else (),smooth=True,
-                          arrow='none' if broken else 'last')
+            c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,fill=col,width=2,smooth=True,arrow='last')
             if label:c.create_text(mid,(y1+y2)/2-8,text=label,fill=col,font=('Segoe UI',8,'bold'))
         for i,act in enumerate(self.actions):
             x,y=self.positions[i];x1,y1=pt(x,y);x2,y2=pt(x+self.NODE_W,y+self.NODE_H)
@@ -15209,7 +15205,11 @@ class SequentPlaybackGraph(SequentStudioGraph):
                 continue
             col = '#58C9D0' if label in ('TRUE','LOOP') else '#D5A76C' if label else '#63718A'
             mid=(x1+x2)/2
-            c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,fill=col,width=2,smooth=True,arrow='last')
+            broken=(a,b) in getattr(self,'disabled_edges',set())
+            if broken:col='#EF4444'
+            c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,fill=col,width=2,
+                          dash=(5,5) if broken else (),smooth=True,
+                          arrow='none' if broken else 'last')
             if broken:
                 c.create_text(mid,(y1+y2)/2-12,text='DISCONNECTED',fill='#EF4444',
                               font=('Segoe UI',max(7,int(8*scale))))
