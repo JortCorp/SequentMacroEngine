@@ -14451,7 +14451,11 @@ class SequentStudioGraph(tk.Frame):
             x2,y2=pt(xx,yy+self.NODE_H/2)
             mid=(x1+x2)/2
             col='#58C9D0' if label in ('TRUE','LOOP') else '#D5A76C' if label else '#63718A'
-            c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,fill=col,width=2,smooth=True,arrow='last')
+            broken=(a,b) in getattr(self,'disabled_edges',set())
+            if broken:col='#EF4444'
+            c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,fill=col,width=2,
+                          dash=(5,5) if broken else (),smooth=True,
+                          arrow='none' if broken else 'last')
             if label:c.create_text(mid,(y1+y2)/2-8,text=label,fill=col,font=('Segoe UI',8,'bold'))
         for i,act in enumerate(self.actions):
             x,y=self.positions[i];x1,y1=pt(x,y);x2,y2=pt(x+self.NODE_W,y+self.NODE_H)
@@ -15045,6 +15049,51 @@ class SequentPlaybackGraph(SequentStudioGraph):
         # No deep-copy of an entire recording just to render its diagram.
         return getattr(self.app, 'current_source_label', 'Playback'), getattr(self.app, 'recorded_actions', [])
 
+    def _layout_key(self, name, actions):
+        # Avoid storing recorded text or other potentially sensitive action data
+        # in the layout file.  The digest is only an identity key.
+        signature = [(a.get('type'), a.get('name') if a.get('type') == 'label' else None)
+                     for a in actions]
+        raw = json.dumps([name, signature], ensure_ascii=True, default=str)
+        return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+    def _layout_file(self):
+        return Path.home() / '.sequent' / 'studio_layouts.json'
+
+    def _read_saved_layout(self, key):
+        try:
+            data=json.loads(self._layout_file().read_text(encoding='utf-8'))
+            return data.get(key, {}) if isinstance(data, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _save_layout(self):
+        if not getattr(self, '_layout_key_current', None):
+            return
+        try:
+            path=self._layout_file()
+            path.parent.mkdir(parents=True,exist_ok=True)
+            try:
+                data=json.loads(path.read_text(encoding='utf-8'))
+                if not isinstance(data,dict):data={}
+            except (OSError,ValueError,TypeError):
+                data={}
+            data[self._layout_key_current]={
+                'positions':{str(k):[round(x,2),round(y,2)]
+                             for k,(x,y) in self.positions.items()},
+                'sections':self.section_boxes,
+                'disabled_edges':[list(e) for e in sorted(getattr(self,'disabled_edges',set()))],
+                'scale':self.scale,
+                'pan':[self.pan_x,self.pan_y]}
+            # Keep only the most recently saved 30 layouts.
+            while len(data)>30:
+                del data[next(iter(data))]
+            temp=path.with_suffix('.tmp')
+            temp.write_text(json.dumps(data,indent=2),encoding='utf-8')
+            temp.replace(path)
+        except (OSError,ValueError,TypeError):
+            pass  # Layout metadata must never interrupt recording/playback.
+
     def redraw(self):
         name, actions = self._load()
         self._preset, self.actions = name, actions
@@ -15062,10 +15111,37 @@ class SequentPlaybackGraph(SequentStudioGraph):
                           (80 + k * self.NODE_X_STEP, 120))
                           for k, n in enumerate(nodes)}
         self._layout_source = name
-        if not hasattr(self, 'section_boxes') or getattr(self, '_sections_source', None) != name:
+        layout_key=self._layout_key(name,actions)
+        if getattr(self,'_layout_key_current',None)!=layout_key:
+            saved=self._read_saved_layout(layout_key)
+            self.section_boxes=[]
+            self.disabled_edges=set()
+            for edge in saved.get('disabled_edges',[]):
+                if isinstance(edge,list) and len(edge)==2 and all(isinstance(v,int) for v in edge):
+                    self.disabled_edges.add(tuple(edge))
+            self._layout_key_current=layout_key
+            for k,point in saved.get('positions',{}).items():
+                try:
+                    index=int(k)
+                    if index in self.positions and len(point)==2:
+                        self.positions[index]=(float(point[0]),float(point[1]))
+                except (ValueError,TypeError,OverflowError):
+                    pass
+            if isinstance(saved.get('sections'),list):
+                self.section_boxes=[f for f in saved['sections']
+                    if isinstance(f,dict) and all(k in f for k in ('x1','y1','x2','y2','name'))][:100]
+            if isinstance(saved.get('pan'),list) and len(saved['pan'])==2:
+                try:self.pan_x,self.pan_y=map(float,saved['pan'])
+                except (ValueError,TypeError):pass
+            if isinstance(saved.get('scale'),(float,int)):
+                self.scale=max(.2,min(3.,saved['scale']))
+        if not hasattr(self, 'section_boxes'):
             self.section_boxes = []
-            self._sections_source = name
+        self._sections_source = name
         self._view_edges = self.projected_edges(nodes, actions)
+        self.disabled_edges = getattr(self,'disabled_edges',set())
+        self.app._studio_disabled_edges=set(self.disabled_edges)
+        self.app._studio_graph_signature=self._layout_key_current
         self._wire_preview = None
         self._wire_source = None
         if self.selected_action is not None and self.selected_action >= len(actions):
@@ -15120,14 +15196,24 @@ class SequentPlaybackGraph(SequentStudioGraph):
                 continue
             x,y = positions[a]
             xx,yy = positions[b]
-            x1,y1 = pt(x+self.NODE_W,y+self.NODE_H/2)
+            source_kind=self._node_by_start.get(a,{}).get('kind')
+            if label in ('TRUE','LOOP','FOUND') and source_kind in ('if_dynamic','loop_start'):
+                exit_y=y+self.NODE_H*.34
+            elif label in ('FALSE','DONE','NOT FOUND') and source_kind in ('if_dynamic','loop_start'):
+                exit_y=y+self.NODE_H*.72
+            else:
+                exit_y=y+self.NODE_H/2
+            x1,y1 = pt(x+self.NODE_W,exit_y)
             x2,y2 = pt(xx,yy+self.NODE_H/2)
             if max(x1,x2)<-pad or min(x1,x2)>w+pad or max(y1,y2)<-pad or min(y1,y2)>h+pad:
                 continue
             col = '#58C9D0' if label in ('TRUE','LOOP') else '#D5A76C' if label else '#63718A'
             mid=(x1+x2)/2
             c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,fill=col,width=2,smooth=True,arrow='last')
-            if label:
+            if broken:
+                c.create_text(mid,(y1+y2)/2-12,text='DISCONNECTED',fill='#EF4444',
+                              font=('Segoe UI',max(7,int(8*scale))))
+            if label and not broken:
                 c.create_text(mid,(y1+y2)/2-12,text=label,fill=col,font=('Segoe UI',8,'bold'))
         if getattr(self, '_wire_preview', None):
             start, (mx, my) = self._wire_preview
@@ -15177,9 +15263,22 @@ class SequentPlaybackGraph(SequentStudioGraph):
             c.create_oval(x1-port_r,cy-port_r,x1+port_r,cy+port_r,
                           fill='#38BDF8',outline='#111827',width=1,
                           tags=(f'n{start}','node','input-port'))
-            c.create_oval(x2-port_r,cy-port_r,x2+port_r,cy+port_r,
-                          fill='#34D399',outline='#111827',width=1,
-                          tags=(f'n{start}','node','output-port'))
+            if typ not in ('if_dynamic','loop_start') and typ not in SCREEN_RECOGNITION_TYPES:
+                c.create_oval(x2-port_r,cy-port_r,x2+port_r,cy+port_r,
+                              fill='#34D399',outline='#111827',width=1,
+                              tags=(f'n{start}','node','output-port'))
+            if typ in ('if_dynamic','loop_start') or typ in SCREEN_RECOGNITION_TYPES:
+                outputs=(('TRUE','#34D399'),('FALSE','#FB7185')) if typ=='if_dynamic' else (
+                    (('LOOP','#34D399'),('DONE','#FB7185')) if typ=='loop_start'
+                    else (('FOUND','#34D399'),('NOT FOUND','#FB7185')))
+                for j,(label,color) in enumerate(outputs):
+                    sy=y1+(self.NODE_H*(.34 if j==0 else .72))*scale
+                    c.create_oval(x2-port_r,sy-port_r,x2+port_r,sy+port_r,
+                                  fill=color,outline='#111827',width=1,
+                                  tags=(f'n{start}','node',f'output-{j}'))
+                    c.create_text(x2-12*scale,sy,anchor='e',text=label,
+                                  fill=color,font=('Segoe UI',max(7,int(8*scale))),
+                                  tags=(f'n{start}','node'))
             if typ=='input_group':
                 count=node['end']-start
                 title=f'{start+1}–{node["end"]}  {"MOUSE MOVEMENT" if node["moves"] else "SCROLL EVENTS"} ×{count:,}'
@@ -15213,6 +15312,8 @@ class SequentPlaybackGraph(SequentStudioGraph):
         for node in reversed(getattr(self,'nodes',())):
             start=node['start']
             nx,ny=self.positions[start]
+            if node['kind'] in ('if_dynamic','loop_start') or node['kind'] in SCREEN_RECOGNITION_TYPES:
+                continue  # Branch outputs are visual until branch rewiring is validated.
             if abs(wx-(nx+self.NODE_W))<13/max(.4,self.scale) and abs(wy-(ny+self.NODE_H/2))<13/max(.4,self.scale):
                 self._wire_source=start
                 self._wire_preview=(start,(e.x,e.y))
@@ -15307,6 +15408,7 @@ class SequentPlaybackGraph(SequentStudioGraph):
             if destination is not None:
                 self._connect_sockets(source,destination)
             self._draw()
+            self._save_layout()
             return
         preview=getattr(self,'_section_preview',None)
         if preview:
@@ -15317,9 +15419,11 @@ class SequentPlaybackGraph(SequentStudioGraph):
                                            'x2':max(x1,x2),'y2':max(y1,y2),
                                            'name':f'Section {len(self.section_boxes)+1}'})
             self._draw()
+            self._save_layout()
             return
         self._drag=self._pan=None
         self._frame_drag=None
+        self._save_layout()
 
     def _connect_sockets(self, source, destination):
         """Only GOTO->LABEL can be written safely to the existing action model.
@@ -15353,6 +15457,10 @@ class SequentPlaybackGraph(SequentStudioGraph):
         self.app._finish_queue_deletion(before,'Studio: change GOTO target')
         self.redraw()
 
+    def zoom(self, direction, x=None, y=None):
+        super().zoom(direction,x,y)
+        self._save_layout()
+
     def _section_at(self, x, y):
         wx,wy=self._world(x,y)
         for section in reversed(getattr(self,'section_boxes',())):
@@ -15363,6 +15471,40 @@ class SequentPlaybackGraph(SequentStudioGraph):
     def _section_menu(self, event):
         section=self._section_at(event.x,event.y)
         if section is None:
+            # Safe workflow editor: allow toggling an edge, but refuse to run
+            # an incomplete graph until the execution engine supports it.
+            wx,wy=self._world(event.x,event.y)
+            best=None
+            distance=32/max(.4,self.scale)
+            for source,target,label in self._view_edges:
+                if source not in self.positions or target not in self.positions:
+                    continue
+                ax,ay=self.positions[source]
+                bx,by=self.positions[target]
+                # Distance from click to segment between port centers.
+                ax+=self.NODE_W;ay+=self.NODE_H/2
+                by+=self.NODE_H/2
+                dx,dy=bx-ax,by-ay
+                t=max(0,min(1,((wx-ax)*dx+(wy-ay)*dy)/(dx*dx+dy*dy or 1)))
+                d=((wx-ax-t*dx)**2+(wy-ay-t*dy)**2)**.5
+                if d<distance:
+                    distance=d;best=(source,target)
+            if best is None:
+                return
+            menu=tk.Menu(self,tearoff=False)
+            disabled=best in self.disabled_edges
+            def toggle():
+                if self.app.playing or self.app.recording:
+                    messagebox.showwarning('Studio','Stop playback or recording before changing wires.',parent=self)
+                    return
+                if disabled:self.disabled_edges.discard(best)
+                else:self.disabled_edges.add(best)
+                self.app._studio_disabled_edges=set(self.disabled_edges)
+                self._save_layout()
+                self._draw()
+            menu.add_command(label=('Reconnect wire' if disabled else 'Disconnect wire'),command=toggle)
+            menu.add_command(label='Disconnected workflows cannot run yet',state='disabled')
+            menu.tk_popup(event.x_root,event.y_root)
             return
         menu=tk.Menu(self,tearoff=False)
         def rename():
@@ -15372,9 +15514,11 @@ class SequentPlaybackGraph(SequentStudioGraph):
             if name and name.strip():
                 section['name']=name.strip()
                 self._draw()
+                self._save_layout()
         def delete():
             self.section_boxes.remove(section)
             self._draw()
+            self._save_layout()
         menu.add_command(label='Rename section',command=rename)
         menu.add_command(label='Delete section',command=delete)
         menu.add_separator()
@@ -22485,6 +22629,16 @@ try {{
             self.root.after(0, self.update_action_count_badge)
     
     def start_macro(self):
+        # Fail closed: a disconnected Studio wire is never silently ignored.
+        # The legacy structured engine cannot yet execute arbitrary graph edges.
+        disconnected=getattr(self,'_studio_disabled_edges',set())
+        if disconnected:
+            messagebox.showerror('Disconnected Studio workflow',
+                f'{len(disconnected)} wire(s) are disconnected. Reconnect them '
+                'in Studio before playback. No actions have been executed.',
+                parent=self.root)
+            self.update_status('Blocked: disconnected workflow',COLOR_DANGER)
+            return
         if not self.recorded_actions:
             self.update_status("Queue Empty", COLOR_DANGER)
             return
