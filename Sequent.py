@@ -14056,6 +14056,10 @@ class SequentStudioGraph(tk.Frame):
         if hit is not None:
             nx,ny=self.positions[hit];self._drag=(hit,x-nx,y-ny)
             self.on_select(self.selected_stage,hit)
+            # Selecting a graph node also selects the first original action
+            # in Playback, but must never move the playhead during execution.
+            if self.app is not None and not self.app.playing and not self.app.recording:
+                self.app.set_active_action_index(hit)
             self.show_properties()
         else:self._pan=(e.x,e.y,self.pan_x,self.pan_y)
         self._draw()
@@ -14310,51 +14314,356 @@ class SequentStudioGraph(tk.Frame):
 
 
 class SequentPlaybackGraph(SequentStudioGraph):
-    """One action graph, backed exclusively by the active Playback queue."""
+    """Playback-synchronized graph with a lossless, condensed *display* model.
+
+    Mouse moves and wheel ticks are grouped in the canvas only. All original
+    actions, their order, and their indices remain authoritative in Playback.
+    """
+    INPUT_NOISE = frozenset(('move', 'scroll', 'wheel'))
+    NODE_Y_STEP = 110
+
+    @staticmethod
+    def build_projection(actions):
+        """Linear-time, lossless graph projection; each node covers [start,end)."""
+        nodes = []
+        n = len(actions)
+        i = 0
+        while i < n:
+            kind = actions[i].get('type')
+            if kind in SequentPlaybackGraph.INPUT_NOISE:
+                j = i + 1
+                moves = int(kind == 'move')
+                scrolls = int(kind in ('scroll', 'wheel'))
+                scroll_delta = actions[i].get('delta', 0) if kind in ('scroll', 'wheel') else 0
+                if not isinstance(scroll_delta, (int, float)):
+                    scroll_delta = 0
+                while j < n and actions[j].get('type') in SequentPlaybackGraph.INPUT_NOISE:
+                    item = actions[j]
+                    t = item.get('type')
+                    if t == 'move':
+                        moves += 1
+                    else:
+                        scrolls += 1
+                        d = item.get('delta', 0)
+                        if isinstance(d, (int, float)):
+                            scroll_delta += d
+                    j += 1
+                if j - i > 1:
+                    nodes.append({'start': i, 'end': j, 'kind': 'input_group',
+                                  'moves': moves, 'scrolls': scrolls,
+                                  'scroll_delta': scroll_delta})
+                else:
+                    nodes.append({'start': i, 'end': j, 'kind': kind})
+                i = j
+            else:
+                nodes.append({'start': i, 'end': i+1, 'kind': kind})
+                i += 1
+        return nodes
+
+    @staticmethod
+    def projected_edges(nodes, actions):
+        """Real execution flow over condensed nodes, not over raw mouse samples."""
+        from collections import defaultdict
+        index_by_label = {}
+        for k, node in enumerate(nodes):
+            action = actions[node['start']]
+            if node['kind'] == 'label':
+                index_by_label.setdefault(action.get('name'), k)
+        if_stack, loop_stack = [], []
+        if_struct, else_end, loop_end, loop_start, breaker_end = {}, {}, {}, {}, {}
+        for k, node in enumerate(nodes):
+            kind = node['kind']
+            if kind == 'if_dynamic':
+                if_stack.append([k, None])
+            elif kind == 'else_dynamic' and if_stack:
+                if_stack[-1][1] = k
+            elif kind == 'end_if' and if_stack:
+                head, other = if_stack.pop()
+                if_struct[head] = (other, k)
+                if other is not None:
+                    else_end[other] = k
+            elif kind == 'loop_start':
+                loop_stack.append([k, []])
+            elif kind == 'loop_break' and loop_stack:
+                loop_stack[-1][1].append(k)
+            elif kind == 'loop_end' and loop_stack:
+                head, breaks = loop_stack.pop()
+                loop_end[head] = k
+                loop_start[k] = head
+                for b in breaks:
+                    breaker_end[b] = k
+        edges = []
+        count = len(nodes)
+        def add(a,b,label=''):
+            if 0 <= b < count:
+                edges.append((nodes[a]['start'],nodes[b]['start'],label))
+        for k,node in enumerate(nodes):
+            kind=node['kind']
+            if kind == 'if_dynamic':
+                add(k,k+1,'TRUE')
+                other, end = if_struct.get(k, (None, None))
+                if other is not None:
+                    add(k,other+1,'FALSE')
+                elif end is not None:
+                    add(k,end+1,'FALSE')
+            elif kind == 'else_dynamic':
+                end=else_end.get(k)
+                if end is not None:
+                    add(k,end+1,'JOIN')
+            elif kind == 'loop_start':
+                add(k,k+1,'LOOP')
+                if k in loop_end:
+                    add(k,loop_end[k]+1,'DONE')
+            elif kind == 'loop_end':
+                if k in loop_start:
+                    add(k,loop_start[k],'REPEAT')
+            elif kind == 'loop_break':
+                if k in breaker_end:
+                    add(k,breaker_end[k]+1,'BREAK')
+            elif kind == 'goto':
+                target=actions[node['start']].get('target')
+                if target in index_by_label:
+                    add(k,index_by_label[target],'GOTO')
+            else:
+                add(k,k+1)
+        return edges
 
     def _load(self):
-        return getattr(self.app, 'current_source_label', 'Playback'), copy.deepcopy(
-            getattr(self.app, 'recorded_actions', []))
+        # No deep-copy of an entire recording just to render its diagram.
+        return getattr(self.app, 'current_source_label', 'Playback'), getattr(self.app, 'recorded_actions', [])
+
+    def redraw(self):
+        name, actions = self._load()
+        self._preset, self.actions = name, actions
+        nodes = self.build_projection(actions)
+        starts = [node['start'] for node in nodes]
+        # Preserve manually dragged placements for unchanged node identities.
+        old_positions = getattr(self, 'positions', {})
+        old_source = getattr(self, '_layout_source', None)
+        if old_source != name:
+            old_positions = {}
+        self.nodes = nodes
+        self._node_starts = starts
+        self._node_by_start = {n['start']: n for n in nodes}
+        self.positions = {n['start']: old_positions.get(n['start'],
+                          (80, k * self.NODE_Y_STEP))
+                          for k, n in enumerate(nodes)}
+        self._layout_source = name
+        self._view_edges = self.projected_edges(nodes, actions)
+        if self.selected_action is not None and self.selected_action >= len(actions):
+            self.selected_action = None
+        self._draw()
+        self.show_properties()
+
+    def _node_for_action(self, action_index):
+        from bisect import bisect_right
+        if action_index is None or not getattr(self, '_node_starts', None):
+            return None
+        k = bisect_right(self._node_starts, action_index) - 1
+        if k < 0:
+            return None
+        node = self.nodes[k]
+        return node if action_index < node['end'] else None
+
+    def _selected_group(self):
+        node = self._node_for_action(self.selected_action)
+        return node if node is not None and node['kind'] == 'input_group' else None
+
+    def _guard_group_edit(self):
+        if self._selected_group() is None:
+            return False
+        messagebox.showinfo('Condensed input node',
+            'This node represents multiple original movement/scroll actions. '
+            'Edit those individual actions in Playback. Studio never replaces '
+            'or deletes the underlying recording when grouping the graph.',
+            parent=self.winfo_toplevel())
+        return True
+
+    def _edges(self):
+        return self._view_edges
+
+    def _draw(self):
+        # The polling debugger calls this often: draw only visible nodes/edges.
+        c = self.canvas
+        c.delete('all')
+        w, h = c.winfo_width(), c.winfo_height()
+        scale = self.scale
+        grid = 32 * scale
+        if grid >= 12:
+            for x in range(int(self.pan_x % grid), w, max(1, int(grid))):
+                for y in range(int(self.pan_y % grid), h, max(1, int(grid))):
+                    c.create_oval(x,y,x+2,y+2,fill='#303848',outline='')
+        def pt(x,y):
+            return self.pan_x+x*scale,self.pan_y+y*scale
+        positions = self.positions
+        pad = 80
+        for a,b,label in getattr(self, '_view_edges', ()):
+            if a not in positions or b not in positions:
+                continue
+            x,y = positions[a]
+            xx,yy = positions[b]
+            x1,y1 = pt(x+self.NODE_W/2,y+self.NODE_H)
+            x2,y2 = pt(xx+self.NODE_W/2,yy)
+            if max(x1,x2)<-pad or min(x1,x2)>w+pad or max(y1,y2)<-pad or min(y1,y2)>h+pad:
+                continue
+            col = '#58C9D0' if label in ('TRUE','LOOP') else '#D5A76C' if label else '#63718A'
+            mid=(y1+y2)/2
+            c.create_line(x1,y1,x1,mid,x2,mid,x2,y2,fill=col,width=2,smooth=True,arrow='last')
+            if label:
+                c.create_text((x1+x2)/2+12,mid-8,text=label,fill=col,font=('Segoe UI',8,'bold'))
+        running_index = getattr(self.app, 'current_action_idx', -1) if self.app is not None and self.app.playing else -1
+        running_node = self._node_for_action(running_index)
+        running_start = running_node['start'] if running_node is not None else None
+        selected_node = self._node_for_action(self.selected_action)
+        selected_start = selected_node['start'] if selected_node is not None else None
+        for node in getattr(self, 'nodes', ()):
+            start = node['start']
+            x,y = positions[start]
+            x1,y1 = pt(x,y)
+            x2,y2 = pt(x+self.NODE_W,y+self.NODE_H)
+            if x2<0 or y2<0 or x1>w or y1>h:
+                continue
+            typ = node['kind']
+            selected = start == selected_start
+            active = (start == running_start)  # graph always reflects the current Playback queue
+            col = '#E9AD4D' if active else '#58C9D0' if selected else '#4A5972'
+            c.create_rectangle(x1,y1,x2,y2,fill='#263145',outline=col,width=2 if selected or active else 1,
+                               tags=(f'n{start}','node'))
+            c.create_rectangle(x1,y1,x1+5*scale,y2,
+                               fill='#58C9D0' if typ in ('if_dynamic','loop_start') else '#8F76D9' if typ=='input_group' else '#7A89C4',
+                               outline='',tags=(f'n{start}','node'))
+            if typ=='input_group':
+                count=node['end']-start
+                title=f'{start+1}–{node["end"]}  RECORDED INPUT ×{count:,}'
+                summary=f'{node["moves"]:,} moves  •  {node["scrolls"]:,} scrolls'
+            else:
+                act=self.actions[start]
+                title=f'{start+1:03}  {str(typ).replace("_"," ").upper()}'
+                summary=str(act.get('name') or act.get('label') or act.get('mode') or act.get('text') or typ)
+            # Tk canvas cannot elide text itself: keep rendering bounded.
+            c.create_text(x1+12*scale,y1+20*scale,anchor='w',text=title[:37],fill='#ACBED5',font=('Segoe UI',max(7,int(9*scale))),tags=(f'n{start}','node'))
+            c.create_text(x1+12*scale,y1+44*scale,anchor='w',text=summary[:37],fill='white',font=('Segoe UI',max(8,int(10*scale)),'bold'),tags=(f'n{start}','node'))
+        if not self.actions:
+            c.create_text(w/2,h/2,text='Load or record a preset in Playback to see its workflow.',fill='#B5C3D7',font=('Segoe UI',12))
+        elif getattr(self,'nodes',None):
+            hidden = len(self.actions)-len(self.nodes)
+            c.create_text(12,12,anchor='nw',text=f'{len(self.nodes):,} nodes  •  {len(self.actions):,} Playback actions  •  {hidden:,} condensed',
+                          fill='#AABBD3',font=('Segoe UI',9,'bold'))
+
+    def _press(self,e):
+        x,y = self._world(e.x,e.y)
+        hit = None
+        # Only visible nodes need hit testing; avoids scanning raw actions.
+        for node in reversed(getattr(self,'nodes',())):
+            key = node['start']
+            nx,ny = self.positions[key]
+            if nx<=x<=nx+self.NODE_W and ny<=y<=ny+self.NODE_H:
+                hit = key
+                break
+        self.selected_action = hit
+        if hit is not None:
+            nx,ny=self.positions[hit]
+            self._drag=(hit,x-nx,y-ny)
+            self._pan=None
+            self.on_select(self.selected_stage,hit)
+            # Selecting a graph node also selects the first original action
+            # in Playback, but must never move the playhead during execution.
+            if self.app is not None and not self.app.playing and not self.app.recording:
+                self.app.set_active_action_index(hit)
+            self.show_properties()
+        else:
+            self._pan=(e.x,e.y,self.pan_x,self.pan_y)
+            self._drag=None
+        self._draw()
+
+    def _motion(self,e):
+        if self._drag:
+            i,dx,dy=self._drag
+            x,y=self._world(e.x,e.y)
+            self.positions[i]=(x-dx,y-dy)
+        elif self._pan:
+            x,y,px,py=self._pan
+            self.pan_x=px+e.x-x
+            self.pan_y=py+e.y-y
+        self._draw()
+
+    def show_properties(self):
+        group = self._selected_group()
+        if group is None:
+            return super().show_properties()
+        for widget in self.property_fields.winfo_children():
+            widget.destroy()
+        self.property_entries={}
+        start,end=group['start'],group['end']
+        facts=(('ACTION RANGE',f'{start+1:,}–{end:,}'),
+               ('RECORDED ACTIONS',f'{end-start:,}'),
+               ('MOUSE MOVEMENTS',f'{group["moves"]:,}'),
+               ('SCROLL EVENTS',f'{group["scrolls"]:,}'),
+               ('SCROLL DELTA',str(group['scroll_delta'])))
+        for name,value in facts:
+            tk.Label(self.property_fields,text=name,bg='#202633',fg='#A9BBD1',font=('Segoe UI',8,'bold')).pack(anchor='w',pady=(12,2))
+            tk.Label(self.property_fields,text=value,bg='#202633',fg='white',font=('Segoe UI',11)).pack(anchor='w')
+        tk.Label(self.property_fields, text='Visual-only grouping. The full input sequence remains unchanged in Playback.',
+                 bg='#202633',fg='#A9BBD1',wraplength=218,justify='left').pack(anchor='w',pady=(16,8))
+        tk.Button(self.property_fields,text='Select First Action in Playback',
+                  command=lambda:self.app.set_active_action_index(start),
+                  bg='#377F83',fg='white',relief='flat').pack(fill='x',pady=6)
+
+    def apply_properties(self):
+        if not self._guard_group_edit():
+            return super().apply_properties()
+    def edit_node(self):
+        if not self._guard_group_edit():
+            return super().edit_node()
+    def delete_node(self):
+        if not self._guard_group_edit():
+            return super().delete_node()
+    def move_node(self,direction):
+        if not self._guard_group_edit():
+            return super().move_node(direction)
+    def connect_node(self):
+        if not self._guard_group_edit():
+            return super().connect_node()
+    def add_action(self):
+        if not self._guard_group_edit():
+            return super().add_action()
+    def add_loop(self):
+        if not self._guard_group_edit():
+            return super().add_loop()
+    def toggle_breakpoint(self):
+        if not self._guard_group_edit():
+            return super().toggle_breakpoint()
 
     def _write(self, actions):
-        app = self.app
-        if app is None or app.playing or app.recording or getattr(app, 'chain_running', False):
-            messagebox.showwarning('Studio', 'Stop recording and playback before editing.', parent=self)
+        app=self.app
+        if app is None or app.playing or app.recording or getattr(app,'chain_running',False):
+            messagebox.showwarning('Studio','Stop recording and playback before editing.',parent=self)
             return False
-        if not isinstance(actions, list) or any(not isinstance(a, dict) for a in actions):
-            messagebox.showerror('Studio', 'Actions must be a list of objects.', parent=self)
+        if not isinstance(actions,list) or any(not isinstance(a,dict) for a in actions):
+            messagebox.showerror('Studio','Actions must be a list of objects.',parent=self)
             return False
         try:
             app._queue_undo_history.append(app._snapshot_queue_for_undo())
             app._queue_redo_history.clear()
         except AttributeError:
             pass
-        app.recorded_actions = copy.deepcopy(actions)
-        app.current_action_idx = min(app.current_action_idx, max(0, len(actions)-1))
+        app.recorded_actions=copy.deepcopy(actions)
+        app.current_action_idx=min(app.current_action_idx,max(0,len(actions)-1))
         app.display_actions_in_queue(app.recorded_actions)
-        # Existing autosave timer observes the modified queue snapshot.
         self.redraw()
         return True
-
-    def redraw(self):
-        name, actions = self._load()
-        # Keep user-arranged positions until the action count/source changes.
-        if name != self._preset or len(actions) != len(self.actions):
-            self.positions = {i: self.positions.get(i, (i % 3 * 295, i // 3 * 150))
-                              for i in range(len(actions))}
-        self._preset, self.actions = name, actions
-        self._draw()
-        self.show_properties()
 
     def _debug_poll(self):
         if not self.winfo_exists():
             return
-        self._draw()
-        self.after(300, self._debug_poll)
+        # Graph is stable; only repaint active-node highlighting.
+        if self.winfo_ismapped():
+            self._draw()
+        self.after(300,self._debug_poll)
 
     def run_graph(self):
         if self.app is not None and not self.app.playing and not self.app.recording:
-            self.app._graph_running_preset = self._preset
+            self.app._graph_running_preset=self._preset
             self.app.start_macro()
 
 class SequentTriggerManager:
@@ -20201,7 +20510,7 @@ try {{
     def _set_tab_heading(self, tab_name):
         headings = {
             "playback": ("Playback", "Record, edit and execute actions"),
-            "sequencer": ("Automation Studio", "Compose macro chains on a visual timeline"),
+            "sequencer": ("Automation Studio", "Visualize and edit the loaded Playback workflow"),
             "debug_tools": ("Debug Tools", "Inspect, troubleshoot and organize Sequent workflows"),
             "settings": ("Settings", "Customize your automation workspace"),
         }
@@ -20220,7 +20529,7 @@ try {{
 
         headings = {
             "playback": ("Playback", "Record, edit and execute actions"),
-            "sequencer": ("Automation Studio", "Compose macro chains on a visual timeline"),
+            "sequencer": ("Automation Studio", "Visualize and edit the loaded Playback workflow"),
             "debug_tools": ("Debug Tools", "Inspect, troubleshoot and organize Sequent workflows"),
             "settings": ("Settings", "Customize your automation workspace"),
         }
