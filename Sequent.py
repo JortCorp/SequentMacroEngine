@@ -6920,7 +6920,7 @@ class VSCodeQueueViewer(tk.Frame):
             start for start, end, count in self._scroll_groups
             if (start, end, count) in preserve
         }
-        self.code_text.tag_configure('scroll_fold_title', foreground=SYNTAX_BLUE)
+        self.code_text.tag_configure('scroll_fold_title', foreground=getattr(self.app, "scroll_event_color", "#EC4899"))
         for start, end, count in self._scroll_groups:
             if start in self._expanded_scroll_groups:
                 continue
@@ -14428,7 +14428,7 @@ class SequentStudioGraph(tk.Frame):
             selected=i==self.selected_action
             color='#E9AD4D' if self.app is not None and self._preset == getattr(self.app,'_graph_running_preset',None) and i == getattr(self.app,'current_action_idx',-1) and self.app.playing else '#58C9D0' if selected else '#4A5972'
             c.create_rectangle(x1,y1,x2,y2,fill='#263145',outline=color,width=2 if selected else 1,tags=(f'n{i}','node'))
-            c.create_rectangle(x1,y1,x1+5*self.scale,y2,fill='#58C9D0' if typ in ('if_dynamic','loop_start') else getattr(self.app, 'mouse_click_color', '#EF4444') if typ == 'click' else '#7A89C4',outline='',tags=(f'n{i}','node'))
+            c.create_rectangle(x1,y1,x1+5*self.scale,y2,fill='#58C9D0' if typ in ('if_dynamic','loop_start') else getattr(self.app, 'mouse_click_color', '#EF4444') if typ == 'click' else getattr(self.app, 'scroll_event_color', '#EC4899') if typ == 'scroll' else '#7A89C4',outline='',tags=(f'n{i}','node'))
             c.create_text(x1+12*self.scale,y1+20*self.scale,anchor='w',text=f'{i+1:03}  {typ.replace("_"," ").upper()[:25]}',fill='#ACBED5',font=('Segoe UI',max(7,int(9*self.scale))),tags=(f'n{i}','node'))
             desc=str(act.get('name') or act.get('label') or act.get('mode') or act.get('text') or typ)
             c.create_text(x1+12*self.scale,y1+44*self.scale,anchor='w',text=desc[:31],fill='white',font=('Segoe UI',max(8,int(10*self.scale)),'bold'),tags=(f'n{i}','node'))
@@ -15110,7 +15110,7 @@ class SequentPlaybackGraph(SequentStudioGraph):
             c.create_rectangle(x1,y1,x2,y2,fill='#263145',outline=col,width=2 if selected or active else 1,
                                tags=(f'n{start}','node'))
             c.create_rectangle(x1,y1,x1+5*scale,y2,
-                               fill='#58C9D0' if typ in ('if_dynamic','loop_start') else getattr(self.app, 'mouse_click_color', '#EF4444') if typ == 'click' else '#8F76D9' if typ=='input_group' else '#7A89C4',
+                               fill='#58C9D0' if typ in ('if_dynamic','loop_start') else getattr(self.app, 'mouse_click_color', '#EF4444') if typ == 'click' else getattr(self.app, 'scroll_event_color', '#EC4899') if typ == 'scroll' or (typ == 'input_group' and node.get('scrolls') and not node.get('moves')) else '#8F76D9' if typ=='input_group' else '#7A89C4',
                                outline='',tags=(f'n{start}','node'))
             if typ=='input_group':
                 count=node['end']-start
@@ -15437,6 +15437,7 @@ class BuiltInMacroApp:
         # Theme & Entertainment Mode State
         self.theme_mode = "Dark"
         self.mouse_click_color = "#EF4444"
+        self.scroll_event_color = "#EC4899"
         self.light_mode = False  # Kept for backward-compatible settings files.
         self.accent_color = DEFAULT_ACCENT_COLOR
         self.gradient_enabled = False
@@ -17899,7 +17900,8 @@ class BuiltInMacroApp:
         if act_type == "disclaimer": return SYNTAX_ORANGE
         if act_type in ("wait_pixel", "wait_text", "find_color", "find_text"): return COLOR_SUCCESS
         if act_type == "click": return self.mouse_click_color
-        if act_type in ("move", "drag", "scroll"): return SYNTAX_BLUE
+        if act_type == "scroll": return self.scroll_event_color
+        if act_type in ("move", "drag"): return SYNTAX_BLUE
         if act_type in ("key", "press", "enter", "backspace"): return SYNTAX_ORANGE
         if act_type in ("combo", "select_all", "copy", "paste", "delay", "search_area"): return SYNTAX_PURPLE
         return TEXT_PRIMARY
@@ -19343,6 +19345,10 @@ try {{
                     self.mouse_click_color = normalize_accent_color(config.get("mouse_click_color", "#EF4444"))
                 except ValueError:
                     self.mouse_click_color = "#EF4444"
+                try:
+                    self.scroll_event_color = normalize_accent_color(config.get("scroll_event_color", "#EC4899"))
+                except ValueError:
+                    self.scroll_event_color = "#EC4899"
                 self.gradient_enabled = bool(config.get("gradient_enabled", False))
                 try:
                     self.gradient_second_color = normalize_accent_color(
@@ -19377,6 +19383,7 @@ try {{
             "theme_mode": self.theme_mode,
             "accent_color": self.accent_color,
             "mouse_click_color": self.mouse_click_color,
+            "scroll_event_color": self.scroll_event_color,
             "gradient_enabled": self.gradient_enabled,
             "gradient_second_color": self.gradient_second_color,
             "entertain_me": self.entertain_me,
@@ -20004,6 +20011,24 @@ try {{
         sequent_toolbar_button(click_row, "Apply", self.apply_mouse_click_color).pack(side=tk.LEFT)
         sequent_toolbar_button(click_row, "Reset", lambda: self.set_mouse_click_color("#EF4444")).pack(side=tk.LEFT, padx=(6, 0))
 
+        scroll_row = tk.Frame(parent, bg=BG_PANEL)
+        scroll_row.pack(fill=tk.X, pady=(5, 6))
+        tk.Label(scroll_row, text="Scroll Event Color", font=("Segoe UI", 9, "bold"),
+                 bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        self.scroll_color_swatch = tk.Label(scroll_row, text="  ", width=3,
+                                            bg=self.scroll_event_color, relief="flat",
+                                            highlightbackground=BG_BORDER, highlightthickness=1)
+        self.scroll_color_swatch.pack(side=tk.LEFT, padx=(0, 7))
+        self.scroll_color_hex_var = tk.StringVar(value=self.scroll_event_color)
+        scroll_entry = tk.Entry(scroll_row, textvariable=self.scroll_color_hex_var, width=10,
+                                bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                                highlightthickness=1, highlightbackground=BG_BORDER,
+                                font=("Consolas", 10), relief="flat")
+        scroll_entry.pack(side=tk.LEFT, padx=(0, 6), ipady=4)
+        scroll_entry.bind("<Return>", lambda event: self.apply_scroll_event_color())
+        sequent_toolbar_button(scroll_row, "Apply", self.apply_scroll_event_color).pack(side=tk.LEFT)
+        sequent_toolbar_button(scroll_row, "Reset", lambda: self.set_scroll_event_color("#EC4899")).pack(side=tk.LEFT, padx=(6, 0))
+
         gradient_row = tk.Frame(parent, bg=BG_PANEL)
         gradient_row.pack(fill=tk.X, pady=(8, 3))
         self.gradient_enabled_var = tk.BooleanVar(value=self.gradient_enabled)
@@ -20118,6 +20143,26 @@ try {{
             self.click_color_hex_var.set(color)
         if hasattr(self, "click_color_swatch") and self.click_color_swatch.winfo_exists():
             self.click_color_swatch.config(bg=color)
+        self.save_settings()
+        if hasattr(self, "recorded_actions") and hasattr(self, "queue_viewer"):
+            self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+        graph = getattr(self, "studio_timeline", None)
+        if graph is not None and graph.winfo_exists():
+            graph._draw()
+
+    def apply_scroll_event_color(self):
+        try:
+            self.set_scroll_event_color(self.scroll_color_hex_var.get())
+        except ValueError:
+            messagebox.showerror("Scroll Event Color", "Enter a valid six-digit hex color (for example #EC4899).", parent=self.root)
+
+    def set_scroll_event_color(self, value):
+        color = normalize_accent_color(value)
+        self.scroll_event_color = color
+        if hasattr(self, "scroll_color_hex_var"):
+            self.scroll_color_hex_var.set(color)
+        if hasattr(self, "scroll_color_swatch") and self.scroll_color_swatch.winfo_exists():
+            self.scroll_color_swatch.config(bg=color)
         self.save_settings()
         if hasattr(self, "recorded_actions") and hasattr(self, "queue_viewer"):
             self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
