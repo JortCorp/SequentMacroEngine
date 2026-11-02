@@ -13668,6 +13668,220 @@ class StudioTimeline(tk.Frame):
             return 'break'
 
 
+
+class SequentWorkflowWindow:
+    """Non-destructive visual workflow explorer for the existing action queue.
+
+    Phase 1: graph visualization, pan/zoom, selection, and inspector.
+    Does not rewrite execution order or action dictionaries.
+    """
+    NODE_W = 230
+    NODE_H = 76
+
+    def __init__(self, app):
+        self.app = app
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Sequent — Visual Workflow")
+        self.win.geometry("1120x720")
+        self.win.minsize(680, 420)
+        self.win.configure(bg="#171B24")
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self.scale = 1.0
+        self.pan_x, self.pan_y = 65, 65
+        self.selected = None
+        self.positions = {}
+        self._drag = None
+        self._pan = None
+        self._snapshot = []
+        self._build()
+        self.refresh()
+
+    def close(self):
+        self.app._workflow_window = None
+        self.win.destroy()
+
+    def _build(self):
+        top = tk.Frame(self.win, bg="#202633", height=52)
+        top.pack(side=tk.TOP, fill=tk.X)
+        top.pack_propagate(False)
+        tk.Label(top, text="◈  VISUAL WORKFLOW", bg="#202633", fg="#F0F3FF",
+                 font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, padx=16)
+        for title, callback in (("Refresh", self.refresh),
+                                ("Fit", self.fit),
+                                ("−", lambda: self.zoom(.85)),
+                                ("+", lambda: self.zoom(1.15))):
+            tk.Button(top, text=title, command=callback, bg="#303A4C",
+                      fg="#E5E9F4", relief=tk.FLAT, bd=0,
+                      activebackground="#45516A", activeforeground="#FFFFFF",
+                      padx=11, pady=5).pack(side=tk.RIGHT, padx=4, pady=8)
+        main = tk.PanedWindow(self.win, orient=tk.HORIZONTAL, bg="#171B24",
+                              sashwidth=5, bd=0, relief=tk.FLAT)
+        main.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(main, bg="#171B24", bd=0,
+                                highlightthickness=0, cursor="fleur")
+        main.add(self.canvas, minsize=350, stretch="always")
+        side = tk.Frame(main, bg="#202633", width=270)
+        main.add(side, minsize=220, stretch="never")
+        tk.Label(side, text="INSPECTOR", bg="#202633", fg="#9EAEC7",
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(18, 8))
+        self.info = tk.Text(side, bg="#202633", fg="#E6EBF6", bd=0,
+                            relief=tk.FLAT, wrap=tk.WORD, font=("Consolas", 10),
+                            state=tk.DISABLED, padx=14, pady=8)
+        self.info.pack(fill=tk.BOTH, expand=True)
+        tk.Button(side, text="Select in Action Queue", command=self.select_queue,
+                  bg="#424A70", fg="#FFFFFF", relief=tk.FLAT, bd=0,
+                  padx=12, pady=9).pack(fill=tk.X, padx=12, pady=12)
+        tk.Label(self.win, text="Drag nodes to arrange • Drag empty space to pan • Mouse wheel to zoom • Click a node to inspect • Layout is visual only",
+                 bg="#202633", fg="#AEB9CD", anchor="w",
+                 font=("Segoe UI", 9)).pack(side=tk.BOTTOM, fill=tk.X, ipady=6)
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._motion)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.canvas.bind("<MouseWheel>", self._wheel)
+        self.canvas.bind("<Button-4>", lambda e: self.zoom(1.1, e.x, e.y))
+        self.canvas.bind("<Button-5>", lambda e: self.zoom(.9, e.x, e.y))
+        self.canvas.bind("<Configure>", lambda e: self.draw())
+
+    def refresh(self):
+        self._snapshot = list(self.app.recorded_actions)
+        self.positions = {i: self.positions.get(i, (i % 4 * 300, i // 4 * 170))
+                          for i in range(len(self._snapshot))}
+        if self.selected is not None and self.selected >= len(self._snapshot):
+            self.selected = None
+        self.draw()
+        self.inspect()
+
+    def _to_screen(self, x, y):
+        return self.pan_x + x * self.scale, self.pan_y + y * self.scale
+
+    def _to_world(self, x, y):
+        return (x-self.pan_x)/self.scale, (y-self.pan_y)/self.scale
+
+    def draw(self):
+        c = self.canvas
+        c.delete("all")
+        width, height = c.winfo_width(), c.winfo_height()
+        spacing = 32 * self.scale
+        if spacing >= 10:
+            for x in range(int(self.pan_x % spacing), width, int(spacing)):
+                for y in range(int(self.pan_y % spacing), height, int(spacing)):
+                    c.create_oval(x, y, x+1, y+1, fill="#303848", outline="")
+        accent = getattr(self.app, "accent_color", "#8B5CF6")
+        for i in range(len(self._snapshot)-1):
+            ax, ay = self.positions[i]
+            bx, by = self.positions[i+1]
+            x1,y1 = self._to_screen(ax+self.NODE_W, ay+self.NODE_H/2)
+            x2,y2 = self._to_screen(bx, by+self.NODE_H/2)
+            mid = (x1+x2)/2
+            c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,fill="#64728C",
+                          width=max(1,2*self.scale),smooth=True)
+        for i, action in enumerate(self._snapshot):
+            x,y = self.positions[i]
+            x1,y1 = self._to_screen(x,y)
+            x2,y2 = self._to_screen(x+self.NODE_W,y+self.NODE_H)
+            if x2 < 0 or y2 < 0 or x1 > width or y1 > height:
+                continue
+            chosen = i == self.selected
+            border = accent if chosen else "#46546B"
+            c.create_rectangle(x1,y1,x2,y2,fill="#293244",
+                               outline=border,width=2 if chosen else 1,
+                               tags=(f"node_{i}", "node"))
+            bar = max(3,5*self.scale)
+            c.create_rectangle(x1,y1,x1+bar,y2,fill=accent,outline="",
+                               tags=(f"node_{i}", "node"))
+            kind = str(action.get("type", "Action")).replace("_"," ").title()
+            label = str(action.get("label") or action.get("name") or kind)
+            label = label[:34] + ("…" if len(label)>34 else "")
+            c.create_text(x1+14*self.scale,y1+21*self.scale,anchor="w",
+                          text=f"{i+1:03d}  {kind[:27]}",fill="#AAB8D0",
+                          font=("Segoe UI",max(7,int(9*self.scale))),
+                          tags=(f"node_{i}", "node"))
+            c.create_text(x1+14*self.scale,y1+48*self.scale,anchor="w",
+                          text=label,fill="#F2F5FA",
+                          font=("Segoe UI",max(8,int(11*self.scale)),"bold"),
+                          tags=(f"node_{i}", "node"))
+        if not self._snapshot:
+            c.create_text(width/2,height/2,
+                          text="No actions in the queue yet.\nRecord or add actions, then click Refresh.",
+                          fill="#B3BED0",font=("Segoe UI",13),justify="center")
+
+    def _hit(self, x, y):
+        wx,wy = self._to_world(x,y)
+        for i in reversed(range(len(self._snapshot))):
+            nx,ny = self.positions[i]
+            if nx <= wx <= nx+self.NODE_W and ny <= wy <= ny+self.NODE_H:
+                return i
+        return None
+
+    def _press(self,event):
+        hit = self._hit(event.x,event.y)
+        self.selected = hit
+        self.inspect()
+        if hit is None:
+            self._pan = (event.x,event.y,self.pan_x,self.pan_y)
+            self._drag = None
+        else:
+            wx,wy = self._to_world(event.x,event.y)
+            nx,ny = self.positions[hit]
+            self._drag = (hit,wx-nx,wy-ny)
+            self._pan = None
+        self.draw()
+
+    def _motion(self,event):
+        if self._drag is not None:
+            idx,dx,dy = self._drag
+            wx,wy = self._to_world(event.x,event.y)
+            self.positions[idx] = (wx-dx,wy-dy)
+        elif self._pan is not None:
+            sx,sy,px,py = self._pan
+            self.pan_x,self.pan_y = px+event.x-sx,py+event.y-sy
+        self.draw()
+
+    def _release(self,event):
+        self._drag = None
+        self._pan = None
+
+    def _wheel(self,event):
+        self.zoom(1.1 if event.delta>0 else .9,event.x,event.y)
+
+    def zoom(self,factor,x=None,y=None):
+        x = self.canvas.winfo_width()/2 if x is None else x
+        y = self.canvas.winfo_height()/2 if y is None else y
+        wx,wy = self._to_world(x,y)
+        self.scale = min(2.2,max(.45,self.scale*factor))
+        self.pan_x,self.pan_y = x-wx*self.scale,y-wy*self.scale
+        self.draw()
+
+    def fit(self):
+        if not self.positions:
+            return
+        max_x = max(x+self.NODE_W for x,y in self.positions.values())
+        max_y = max(y+self.NODE_H for x,y in self.positions.values())
+        self.scale = max(.45,min(1.0,(self.canvas.winfo_width()-80)/max_x,
+                                (self.canvas.winfo_height()-80)/max_y))
+        self.pan_x,self.pan_y = 40,40
+        self.draw()
+
+    def inspect(self):
+        self.info.configure(state=tk.NORMAL)
+        self.info.delete("1.0",tk.END)
+        if self.selected is None:
+            self.info.insert(tk.END,"Select a node to inspect its existing action settings.")
+        else:
+            action = self._snapshot[self.selected]
+            self.info.insert(tk.END,f"ACTION {self.selected+1}\n\n")
+            for key,value in action.items():
+                display = repr(value)
+                if len(display)>220:
+                    display=display[:217]+"..."
+                self.info.insert(tk.END,f"{key}\n  {display}\n\n")
+        self.info.configure(state=tk.DISABLED)
+
+    def select_queue(self):
+        if self.selected is not None:
+            self.app.set_active_action_index(self.selected)
+            self.app.root.lift()
+
 class BuiltInMacroApp:
     def __init__(self, root):
         self.root = root
@@ -13845,6 +14059,9 @@ class BuiltInMacroApp:
         self.root.configure(bg=BG_APP)
 
         self.setup_ui()
+        self._workflow_window = None
+        self.root.bind("<Control-Shift-w>", self.open_visual_workflow, add="+")
+        self.root.bind("<Control-Shift-W>", self.open_visual_workflow, add="+")
         self.ghost_reticle = GhostReticle(self.root)
         self._reticle_edit_index = None
         self.refresh_preset_menu()
@@ -13856,6 +14073,20 @@ class BuiltInMacroApp:
         self._autosave_job = self.root.after(600, self._autosave_tick)
 
     
+    def open_visual_workflow(self, event=None):
+        """Open a safe, separate visual explorer without changing macro execution."""
+        existing = getattr(self, "_workflow_window", None)
+        if existing is not None:
+            try:
+                if existing.win.winfo_exists():
+                    existing.win.lift()
+                    existing.refresh()
+                    return "break"
+            except tk.TclError:
+                pass
+        self._workflow_window = SequentWorkflowWindow(self)
+        return "break"
+
     def set_app_window(self):
         # This helper is also invoked after the Mini HUD and screen selection.
         # Never switch a natively managed window back to borderless mode.
@@ -18407,151 +18638,82 @@ try {{
         return window
 
     def build_appearance_settings(self, parent):
-        """GitHub-inspired theme cards, accent swatches, and independent light/dark presets."""
-        heading = tk.Frame(parent, bg=BG_PANEL)
-        heading.pack(fill=tk.X, pady=(2, 12))
-        tk.Label(heading, text="Appearance", font=("Segoe UI", 16, "bold"),
-                 bg=BG_PANEL, fg=TEXT_PRIMARY).pack(anchor="w")
-        tk.Label(heading, text="Choose a theme and accent. Changes are saved automatically.",
-                 bg=BG_PANEL, fg=TEXT_MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 0))
-
+        """Persistent, easy-to-read theme selector and shared accent picker."""
         theme_row = tk.Frame(parent, bg=BG_PANEL)
-        theme_row.pack(fill=tk.X, pady=(0, 12))
-        tk.Label(theme_row, text="Theme mode", bg=BG_PANEL, fg=TEXT_PRIMARY,
-                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        theme_row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(theme_row, text="Application Theme", font=("Segoe UI", 9, "bold"),
+                 bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
         self.theme_mode_var = tk.StringVar(value=self.theme_mode)
-        menu = tk.OptionMenu(theme_row, self.theme_mode_var, "Match System", "Light", "Dark",
-                             command=self.set_theme_mode)
-        menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, relief="flat",
-                    highlightthickness=1, highlightbackground=BG_BORDER, width=20)
-        menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
-        menu.pack(anchor="w", pady=(5, 0))
+        theme_menu = tk.OptionMenu(theme_row, self.theme_mode_var,
+                                   "Dark", "Light", "Match System", command=self.set_theme_mode)
+        theme_menu.configure(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
+                             activeforeground=TEXT_PRIMARY, font=("Segoe UI", 9),
+                             highlightthickness=1, highlightbackground=BG_BORDER,
+                             bd=0, relief="flat", width=16, anchor="w")
+        theme_menu["menu"].configure(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                      activebackground=COLOR_ACCENT,
+                                      activeforeground=TEXT_ON_ACCENT, bd=1, relief="flat")
+        theme_menu.pack(side=tk.LEFT)
 
-        tk.Label(parent, text="THEMES", bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(4, 6))
-        cards = tk.Frame(parent, bg=BG_PANEL)
-        cards.pack(fill=tk.X, pady=(0, 12))
-        self.appearance_theme_cards = {}
-        for theme in ("Light", "Dark"):
-            frame = tk.Frame(cards, bg=BG_PANEL, highlightthickness=2,
-                             highlightbackground=BG_BORDER)
-            frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
-                       padx=(0, 8) if theme == "Light" else (0, 0))
-            title = tk.Frame(frame, bg=BG_PANEL)
-            title.pack(fill=tk.X, padx=10, pady=(9, 4))
-            tk.Label(title, text=theme + " theme", bg=BG_PANEL, fg=TEXT_PRIMARY,
-                     font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
-            preview = tk.Canvas(frame, height=100, bg="#F4F5F8" if theme == "Light" else "#171A22",
-                                highlightthickness=0, cursor="hand2")
-            preview.pack(fill=tk.X, padx=8, pady=(5, 6))
-            def paint(event=None, canvas=preview, mode=theme):
-                canvas.delete("all")
-                w = max(40, canvas.winfo_width())
-                dark = mode == "Dark"
-                panel = "#272B36" if dark else "#FFFFFF"
-                ink = "#C4CBD7" if dark else "#636C7A"
-                color = self.accent_color
-                canvas.create_rectangle(0, 0, w, 100, fill=panel, outline="")
-                canvas.create_rectangle(0, 0, w, 18, fill="#353A46" if dark else "#E5E9F0", outline="")
-                for x in (12, 37, 62):
-                    canvas.create_line(x, 9, x+14, 9, fill=ink, width=4, capstyle="round")
-                canvas.create_rectangle(9, 27, w*.30, 91, fill="#20242E" if dark else "#EEF0F5", outline="")
-                canvas.create_rectangle(15, 35, w*.30-6, 42, fill=color, outline="")
-                canvas.create_line(w*.37, 36, w*.72, 36, fill=ink, width=5, capstyle="round")
-                canvas.create_rectangle(w*.37, 50, w-10, 68, fill=color, outline="")
-                canvas.create_line(w*.37, 81, w*.80, 81, fill=ink, width=4, capstyle="round")
-            preview.bind("<Configure>", paint)
-            preview.bind("<Button-1>", lambda e, mode=theme: self.set_theme_mode(mode))
-            bottom = tk.Frame(frame, bg=BG_PANEL)
-            bottom.pack(fill=tk.X, padx=10, pady=(2, 9))
-            tk.Label(bottom, text=theme + " default", bg=BG_PANEL,
-                     fg=TEXT_PRIMARY).pack(side=tk.LEFT)
-            self.appearance_theme_cards[theme] = frame
+        accent_row = tk.Frame(parent, bg=BG_PANEL)
+        accent_row.pack(fill=tk.X, pady=(3, 5))
+        tk.Label(accent_row, text="Accent Color", font=("Segoe UI", 9, "bold"),
+                 bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        self.accent_swatch = tk.Label(accent_row, text="  ", width=3,
+                                       bg=self.accent_color, relief="flat",
+                                       highlightbackground=BG_BORDER, highlightthickness=1)
+        self.accent_swatch.pack(side=tk.LEFT, padx=(0, 7))
+        self.accent_hex_var = tk.StringVar(value=self.accent_color)
+        entry = tk.Entry(accent_row, textvariable=self.accent_hex_var, width=10,
+                         bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                         highlightthickness=1, highlightbackground=BG_BORDER,
+                         font=("Consolas", 10), relief="flat")
+        entry.pack(side=tk.LEFT, padx=(0, 6), ipady=4)
+        entry.bind("<Return>", lambda event: self.apply_accent_hex())
+        sequent_toolbar_button(accent_row, "Apply", self.apply_accent_hex).pack(side=tk.LEFT, padx=(0, 6))
+        sequent_toolbar_button(accent_row, "Customize...", self.choose_accent_color).pack(side=tk.LEFT)
 
-        tk.Label(parent, text="ACCENT COLORS", bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(4, 6))
-        swatches = tk.Frame(parent, bg=BG_PANEL)
-        swatches.pack(fill=tk.X, pady=(0, 12))
-        choices = [
-            ("Purple", "#9361FF", None), ("Blue", "#378CF5", None),
-            ("Emerald", "#00B88C", None), ("Purple / Cyan", "#9361FF", "#00D4FF"),
-            ("Sunset", "#FF6B81", "#FFB347"), ("Aurora", "#00C896", "#5E79FF"),
-            ("Rose", "#FF58B4", "#A05CFF")]
-        for name, first, second in choices:
-            sw = tk.Canvas(swatches, width=38, height=38, bg=BG_PANEL,
-                           highlightthickness=0, cursor="hand2")
-            sw.pack(side=tk.LEFT, padx=(0, 6))
-            def draw(event=None, canvas=sw, a=first, b=second):
-                canvas.delete("all")
-                canvas.create_oval(2, 2, 36, 36, fill=a, outline=BG_BORDER, width=2)
-                if b:
-                    canvas.create_arc(2, 2, 36, 36, start=270, extent=180,
-                                      fill=b, outline="")
-                selected = (self.accent_color == a and
-                            self.gradient_enabled == bool(b) and
-                            (not b or self.gradient_second_color == b))
-                if selected:
-                    canvas.create_oval(0, 0, 38, 38, outline=TEXT_PRIMARY, width=2)
-            sw.bind("<Expose>", draw)
-            sw.after_idle(draw)
-            sw.bind("<Button-1>", lambda e, a=first, b=second:
-                    self.select_appearance_preset(a, b))
-            ModernTooltip(sw, name)
-
+        gradient_row = tk.Frame(parent, bg=BG_PANEL)
+        gradient_row.pack(fill=tk.X, pady=(8, 3))
         self.gradient_enabled_var = tk.BooleanVar(value=self.gradient_enabled)
-        tk.Checkbutton(parent, text="Use two-color gradient",
+        tk.Checkbutton(gradient_row, text="Two-color gradient accents",
                        variable=self.gradient_enabled_var, command=self.apply_gradient_settings,
                        bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_PANEL,
-                       selectcolor=BG_INPUT).pack(anchor="w", pady=(0, 8))
-        for label, attr, initial, callback in (
-                ("Primary color", "accent_hex_var", self.accent_color, self.apply_accent_hex),
-                ("Secondary color", "gradient_second_var", self.gradient_second_color,
-                 self.apply_gradient_settings)):
-            row = tk.Frame(parent, bg=BG_PANEL)
-            row.pack(fill=tk.X, pady=(0, 7))
-            tk.Label(row, text=label, width=19, anchor="w", bg=BG_PANEL,
-                     fg=TEXT_PRIMARY).pack(side=tk.LEFT)
-            var = tk.StringVar(value=initial)
-            setattr(self, attr, var)
-            tk.Entry(row, textvariable=var, width=10, bg=BG_INPUT, fg=TEXT_PRIMARY,
-                     insertbackground=TEXT_PRIMARY, bd=0).pack(side=tk.LEFT, padx=(0, 8), ipady=4)
-            sequent_toolbar_button(row, "Apply", callback).pack(side=tk.LEFT, padx=(0, 6))
-            picker = self.choose_accent_color if attr == "accent_hex_var" else self.choose_gradient_second_color
-            sequent_toolbar_button(row, "Customize...", picker).pack(side=tk.LEFT)
-        self.accent_swatch = tk.Label(parent, bg=self.accent_color, height=0)
+                       selectcolor=BG_INPUT).pack(side=tk.LEFT)
+        second_row = tk.Frame(parent, bg=BG_PANEL)
+        second_row.pack(fill=tk.X, pady=(2, 4))
+        tk.Label(second_row, text="Second Gradient Color", bg=BG_PANEL,
+                 fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        self.gradient_second_var = tk.StringVar(value=self.gradient_second_color)
+        tk.Entry(second_row, textvariable=self.gradient_second_var, width=10,
+                 bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                 relief="flat").pack(side=tk.LEFT, padx=(0, 6), ipady=4)
+        sequent_toolbar_button(second_row, "Apply Gradient",
+                               self.apply_gradient_settings).pack(side=tk.LEFT, padx=(0, 6))
+        sequent_toolbar_button(second_row, "Customize...",
+                               self.choose_gradient_second_color).pack(side=tk.LEFT)
         self.gradient_preview = SequentGradientStrip(
-            parent, self.accent_color,
-            self.gradient_second_color if self.gradient_enabled else self.accent_color,
-            height=12, bg=BG_PANEL)
-        self.gradient_preview.pack(fill=tk.X, pady=(7, 13))
-        self.gradient_second_var.trace_add("write", lambda *_: self._preview_gradient_settings())
-        sequent_toolbar_button(parent, "Restore default appearance",
-                               lambda: self.select_appearance_preset(DEFAULT_ACCENT_COLOR, None)
-                               ).pack(anchor="w", pady=(0, 10))
-        self._refresh_appearance_cards()
+            parent, self.accent_color, self.gradient_second_color, height=9, bg=BG_PANEL)
+        self.gradient_preview.pack(fill=tk.X, pady=(2, 8))
+        self.gradient_second_var.trace_add('write', lambda *_: self._preview_gradient_settings())
 
-    def _refresh_appearance_cards(self):
-        for name, card in getattr(self, "appearance_theme_cards", {}).items():
-            try:
-                card.config(highlightbackground=COLOR_ACCENT if
-                            self.resolve_theme_mode().lower() == name.lower() else BG_BORDER)
-            except tk.TclError:
-                pass
-
-    def select_appearance_preset(self, primary, secondary=None):
-        self.accent_color = normalize_accent_color(primary)
-        if secondary:
-            self.gradient_second_color = normalize_accent_color(secondary)
-        self.gradient_enabled = bool(secondary)
-        if hasattr(self, "accent_hex_var"):
-            self.accent_hex_var.set(self.accent_color)
-        if hasattr(self, "gradient_second_var"):
-            self.gradient_second_var.set(self.gradient_second_color)
-        if hasattr(self, "gradient_enabled_var"):
-            self.gradient_enabled_var.set(self.gradient_enabled)
-        self._persist_appearance()
-        self.apply_theme(self.resolve_theme_mode())
-        self.update_status("Appearance preset applied", COLOR_SUCCESS)
+        presets_row = tk.Frame(parent, bg=BG_PANEL)
+        presets_row.pack(fill=tk.X, pady=(0, 9))
+        tk.Label(presets_row, text="Quick Colors", font=("Segoe UI", 9),
+                 bg=BG_PANEL, fg=TEXT_MUTED, width=24, anchor="w").pack(side=tk.LEFT)
+        for name, value in ACCENT_PRESETS:
+            selected = (value.upper() == self.accent_color)
+            swatch = tk.Button(presets_row, text="", width=2, height=1,
+                               bg=value, activebackground=value, relief="flat",
+                               bd=0, cursor="hand2", takefocus=True,
+                               highlightthickness=2 if selected else 1,
+                               highlightbackground=TEXT_PRIMARY if selected else BG_BORDER,
+                               command=lambda chosen=value: self.set_accent_color(chosen))
+            swatch.pack(side=tk.LEFT, padx=(0, 5))
+            ModernTooltip(swatch, name)
+        sequent_toolbar_button(presets_row, "Reset", lambda: self.set_accent_color(DEFAULT_ACCENT_COLOR)).pack(side=tk.LEFT, padx=(7, 0))
+        tk.Label(parent, text="Saved automatically. Match System follows Windows app theme.",
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=("Segoe UI", 8), anchor="w").pack(fill=tk.X, pady=(0, 9))
 
     def resolve_theme_mode(self):
         if self.theme_mode == "Light":
@@ -18600,7 +18762,6 @@ try {{
         desired = self.resolve_theme_mode()
         if desired != self._effective_theme:
             self.apply_theme(desired)
-        self._refresh_appearance_cards()
         self.update_status(f"Theme: {value}", COLOR_SUCCESS)
 
     def set_light_mode(self, enabled):
