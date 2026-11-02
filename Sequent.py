@@ -6669,7 +6669,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter_frame.pack(side=tk.LEFT, fill=tk.Y)
 
         self.gutter_margin = tk.Canvas(
-            self.gutter_frame, width=22, bg=BG_GUTTER,
+            self.gutter_frame, width=44, bg=BG_GUTTER,
             highlightthickness=0, bd=0, cursor="hand2"
         )
         self.gutter_margin.pack(side=tk.LEFT, fill=tk.Y)
@@ -6723,6 +6723,7 @@ class VSCodeQueueViewer(tk.Frame):
             w.bind("<Button-3>", self._on_right_click)
 
         self.gutter_margin.bind("<Button-1>", self._on_gutter_margin_click)
+        self.gutter_margin.bind("<Configure>", lambda event: self.redraw_typing_disclosures())
         self.gutter.bind("<Button-1>", self._on_gutter_click)
         self.code_text.bind("<Button-1>", self._on_code_click)
         self.bind("<MouseWheel>", self._on_mousewheel)
@@ -6752,7 +6753,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter.tag_raise("active_line")
 
 
-    def fold_typed_text(self, actions):
+    def fold_typed_text(self, actions, expanded_groups=()):
         """Collapse consecutive keys in both Tk Text widgets, keeping line indices.
 
         Elided lines still exist in the underlying Text buffers: every Playback
@@ -6762,11 +6763,18 @@ class VSCodeQueueViewer(tk.Frame):
         self._text_group_by_index = {start: (start, end, text)
                                      for start, end, text in self._text_groups}
         self._text_group_starts = [start for start, _, _ in self._text_groups]
-        self._expanded_text_groups.clear()
+        preserve = set(expanded_groups)
+        self._expanded_text_groups = {
+            start for start, end, text in self._text_groups
+            if (start, end, text) in preserve
+        }
         self.code_text.tag_configure('typed_fold_hidden', elide=True)
         self.gutter.tag_configure('typed_fold_hidden', elide=True)
         self.code_text.tag_configure('typed_fold_title', foreground=SYNTAX_ORANGE)
         for start, end, text in self._text_groups:
+            if start in self._expanded_text_groups:
+                # The queue was freshly repainted with its original action rows.
+                continue
             line = start + 2
             title = sequent_typed_group_caption(start, end, text)
             self.code_text.delete(f'{line}.0', f'{line}.end')
@@ -6803,6 +6811,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.insert(f'{line}.0', self.app.get_action_summary(self.app.recorded_actions[start]), 'typed_fold_title')
         for widget in (self.code_text, self.gutter):
             widget.tag_remove('typed_fold_hidden', f'{start+3}.0', f'{end+2}.0')
+        self.redraw_breakpoints()
         return True
 
     def collapse_typed_text(self, index):
@@ -6823,7 +6832,49 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.insert(f'{line}.0', title, 'typed_fold_title')
         for widget in (self.code_text, self.gutter):
             widget.tag_add('typed_fold_hidden', f'{start+3}.0', f'{end+2}.0')
+        self.redraw_breakpoints()
         return True
+
+    def toggle_typed_text(self, index):
+        """Expand/collapse an existing typing session without touching actions."""
+        if self.collapse_typed_text(index) or self.expand_typed_text(index):
+            self.redraw_breakpoints()  # Also refresh gutter disclosure triangles.
+            return True
+        return False
+
+    def redraw_typing_disclosures(self):
+        """Draw arrows only for group headers visible in the scrolled gutter.
+
+        This is independent of per-keystroke data: even extremely long groups
+        require just one triangle, and hidden lines never get a triangle.
+        """
+        self.gutter_margin.delete('typing_disclosure')
+        if not self._text_group_starts or self.line_count <= 1:
+            return
+        from bisect import bisect_left
+        try:
+            first = max(0, int(self.gutter.index('@0,0').split('.')[0]) - 2)
+            last = int(self.gutter.index(f'@0,{max(1, self.gutter.winfo_height())}').split('.')[0]) - 1
+            pos = bisect_left(self._text_group_starts, first)
+            for start in self._text_group_starts[pos:]:
+                if start > last:
+                    break
+                dinfo = self.gutter.dlineinfo(f'{start + 2}.0')
+                if dinfo is None:
+                    continue
+                _x, y, _w, h, _base = dinfo
+                cy = y + h / 2
+                # Left of the breakpoint dot, pointing right when collapsed
+                # and down when expanded. No emoji/font fallback differences.
+                if start in self._expanded_text_groups:
+                    coords = (5, cy-3, 15, cy-3, 10, cy+3)
+                else:
+                    coords = (7, cy-5, 7, cy+5, 13, cy)
+                self.gutter_margin.create_polygon(
+                    *coords, fill=TEXT_MUTED, outline='',
+                    tags=('typing_disclosure', f'typing_group_{start}'))
+        except tk.TclError:
+            pass
 
     def highlight_action(self, index):
         self.code_text.tag_remove("active_line", "1.0", "end")
@@ -6852,12 +6903,13 @@ class VSCodeQueueViewer(tk.Frame):
             if dinfo:
                 gx, gy, gw, gh, gbase = dinfo
                 r = 4.5
-                cx = 11
+                cx = 27  # Preserve the left gutter zone for the fold arrow.
                 cy = gy + gh // 2
                 self.gutter_margin.create_oval(
                     cx - r, cy - r, cx + r, cy + r,
                     fill=COLOR_DANGER, outline="#ff7b7b", width=1, tags="bp_dot"
                 )
+        self.redraw_typing_disclosures()
 
     def _on_gutter_margin_click(self, event):
         if not self.interactive_enabled: return
@@ -6866,9 +6918,16 @@ class VSCodeQueueViewer(tk.Frame):
         try:
             line_num = int(idx.split(".")[0])
             if line_num >= 2 and (line_num - 2) < len(self.app.recorded_actions):
-                self.app.toggle_breakpoint(line_num - 2)
-        except Exception:
+                action_idx = line_num - 2
+                if event.x < 20:
+                    # Dedicated disclosure zone: no breakpoint toggling.
+                    if action_idx in self._text_group_by_index:
+                        self.toggle_typed_text(action_idx)
+                    return 'break'
+                self.app.toggle_breakpoint(action_idx)
+        except (tk.TclError, ValueError, IndexError):
             pass
+        return 'break'
 
     def _on_text_selection_changed(self, event=None):
         if getattr(self.app, "_reticle_edit_index", None) is not None:
@@ -6955,6 +7014,8 @@ class VSCodeQueueViewer(tk.Frame):
         self._text_group_by_index = {}
         self._text_group_starts = []
         self._expanded_text_groups.clear()
+        self.gutter_margin.delete('typing_disclosure')
+        self.gutter_margin.delete('bp_dot')
         self._cancel_queue_drag()
         self.close_sub_menu()
         self.plus_btn.place_forget()
@@ -7275,7 +7336,7 @@ class VSCodeQueueViewer(tk.Frame):
         gx, gy, gw, gh, gbase = dinfo
         btn_size = 14
         btn_y = gy + (gh - btn_size) // 2
-        btn_x = (22 - btn_size) // 2
+        btn_x = 44 - btn_size
 
         self.hovered_line = line_num
         self.plus_btn.place(x=btn_x, y=btn_y, width=btn_size, height=btn_size)
@@ -14531,7 +14592,7 @@ def sequent_typed_group_caption(start, end, text):
     detail = f'{len(text):,} keys'
     if pauses:
         detail += f', {pauses:,} timing delays'
-    return f'keyboard.type_text({sequent_typed_text_preview(text)})  [{detail}; double-click to expand]'
+    return f'keyboard.type_text({sequent_typed_text_preview(text)})  [{detail}]'
 
 
 def sequent_typed_text_preview(text, limit=72):
@@ -20448,8 +20509,15 @@ try {{
         if source_label is None: 
             source_label = self.current_source_label
 
-        # Save current scroll position unless loading a completely new macro file
+        # Save the expanded typing sessions when repainting the same source.
+        # Matching includes the complete group span and text, so edits that
+        # change grouping won't accidentally reopen unrelated actions.
         old_scroll = self.queue_viewer.code_text.yview() if not is_new_source else None
+        expanded_groups = (
+            {(start, end, text) for start, end, text in self.queue_viewer._text_groups
+             if start in self.queue_viewer._expanded_text_groups}
+            if not is_new_source else set()
+        )
 
         self.current_source_label = source_label
 
@@ -20463,7 +20531,7 @@ try {{
 
         # Fold text visually in Playback but retain the original one-line-per-action
         # Text indices, which are used by edit, breakpoints and the scrubber.
-        self.queue_viewer.fold_typed_text(actions)
+        self.queue_viewer.fold_typed_text(actions, expanded_groups)
         self.update_action_count_badge()
         self.update_scrubber_ui()
         self.queue_viewer.redraw_breakpoints()
@@ -20475,6 +20543,7 @@ try {{
         if not is_new_source and old_scroll:
             self.queue_viewer.code_text.yview_moveto(old_scroll[0])
             self.queue_viewer.gutter.yview_moveto(old_scroll[0])
+        self.queue_viewer.redraw_breakpoints()
         # Queue redraws replace all text and tags. Reapply the active search
         # after restoring scroll, so the first match remains in view.
         if hasattr(self, "queue_search_var"):
