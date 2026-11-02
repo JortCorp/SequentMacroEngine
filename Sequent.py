@@ -6652,6 +6652,10 @@ class VSCodeQueueViewer(tk.Frame):
         self._move_group_by_index = {}
         self._move_group_starts = []
         self._expanded_move_groups = set()
+        self._scroll_groups = []
+        self._scroll_group_by_index = {}
+        self._scroll_group_starts = []
+        self._expanded_scroll_groups = set()
         self.hovered_line = None
         self._hover_breakpoint_line = None
         self.interactive_enabled = True
@@ -6859,6 +6863,7 @@ class VSCodeQueueViewer(tk.Frame):
             for starts, expanded, kind in (
                 (self._text_group_starts, self._expanded_text_groups, 'text'),
                 (self._move_group_starts, self._expanded_move_groups, 'mouse'),
+                (self._scroll_group_starts, self._expanded_scroll_groups, 'scroll'),
             ):
                 for start in starts[bisect_left(starts, first):]:
                     if start > last:
@@ -6904,6 +6909,70 @@ class VSCodeQueueViewer(tk.Frame):
             for widget in (self.code_text, self.gutter):
                 widget.tag_add('typed_fold_hidden', f'{start+3}.0', f'{end+2}.0')
 
+    def fold_scroll_events(self, actions, expanded_groups=()):
+        """Visually collapse consecutive scroll/wheel events, preserving action IDs."""
+        self._scroll_groups = list(sequent_scroll_event_groups(actions))
+        self._scroll_group_by_index = {start: (start, end, count)
+                                       for start, end, count in self._scroll_groups}
+        self._scroll_group_starts = [start for start, _, _ in self._scroll_groups]
+        preserve = set(expanded_groups)
+        self._expanded_scroll_groups = {
+            start for start, end, count in self._scroll_groups
+            if (start, end, count) in preserve
+        }
+        self.code_text.tag_configure('scroll_fold_title', foreground=SYNTAX_BLUE)
+        for start, end, count in self._scroll_groups:
+            if start in self._expanded_scroll_groups:
+                continue
+            line = start + 2
+            self.code_text.delete(f'{line}.0', f'{line}.end')
+            self.code_text.insert(f'{line}.0', sequent_scroll_group_caption(actions, start, end), 'scroll_fold_title')
+            for widget in (self.code_text, self.gutter):
+                widget.tag_add('typed_fold_hidden', f'{start+3}.0', f'{end+2}.0')
+
+    def _scroll_group_at(self, index, include_expanded=False):
+        if index is None or not self._scroll_groups:
+            return None
+        from bisect import bisect_right
+        k = bisect_right(self._scroll_group_starts, index) - 1
+        if k < 0:
+            return None
+        group = self._scroll_groups[k]
+        if index >= group[1] or (not include_expanded and group[0] in self._expanded_scroll_groups):
+            return None
+        return group
+
+    def expand_scroll_events(self, index):
+        group = self._scroll_group_at(index)
+        if group is None:
+            return False
+        start, end, count = group
+        self._expanded_scroll_groups.add(start)
+        line = start + 2
+        self.code_text.delete(f'{line}.0', f'{line}.end')
+        self.code_text.insert(f'{line}.0', self.app.get_action_summary(self.app.recorded_actions[start]), 'scroll_fold_title')
+        for widget in (self.code_text, self.gutter):
+            widget.tag_remove('typed_fold_hidden', f'{start+3}.0', f'{end+2}.0')
+        self.redraw_breakpoints()
+        return True
+
+    def collapse_scroll_events(self, index):
+        group = self._scroll_group_at(index, include_expanded=True)
+        if group is None or group[0] not in self._expanded_scroll_groups:
+            return False
+        start, end, count = group
+        self._expanded_scroll_groups.remove(start)
+        line = start + 2
+        self.code_text.delete(f'{line}.0', f'{line}.end')
+        self.code_text.insert(f'{line}.0', sequent_scroll_group_caption(self.app.recorded_actions, start, end), 'scroll_fold_title')
+        for widget in (self.code_text, self.gutter):
+            widget.tag_add('typed_fold_hidden', f'{start+3}.0', f'{end+2}.0')
+        self.redraw_breakpoints()
+        return True
+
+    def toggle_scroll_events(self, index):
+        return self.collapse_scroll_events(index) or self.expand_scroll_events(index)
+
     def _mouse_group_at(self, index, include_expanded=False):
         if index is None or not self._move_groups:
             return None
@@ -6918,7 +6987,7 @@ class VSCodeQueueViewer(tk.Frame):
 
     def folded_input_at(self, index):
         """Find the header representing any *collapsed* keystroke/move action."""
-        return self.folded_text_at(index) or self._mouse_group_at(index)
+        return self.folded_text_at(index) or self._mouse_group_at(index) or self._scroll_group_at(index)
 
     def expand_mouse_movements(self, index):
         group = self._mouse_group_at(index)
@@ -7020,6 +7089,8 @@ class VSCodeQueueViewer(tk.Frame):
                         self.toggle_typed_text(action_idx)
                     elif action_idx in self._move_group_by_index:
                         self.toggle_mouse_movements(action_idx)
+                    elif action_idx in self._scroll_group_by_index:
+                        self.toggle_scroll_events(action_idx)
                     return 'break'
                 if event.x < 15:
                     # Leftmost lane: breakpoint only.
@@ -7120,6 +7191,10 @@ class VSCodeQueueViewer(tk.Frame):
         self._move_group_by_index = {}
         self._move_group_starts = []
         self._expanded_move_groups.clear()
+        self._scroll_groups = []
+        self._scroll_group_by_index = {}
+        self._scroll_group_starts = []
+        self._expanded_scroll_groups.clear()
         self.gutter_margin.delete('typing_disclosure')
         self.gutter_margin.delete('bp_dot')
         self._cancel_queue_drag()
@@ -7348,6 +7423,8 @@ class VSCodeQueueViewer(tk.Frame):
             folded_text = self.folded_text_at(act_idx)
             folded_move = self._mouse_group_at(act_idx)
             expanded_move = self._mouse_group_at(act_idx, include_expanded=True)
+            folded_scroll = self._scroll_group_at(act_idx)
+            expanded_scroll = self._scroll_group_at(act_idx, include_expanded=True)
             if folded_text:
                 menu.add_command(label=f'Expand Typed Text ({folded_text[1]-folded_text[0]} actions)',
                                  command=lambda idx=act_idx: self.expand_typed_text(idx))
@@ -7355,6 +7432,10 @@ class VSCodeQueueViewer(tk.Frame):
             elif folded_move:
                 menu.add_command(label=f'Expand Mouse Movements ({folded_move[2]:,} moves)',
                                  command=lambda idx=act_idx: self.expand_mouse_movements(idx))
+                menu.add_separator()
+            elif folded_scroll:
+                menu.add_command(label=f'Expand Scroll Events ({folded_scroll[2]:,} events)',
+                                 command=lambda idx=act_idx: self.expand_scroll_events(idx))
                 menu.add_separator()
             elif any(start <= act_idx < end and start in self._expanded_text_groups
                      for start, end, _ in self._text_groups):
@@ -7365,7 +7446,11 @@ class VSCodeQueueViewer(tk.Frame):
                 menu.add_command(label='Collapse Mouse Movements',
                                  command=lambda idx=act_idx: self.collapse_mouse_movements(idx))
                 menu.add_separator()
-            folded = folded_text or folded_move
+            elif expanded_scroll and expanded_scroll[0] in self._expanded_scroll_groups:
+                menu.add_command(label='Collapse Scroll Events',
+                                 command=lambda idx=act_idx: self.collapse_scroll_events(idx))
+                menu.add_separator()
+            folded = folded_text or folded_move or folded_scroll
 
             # Copy the full highlighted range when the context row is selected.
             selected = self.selected_action_indices()
@@ -14637,6 +14722,35 @@ def sequent_mouse_movement_groups(actions, minimum=2):
         yield start, len(actions), len(actions) - start
 
 
+def sequent_scroll_event_groups(actions, minimum=2):
+    """Consecutive wheel/scroll events; clicks and other actions are boundaries."""
+    start = None
+    for i, action in enumerate(actions):
+        if isinstance(action, dict) and action.get('type') in ('scroll', 'wheel'):
+            if start is None:
+                start = i
+        elif start is not None:
+            if i - start >= minimum:
+                yield start, i, i - start
+            start = None
+    if start is not None and len(actions) - start >= minimum:
+        yield start, len(actions), len(actions) - start
+
+
+def sequent_scroll_group_caption(actions, start, end):
+    """A concise summary without changing wheel event directions or deltas."""
+    total = 0
+    valid = True
+    for action in actions[start:end]:
+        delta = action.get('delta', 0)
+        if not isinstance(delta, (int, float)):
+            valid = False
+            break
+        total += delta
+    detail = f'; net delta {total:g}' if valid else ''
+    return f'mouse.scroll_events(...)  [{end-start:,} events{detail}; actions {start+1:,}–{end:,}]'
+
+
 # Display-only typing-session detection. Real keystroke/delay actions are
 # never merged, removed, or replaced in the underlying macro.
 SEQUENT_TYPING_PAUSE_SECONDS = 0.90
@@ -20732,6 +20846,11 @@ try {{
              if start in self.queue_viewer._expanded_text_groups}
             if not is_new_source else set()
         )
+        expanded_scrolls = (
+            {(start, end, count) for start, end, count in self.queue_viewer._scroll_groups
+             if start in self.queue_viewer._expanded_scroll_groups}
+            if not is_new_source else set()
+        )
         expanded_moves = (
             {(start, end, count) for start, end, count in self.queue_viewer._move_groups
              if start in self.queue_viewer._expanded_move_groups}
@@ -20752,6 +20871,7 @@ try {{
         # Text indices, which are used by edit, breakpoints and the scrubber.
         self.queue_viewer.fold_typed_text(actions, expanded_groups)
         self.queue_viewer.fold_mouse_movements(actions, expanded_moves)
+        self.queue_viewer.fold_scroll_events(actions, expanded_scrolls)
         self.update_action_count_badge()
         self.update_scrubber_ui()
         self.queue_viewer.redraw_breakpoints()
