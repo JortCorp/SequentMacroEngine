@@ -4800,7 +4800,7 @@ def sequent_screen_outcome_config(action, found):
         target = ''
         behavior = ('Continue' if found or typ == 'search_area'
                     else 'Stop with Error')
-    if behavior not in SCREEN_OUTCOME_OPTIONS and not (typ == 'find_text' and found and behavior == 'Save Coordinates to Variables'):
+    if behavior not in SCREEN_OUTCOME_OPTIONS and not (behavior == 'Save Coordinates to Variables' and ((typ == 'find_text' and found) or typ in ('find_color', 'search_area'))):
         raise MacroExecutionError(f'Invalid {key} option: {behavior!r}')
     return behavior, str(target or '').strip()
 
@@ -4830,7 +4830,7 @@ def sequent_add_screen_outcome_editor(parent, app, action):
         tk.Label(frame, text=caption, bg=BG_PANEL, fg=TEXT_MUTED,
                  font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(0, 3))
         choice = tk.StringVar(value=mode)
-        choices = SCREEN_OUTCOME_OPTIONS + (('Save Coordinates to Variables',) if found and action.get('type') == 'find_text' else ())
+        choices = SCREEN_OUTCOME_OPTIONS + (('Save Coordinates to Variables',) if (found and action.get('type') == 'find_text') or action.get('type') in ('find_color', 'search_area') else ())
         menu = tk.OptionMenu(frame, choice, *choices)
         menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
                     highlightthickness=1, highlightbackground=BG_BORDER)
@@ -4850,7 +4850,7 @@ def sequent_add_screen_outcome_editor(parent, app, action):
             selected['kind'] = None
             mode = choice.get()
             if mode == 'Save Coordinates to Variables':
-                tk.Label(target_box, text='Save detected text coordinates as:', bg=BG_PANEL,
+                tk.Label(target_box, text=('Save detected coordinates as:' if action.get('type') == 'find_text' else 'Save current mouse coordinates as:'), bg=BG_PANEL,
                          fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
                 entries = {}
                 for field, label in (('save_x_variable', 'Found X'), ('save_y_variable', 'Found Y'),
@@ -4899,7 +4899,7 @@ def sequent_add_screen_outcome_editor(parent, app, action):
         result = {}
         for key, (choice, selected) in settings.items():
             mode = choice.get()
-            if mode not in SCREEN_OUTCOME_OPTIONS and not (key == 'if_found' and action.get('type') == 'find_text' and mode == 'Save Coordinates to Variables'):
+            if mode not in SCREEN_OUTCOME_OPTIONS and not (mode == 'Save Coordinates to Variables' and ((key == 'if_found' and action.get('type') == 'find_text') or action.get('type') in ('find_color', 'search_area'))):
                 raise MacroExecutionError(f'Invalid {key}: {mode}')
             target = ''
             if mode in ('Run Saved Macro', 'Jump to Label'):
@@ -5327,6 +5327,25 @@ def save_find_text_coordinates(app, action, box):
         raise MacroExecutionError('Invalid Find Text coordinate scope')
     for field, value in (('save_x_variable', x), ('save_y_variable', y),
                          ('save_click_x_variable', click_x), ('save_click_y_variable', click_y)):
+        name = str(action.get(field, '')).strip()
+        if name:
+            set_variable(app, name, str(value), scope)
+
+
+
+def save_current_cursor_coordinates(app, action):
+    """Store the actual cursor position at the chosen screen-search outcome.
+
+    Do not infer a target from search bounds or alter existing detection/movement.
+    The four legacy coordinate fields all represent the same actual cursor
+    location for Find Color and Search Selected Area.
+    """
+    x, y = get_mouse_pos()
+    scope = str(action.get('coordinate_scope', 'Local')).lower()
+    if scope not in ('local', 'global'):
+        raise MacroExecutionError('Invalid coordinate variable scope')
+    for field, value in (('save_x_variable', x), ('save_y_variable', y),
+                         ('save_click_x_variable', x), ('save_click_y_variable', y)):
         name = str(action.get(field, '')).strip()
         if name:
             set_variable(app, name, str(value), scope)
@@ -5968,6 +5987,13 @@ class SequentDynamicEngine:
                 if typ == 'find_text':
                     save_find_text_coordinates(self.app, action, box)
                 result.update(self._click_box(action, box))
+        # Record after the existing mouse action has finished. On a miss the
+        # cursor is not moved, so its current position is saved unchanged.
+        outcome, _ = sequent_screen_outcome_config(action, result['found'])
+        if typ in ('find_color', 'search_area') and outcome == 'Save Coordinates to Variables':
+            if not idle and not self.app.playing:
+                raise MacroCancelled('Screen search cancelled before saving coordinates')
+            save_current_cursor_coordinates(self.app, action)
         # Stop can also happen while a click/hover is being dispatched.
         if not idle and not self.app.playing:
             raise MacroCancelled('Screen search cancelled before branch')
@@ -6386,8 +6412,8 @@ class SequentDynamicEngine:
             if typ in SCREEN_RECOGNITION_TYPES:
                 match = self._recognize_screen_action(action, idle=idle)
                 behavior, target = sequent_screen_outcome_config(action, match['found'])
-                if behavior == 'Save Coordinates to Variables' and typ == 'find_text' and match['found']:
-                    # Coordinates were saved by _recognize_screen_action on a successful match.
+                if behavior == 'Save Coordinates to Variables' and ((typ == 'find_text' and match['found']) or typ in ('find_color','search_area')):
+                    # Coordinates were saved by _recognize_screen_action at the selected outcome.
                     # Treat this branch as a normal continuation.
                     behavior = 'Continue'
                 if behavior == 'Continue':
@@ -15681,7 +15707,7 @@ class SequentPlaybackGraph(SequentStudioGraph):
             return
         win=tk.Toplevel(self)
         win.title('Conditional outcomes — '+str(action['type']).replace('_',' ').title())
-        win.geometry('500x390')
+        win.geometry('520x670')
         win.configure(bg='#202633')
         win.transient(self.winfo_toplevel())
         win.grab_set()
@@ -15693,7 +15719,7 @@ class SequentPlaybackGraph(SequentStudioGraph):
             frame=tk.LabelFrame(win,text=caption,bg='#202633',fg='#A9BBD1',padx=10,pady=8)
             frame.pack(fill='x',padx=16,pady=7)
             options=list(SCREEN_OUTCOME_OPTIONS)
-            if found and action['type']=='find_text':
+            if (found and action['type']=='find_text') or action['type'] in ('find_color','search_area'):
                 options.append('Save Coordinates to Variables')
             var=tk.StringVar(value=behavior)
             opt=tk.OptionMenu(frame,var,*options)
@@ -15705,6 +15731,20 @@ class SequentPlaybackGraph(SequentStudioGraph):
             tk.Label(frame,text='Target macro or label (when applicable)',
                      bg='#202633',fg='#A9BBD1').pack(anchor='w')
             fields[found]=(var,target_var)
+        coord_frame=tk.LabelFrame(win,text='Coordinate variable names (Save Coordinates mode)',
+                                  bg='#202633',fg='white',padx=8,pady=6)
+        coord_frame.pack(fill='x',padx=16)
+        coord_fields={}
+        for key,caption in (('save_x_variable','X'),('save_y_variable','Y'),
+                            ('save_click_x_variable','Click X'),('save_click_y_variable','Click Y')):
+            r=tk.Frame(coord_frame,bg='#202633');r.pack(fill='x')
+            tk.Label(r,text=caption,width=9,anchor='w',bg='#202633',fg='white').pack(side='left')
+            var=tk.StringVar(value=str(action.get(key,'')))
+            tk.Entry(r,textvariable=var,bg='#151B27',fg='white',
+                     insertbackground='white').pack(side='left',fill='x',expand=True)
+            coord_fields[key]=var
+        scope_var=tk.StringVar(value=action.get('coordinate_scope','Local'))
+        tk.OptionMenu(coord_frame,scope_var,'Local','Global').pack(fill='x')
         def save():
             updated=copy.deepcopy(action)
             for found,(var,target_var) in fields.items():
@@ -15714,6 +15754,12 @@ class SequentPlaybackGraph(SequentStudioGraph):
                 if updated[key] in ('Jump to Label','Run Saved Macro') and not updated[key+'_target']:
                     messagebox.showerror('Missing target',f'{key}: specify a target.',parent=win)
                     return
+            if any(v.get()=='Save Coordinates to Variables' for v,_ in fields.values()):
+                if not any(v.get().strip() for v in coord_fields.values()):
+                    messagebox.showerror('Missing variable','Enter at least one coordinate variable name.',parent=win)
+                    return
+                updated.update({k:v.get().strip() for k,v in coord_fields.items()})
+                updated['coordinate_scope']=scope_var.get()
             actions=copy.deepcopy(self.actions)
             actions[i]=updated
             if self._write(actions):
