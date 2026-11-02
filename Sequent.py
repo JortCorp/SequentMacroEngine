@@ -6673,7 +6673,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter_frame.pack(side=tk.LEFT, fill=tk.Y)
 
         self.gutter_margin = tk.Canvas(
-            self.gutter_frame, width=44, bg=BG_GUTTER,
+            self.gutter_frame, width=62, bg=BG_GUTTER,
             highlightthickness=0, bd=0, cursor="hand2"
         )
         self.gutter_margin.pack(side=tk.LEFT, fill=tk.Y)
@@ -6868,9 +6868,9 @@ class VSCodeQueueViewer(tk.Frame):
                     _x, y, _w, h, _base = dinfo
                     cy = y + h / 2
                     if start in expanded:
-                        coords = (5, cy-3, 15, cy-3, 10, cy+3)
+                        coords = (23, cy-3, 33, cy-3, 28, cy+3)
                     else:
-                        coords = (7, cy-5, 7, cy+5, 13, cy)
+                        coords = (25, cy-5, 25, cy+5, 31, cy)
                     self.gutter_margin.create_polygon(
                         *coords, fill=TEXT_MUTED, outline='',
                         tags=('typing_disclosure', f'{kind}_group_{start}'))
@@ -6977,7 +6977,7 @@ class VSCodeQueueViewer(tk.Frame):
             if dinfo:
                 gx, gy, gw, gh, gbase = dinfo
                 r = 4.5
-                cx = 27  # Preserve the left gutter zone for the fold arrow.
+                cx = 9  # Leftmost breakpoint lane; fold and add lanes follow.
                 cy = gy + gh // 2
                 self.gutter_margin.create_oval(
                     cx - r, cy - r, cx + r, cy + r,
@@ -6993,14 +6993,18 @@ class VSCodeQueueViewer(tk.Frame):
             line_num = int(idx.split(".")[0])
             if line_num >= 2 and (line_num - 2) < len(self.app.recorded_actions):
                 action_idx = line_num - 2
-                if event.x < 20:
-                    # Dedicated disclosure zone: no breakpoint toggling.
+                if 18 <= event.x < 39:
+                    # Middle lane: fold/unfold without touching breakpoints.
                     if action_idx in self._text_group_by_index:
                         self.toggle_typed_text(action_idx)
                     elif action_idx in self._move_group_by_index:
                         self.toggle_mouse_movements(action_idx)
                     return 'break'
-                self.app.toggle_breakpoint(action_idx)
+                if event.x < 18:
+                    # Leftmost lane: breakpoint only.
+                    self.app.toggle_breakpoint(action_idx)
+                # Rightmost lane belongs to the hover + label; do not
+                # accidentally toggle a breakpoint when the + is hidden.
         except (tk.TclError, ValueError, IndexError):
             pass
         return 'break'
@@ -7427,7 +7431,7 @@ class VSCodeQueueViewer(tk.Frame):
         gx, gy, gw, gh, gbase = dinfo
         btn_size = 14
         btn_y = gy + (gh - btn_size) // 2
-        btn_x = 44 - btn_size
+        btn_x = 62 - btn_size - 3
 
         self.hovered_line = line_num
         self.plus_btn.place(x=btn_x, y=btn_y, width=btn_size, height=btn_size)
