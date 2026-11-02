@@ -6674,14 +6674,14 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter_frame.pack(side=tk.LEFT, fill=tk.Y)
 
         self.gutter_margin = tk.Canvas(
-            self.gutter_frame, width=54, bg=BG_GUTTER,
+            self.gutter_frame, width=45, bg=BG_GUTTER,
             highlightthickness=0, bd=0, cursor="hand2"
         )
         self.gutter_margin.pack(side=tk.LEFT, fill=tk.Y)
 
         self.gutter = tk.Text(
-            self.gutter_frame, width=5, bg=BG_GUTTER, fg=TEXT_MUTED,
-            font=("Consolas", 10), bd=0, padx=4, pady=8,
+            self.gutter_frame, width=2, bg=BG_GUTTER, fg=TEXT_MUTED,
+            font=("Consolas", 10), bd=0, padx=1, pady=8,
             highlightthickness=0, wrap="none", cursor="arrow",
             takefocus=0
         )
@@ -6869,9 +6869,9 @@ class VSCodeQueueViewer(tk.Frame):
                     _x, y, _w, h, _base = dinfo
                     cy = y + h / 2
                     if start in expanded:
-                        coords = (23, cy-3, 33, cy-3, 28, cy+3)
+                        coords = (18, cy-3, 28, cy-3, 23, cy+3)
                     else:
-                        coords = (25, cy-5, 25, cy+5, 31, cy)
+                        coords = (20, cy-5, 20, cy+5, 26, cy)
                     self.gutter_margin.create_polygon(
                         *coords, fill=TEXT_MUTED, outline='',
                         tags=('typing_disclosure', f'{kind}_group_{start}'))
@@ -6979,7 +6979,7 @@ class VSCodeQueueViewer(tk.Frame):
             if dinfo:
                 gx, gy, gw, gh, gbase = dinfo
                 r = 4.5
-                cx = 9  # Leftmost breakpoint lane; fold and add lanes follow.
+                cx = 7.5  # 15px breakpoint lane; fold and add lanes follow.
                 cy = gy + gh // 2
                 self.gutter_margin.create_oval(
                     cx - r, cy - r, cx + r, cy + r,
@@ -7001,7 +7001,7 @@ class VSCodeQueueViewer(tk.Frame):
                     if dinfo:
                         cy = dinfo[1] + dinfo[3] / 2
                         self.gutter_margin.create_oval(
-                            4.5, cy - 4.5, 13.5, cy + 4.5,
+                            3, cy - 4.5, 12, cy + 4.5,
                             fill='#777B85', outline='#A0A4AE', width=1,
                             tags='bp_hover')
         self.redraw_typing_disclosures()
@@ -7014,14 +7014,14 @@ class VSCodeQueueViewer(tk.Frame):
             line_num = int(idx.split(".")[0])
             if line_num >= 2 and (line_num - 2) < len(self.app.recorded_actions):
                 action_idx = line_num - 2
-                if 18 <= event.x < 39:
+                if 15 <= event.x < 30:
                     # Middle lane: fold/unfold without touching breakpoints.
                     if action_idx in self._text_group_by_index:
                         self.toggle_typed_text(action_idx)
                     elif action_idx in self._move_group_by_index:
                         self.toggle_mouse_movements(action_idx)
                     return 'break'
-                if event.x < 18:
+                if event.x < 15:
                     # Leftmost lane: breakpoint only.
                     self.app.toggle_breakpoint(action_idx)
                     self.redraw_breakpoints()
@@ -7131,7 +7131,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.line_count = 0
         self.gutter.delete("1.0", "end")
         self.code_text.delete("1.0", "end")
-        self.gutter.configure(width=5)
+        self.gutter.configure(width=2)
 
     def search_queue(self, query):
         """Highlight matches and jump the queue scrollbar to the first result."""
@@ -7162,8 +7162,10 @@ class VSCodeQueueViewer(tk.Frame):
 
     def append_line(self, text, color=TEXT_PRIMARY, auto_scroll=True):
         self.line_count += 1
-        needed_width = max(5, len(str(self.line_count)) + 2)
-        if int(self.gutter.cget("width")) < needed_width:
+        # Keep the number lane just wide enough for the largest displayed index.
+        # Tk Text width is in font characters; never reserve unused digits.
+        needed_width = max(2, len(str(self.line_count)) + 1)
+        if int(self.gutter.cget("width")) != needed_width:
             self.gutter.configure(width=needed_width)
 
         self.gutter.insert("end", f"{self.line_count}\n", "right")
@@ -7434,7 +7436,7 @@ class VSCodeQueueViewer(tk.Frame):
     def _on_viewer_motion(self, event):
         # The inactive breakpoint preview belongs to the leftmost 18px only.
         hover_line = None
-        if event.widget == self.gutter_margin and 0 <= event.x < 18 and self.interactive_enabled:
+        if event.widget == self.gutter_margin and 0 <= event.x < 15 and self.interactive_enabled:
             try:
                 rel_y = event.y_root - self.gutter.winfo_rooty()
                 line = int(self.gutter.index(f'@0,{rel_y}').split('.')[0])
@@ -7466,7 +7468,7 @@ class VSCodeQueueViewer(tk.Frame):
         gx, gy, gw, gh, gbase = dinfo
         btn_size = 14
         btn_y = gy + (gh - btn_size) // 2
-        btn_x = 54 - btn_size - 2
+        btn_x = 45 - btn_size - 1
 
         self.hovered_line = line_num
         self.plus_btn.place(x=btn_x, y=btn_y, width=btn_size, height=btn_size)
