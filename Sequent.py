@@ -31,63 +31,6 @@ CUSTOM_SOUND_PATHS = {
     "start": ""  
 }
 
-def sequent_gradient_colors(first, second, steps=64):
-    """Smooth two-color interpolation; pure stdlib and Tk-compatible hex colors."""
-    first, second = normalize_accent_color(first), normalize_accent_color(second)
-    a = [int(first[i:i+2], 16) for i in (1, 3, 5)]
-    b = [int(second[i:i+2], 16) for i in (1, 3, 5)]
-    return ['#' + ''.join(f'{round(x + (y-x)*t/(steps-1)):02X}'
-                        for x,y in zip(a,b)) for t in range(steps)]
-
-
-class SequentSelectionGradient(tk.Canvas):
-    """Canvas backdrop for a selected row, painted with a horizontal gradient."""
-    def __init__(self, parent, start, end, **kwargs):
-        super().__init__(parent, bd=0, highlightthickness=0, takefocus=0, **kwargs)
-        self.start, self.end = start, end
-        self.bind('<Configure>', self.redraw, add='+')
-
-    def set_colors(self, start, end):
-        self.start, self.end = start, end
-        self.redraw()
-
-    def redraw(self, event=None):
-        self.delete('gradient')
-        width, height = self.winfo_width(), self.winfo_height()
-        if width < 2 or height < 2:
-            return
-        inks = sequent_gradient_colors(self.start, self.end, min(128, max(2, width)))
-        for i, ink in enumerate(inks):
-            x0 = round(width*i/len(inks))
-            x1 = round(width*(i+1)/len(inks))+1
-            self.create_rectangle(x0, 0, x1, height, fill=ink,
-                                  outline='', tags='gradient')
-
-
-class SequentGradientStrip(tk.Canvas):
-    """Resizing, non-interactive accent gradient preview/header strip."""
-    def __init__(self, parent, start, end, height=10, **kwargs):
-        super().__init__(parent, height=height, bd=0, highlightthickness=0,
-                         takefocus=0, **kwargs)
-        self.start, self.end = start, end
-        self.bind('<Configure>', self._redraw, add='+')
-
-    def set_colors(self, start, end):
-        self.start, self.end = start, end
-        self._redraw()
-
-    def _redraw(self, event=None):
-        self.delete('all')
-        w, h = self.winfo_width(), self.winfo_height()
-        if w < 2 or h < 2:
-            return
-        colors = sequent_gradient_colors(self.start, self.end, max(2, min(256, w)))
-        n = len(colors)
-        for i, color in enumerate(colors):
-            self.create_rectangle(round(i*w/n), 0, round((i+1)*w/n)+1, h,
-                                  fill=color, outline='')
-
-
 class MacroExecutionError(Exception):
     """Expected macro failure, such as an unmet verification condition."""
 
@@ -1547,7 +1490,6 @@ class SequentRoundedAccentBar(tk.Canvas):
         self.thickness = max(2, int(thickness))
         self.inset = max(0, int(inset))
         self.accent = COLOR_ACCENT if accent is None else accent
-        self.gradient_end = None
         bg = background if background is not None else parent.cget('bg')
         super().__init__(parent, width=self.thickness + 4, height=1,
                          bg=bg, borderwidth=0, highlightthickness=0,
@@ -1561,11 +1503,6 @@ class SequentRoundedAccentBar(tk.Canvas):
             self.configure(bg=background)
         self._paint_accent()
 
-    def set_gradient(self, start, end=None):
-        self.accent = start
-        self.gradient_end = end
-        self._paint_accent()
-
     def _paint_accent(self, event=None):
         self.delete('rounded_accent_bar')
         if not self.accent:
@@ -1577,18 +1514,9 @@ class SequentRoundedAccentBar(tk.Canvas):
         r = self.thickness / 2
         y0 = min(h / 2, self.inset + r)
         y1 = max(h / 2, h - self.inset - r)
-        if self.gradient_end:
-            colors = sequent_gradient_colors(self.accent, self.gradient_end, 48)
-            for i, ink in enumerate(colors):
-                a = y0 + (y1-y0)*i/len(colors)
-                b = y0 + (y1-y0)*(i+1)/len(colors)
-                self.create_line(x, a, x, b+1, fill=ink, width=self.thickness,
-                                 capstyle=tk.ROUND if i in (0, len(colors)-1) else tk.BUTT,
-                                 tags='rounded_accent_bar')
-        else:
-            self.create_line(x, y0, x, y1, fill=self.accent,
-                             width=self.thickness, capstyle=tk.ROUND,
-                             tags='rounded_accent_bar')
+        self.create_line(x, y0, x, y1, fill=self.accent,
+                         width=self.thickness, capstyle=tk.ROUND,
+                         tags='rounded_accent_bar')
 
 
 def sequent_dock_header(parent, title, subtitle="", right_text=""):
@@ -3098,20 +3026,8 @@ class SequentAnimatedPillBar(tk.Canvas):
         if sel_bounds is not None:
             highlight_color = blend_hex(self.accent_getter(), self.surface,
                                         max(0.,min(1.,self._visibility)))
-            app = self.winfo_toplevel()
-            if getattr(app, 'gradient_enabled', False):
-                left, right = sel_bounds
-                gradient = sequent_gradient_colors(self.accent_getter(),
-                    app.gradient_second_color, 48)
-                for i, ink in enumerate(gradient):
-                    x0 = left + (right-left)*i/len(gradient)
-                    x1 = left + (right-left)*(i+1)/len(gradient)
-                    shade = blend_hex(ink, self.surface, max(0.,min(1.,self._visibility)))
-                    self.create_rectangle(x0, 5, x1+1, self.HEIGHT-5,
-                                          fill=shade, outline='', tags='pill_art')
-            else:
-                self._capsule(self, sel_bounds[0], 5, sel_bounds[1],
-                              self.HEIGHT-5, highlight_color, 'pill_art')
+            self._capsule(self, sel_bounds[0], 5, sel_bounds[1],
+                          self.HEIGHT-5, highlight_color, 'pill_art')
         fg_normal = TEXT_PRIMARY
         fg_selected = accent_text_color(self.accent_getter())
         for idx,(slot,caption,cmd,tip,fallback) in enumerate(self.items):
@@ -3170,10 +3086,9 @@ class SequentAccentColorDialog:
     SV_HEIGHT = 208
     HUE_WIDTH = 26
 
-    def __init__(self, app, target="primary"):
+    def __init__(self, app):
         self.app = app
-        self.target = target
-        self.original = app.gradient_second_color if target == "secondary" else app.accent_color
+        self.original = app.accent_color
         self.selected = self.original
         self._closing = False
         self._updating_fields = False
@@ -3182,7 +3097,7 @@ class SequentAccentColorDialog:
         self.h, self.s, self.v = self.hex_to_hsv(self.original)
 
         self.window = tk.Toplevel(app.root)
-        self.window.title("Sequent — Custom Gradient Color" if target == "secondary" else "Sequent — Custom Accent Color")
+        self.window.title("Sequent — Custom Accent Color")
         self.window.configure(bg=BG_BORDER)
         self.window.resizable(False, False)
         self.window.transient(app.root)
@@ -3509,7 +3424,7 @@ class SequentAccentColorDialog:
         chosen = self.selected
         if self._close():
             # Finish the modal event before Sequent rebuilds its themed widgets.
-            self.app.root.after_idle(lambda: self.app.set_gradient_second_color(chosen) if self.target == "secondary" else self.app.set_accent_color(chosen))
+            self.app.root.after_idle(lambda: self.app.set_accent_color(chosen))
 
 
 class ModernTooltip:
@@ -3614,7 +3529,7 @@ class ModernCard(tk.Frame):
 
 # --- Thick Custom Dark Mode Scrollbar ---
 class ModernScrollBar(tk.Canvas):
-    def __init__(self, parent, command=None, width=12, bg_trough=None,
+    def __init__(self, parent, command=None, width=18, bg_trough=None,
                  thumb_color=None, hover_color=None, active_color=None, **kwargs):
         bg_trough = bg_trough or BG_SCROLL_TRACK
         thumb_color = thumb_color or TRACK_INACTIVE
@@ -3688,7 +3603,7 @@ class ModernScrollBar(tk.Canvas):
         y0 = int((first_clamped / max_first) * travel)
         y1 = y0 + thumb_h
 
-        pad = max(3, (w - 4) // 2)
+        pad = 5
         cx = w / 2
         
         # Draw rounded modern thumb
@@ -3748,63 +3663,6 @@ class ModernScrollBar(tk.Canvas):
             self.command("moveto", f"{new_first:.6f}")
 
             
-class ModernHorizontalScrollBar(ModernScrollBar):
-    """Transport-style scrollbar with horizontal thumb and drag handling."""
-    def __init__(self, parent, command=None, height=12, **kwargs):
-        super().__init__(parent, command=command, width=height, **kwargs)
-        self.configure(height=height)
-        self.drag_start_x = 0
-
-    def _metrics(self):
-        length = self.winfo_width()
-        span = min(1.0, max(0.0, self.last - self.first))
-        thumb = min(length, max(24, int(span * length)))
-        travel = max(0, length - thumb)
-        max_first = max(0.0, 1.0 - span)
-        start = int((min(self.first, max_first) / max_first) * travel) if max_first and travel else 0
-        return length, thumb, travel, max_first, start
-
-    def draw(self):
-        if not self.winfo_exists():
-            return
-        self.delete('all')
-        length, thumb, travel, max_first, start = self._metrics()
-        height = self.winfo_height()
-        if length <= 2 or height <= 2:
-            return
-        self.create_rectangle(0, 0, length, height, fill=self.bg_trough, outline='')
-        pad = min(5, max(1, height // 4))
-        if thumb > pad * 2:
-            self.create_line(start + pad, height / 2, start + thumb - pad, height / 2,
-                             fill=self.current_color, width=max(2, height - 2 * pad),
-                             capstyle='round')
-
-    def _on_click(self, event):
-        length, thumb, travel, max_first, start = self._metrics()
-        if length <= 2:
-            return
-        if start <= event.x <= start + thumb:
-            self.drag_start_first = self.first
-        else:
-            self.drag_start_first = max(0.0, min(max_first,
-                ((event.x - thumb / 2) / travel) * max_first)) if travel else 0.0
-            if self.command:
-                self.command('moveto', f'{self.drag_start_first:.6f}')
-        self.is_dragging = True
-        self.current_color = self.active_color
-        self.drag_start_x = event.x
-        self.draw()
-
-    def _on_drag(self, event):
-        if not self.is_dragging:
-            return
-        _, _, travel, max_first, _ = self._metrics()
-        new_first = max(0.0, min(max_first,
-            self.drag_start_first + (event.x - self.drag_start_x) / travel * max_first)) if travel else 0.0
-        if self.command:
-            self.command('moveto', f'{new_first:.6f}')
-
-
 # New actions are stored as plain dictionaries alongside legacy recorded actions.
 # Editor field: (key, label, kind, initial[, choice options]).
 DYNAMIC_ACTION_SPECS = {
@@ -4799,7 +4657,7 @@ def sequent_screen_outcome_config(action, found):
         target = ''
         behavior = ('Continue' if found or typ == 'search_area'
                     else 'Stop with Error')
-    if behavior not in SCREEN_OUTCOME_OPTIONS and not (typ == 'find_text' and found and behavior == 'Save Coordinates to Variables'):
+    if behavior not in SCREEN_OUTCOME_OPTIONS:
         raise MacroExecutionError(f'Invalid {key} option: {behavior!r}')
     return behavior, str(target or '').strip()
 
@@ -4829,8 +4687,7 @@ def sequent_add_screen_outcome_editor(parent, app, action):
         tk.Label(frame, text=caption, bg=BG_PANEL, fg=TEXT_MUTED,
                  font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(0, 3))
         choice = tk.StringVar(value=mode)
-        choices = SCREEN_OUTCOME_OPTIONS + (('Save Coordinates to Variables',) if found and action.get('type') == 'find_text' else ())
-        menu = tk.OptionMenu(frame, choice, *choices)
+        menu = tk.OptionMenu(frame, choice, *SCREEN_OUTCOME_OPTIONS)
         menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
                     highlightthickness=1, highlightbackground=BG_BORDER)
         menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
@@ -4848,27 +4705,6 @@ def sequent_add_screen_outcome_editor(parent, app, action):
             selected['variable'] = None
             selected['kind'] = None
             mode = choice.get()
-            if mode == 'Save Coordinates to Variables':
-                tk.Label(target_box, text='Save detected text coordinates as:', bg=BG_PANEL,
-                         fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
-                entries = {}
-                for field, label in (('save_x_variable', 'Found X'), ('save_y_variable', 'Found Y'),
-                                     ('save_click_x_variable', 'Click X'), ('save_click_y_variable', 'Click Y')):
-                    row = tk.Frame(target_box, bg=BG_PANEL)
-                    row.pack(fill=tk.X, pady=2)
-                    tk.Label(row, text=label, width=10, anchor='w', bg=BG_PANEL,
-                             fg=TEXT_MUTED).pack(side=tk.LEFT)
-                    variable = tk.StringVar(value=str(action.get(field, '')))
-                    tk.Entry(row, textvariable=variable, bg=BG_INPUT, fg=TEXT_PRIMARY,
-                             insertbackground=TEXT_PRIMARY).pack(side=tk.LEFT, fill=tk.X, expand=True)
-                    entries[field] = variable
-                scope = tk.StringVar(value=action.get('coordinate_scope', 'Local'))
-                tk.OptionMenu(target_box, scope, 'Local', 'Global').pack(fill=tk.X, pady=3)
-                selected['entries'] = entries
-                selected['scope'] = scope
-                return
-            selected.pop('entries', None)
-            selected.pop('scope', None)
             if mode not in ('Run Saved Macro', 'Jump to Label'):
                 return
             values = presets if mode == 'Run Saved Macro' else labels
@@ -4898,7 +4734,7 @@ def sequent_add_screen_outcome_editor(parent, app, action):
         result = {}
         for key, (choice, selected) in settings.items():
             mode = choice.get()
-            if mode not in SCREEN_OUTCOME_OPTIONS and not (key == 'if_found' and action.get('type') == 'find_text' and mode == 'Save Coordinates to Variables'):
+            if mode not in SCREEN_OUTCOME_OPTIONS:
                 raise MacroExecutionError(f'Invalid {key}: {mode}')
             target = ''
             if mode in ('Run Saved Macro', 'Jump to Label'):
@@ -4907,13 +4743,6 @@ def sequent_add_screen_outcome_editor(parent, app, action):
                 if target not in available:
                     item = 'saved macro' if mode == 'Run Saved Macro' else 'label'
                     raise MacroExecutionError(f'Select an existing {item} for {key.replace("_", " ")}.')
-            if mode == 'Save Coordinates to Variables':
-                entries = selected.get('entries', {})
-                names = {field: var.get().strip() for field, var in entries.items()}
-                if not any(names.values()):
-                    raise MacroExecutionError('Enter at least one coordinate variable name.')
-                result.update(names)
-                result['coordinate_scope'] = selected['scope'].get()
             result[key] = mode
             result[key + '_target'] = target
         return result
@@ -5061,82 +4890,21 @@ def variable_identity(name, scope=None):
 
 
 def _global_variable_path(app):
-    """Per-user writable storage; never require write access to installation/presets."""
-    base = (os.environ.get('LOCALAPPDATA') or
-            os.path.join(os.path.expanduser('~'), 'AppData', 'Local'))
-    return os.path.join(base, 'Sequent', 'globals.json')
-
-
-def _retry_global_io(operation):
-    """Windows antivirus/indexers can briefly lock JSON files during replace/read."""
-    for attempt in range(6):
-        try:
-            return operation()
-        except (PermissionError, OSError) as exc:
-            # Only retry Windows sharing/lock/access-denied errors; not arbitrary I/O.
-            if getattr(exc, 'winerror', None) not in (5, 32, 33) and getattr(exc, 'errno', None) not in (13, 16):
-                raise
-            if attempt == 5:
-                raise
-            time.sleep(0.05 * (attempt + 1))
-
-
-def _read_global_file(path):
-    def read():
-        with open(path, 'r', encoding='utf-8') as stream:
-            return json.load(stream)
-    return _retry_global_io(read)
+    return os.path.join(app.presets_dir, 'globals.json')
 
 
 def _read_global_values(app):
     path = _global_variable_path(app)
     try:
-        data = _read_global_file(path)
+        with open(path, 'r', encoding='utf-8') as stream:
+            data = json.load(stream)
     except FileNotFoundError:
-        # Migrate once from older Sequent versions which stored globals beside
-        # presets. Never delete or modify the original during migration.
-        legacy = os.path.join(app.presets_dir, 'globals.json')
-        if os.path.normcase(os.path.abspath(legacy)) == os.path.normcase(os.path.abspath(path)):
-            return {}
-        try:
-            data = _read_global_file(legacy)
-        except FileNotFoundError:
-            return {}
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise MacroExecutionError(f'Unable to read legacy global variables: {exc}') from exc
-        if not isinstance(data, dict):
-            raise MacroExecutionError('Legacy global variable file must contain a JSON object')
-        _write_global_values(app, data)
-        return data
+        return {}
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise MacroExecutionError(f'Unable to read global variables at {path}: {exc}') from exc
+        raise MacroExecutionError(f'Unable to read global variables: {exc}') from exc
     if not isinstance(data, dict):
         raise MacroExecutionError('Global variable file must contain a JSON object')
     return data
-
-
-def _write_global_values(app, data):
-    path = _global_variable_path(app)
-    folder = os.path.dirname(path)
-    temporary = None
-    try:
-        os.makedirs(folder, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix='.sequent-global-', suffix='.tmp', dir=folder)
-        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-            json.dump(data, stream, indent=2, ensure_ascii=True)
-            stream.write('\n')
-            stream.flush()
-            os.fsync(stream.fileno())
-        _retry_global_io(lambda: os.replace(temporary, path))
-    except (OSError, TypeError, ValueError) as exc:
-        raise MacroExecutionError(f'Unable to save global variables at {path}: {exc}') from exc
-    finally:
-        if temporary is not None:
-            try:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-            except OSError:
-                pass
 
 
 def get_global_var(app, name, default=''):
@@ -5145,11 +4913,36 @@ def get_global_var(app, name, default=''):
 
 
 def set_global_var(app, name, value):
-    """Save a global value in per-user storage with atomic replacement."""
+    """Atomically persist a value so another macro can access it.
+
+    Preserve existing globals if a read fails, rather than overwriting a
+    damaged/unreadable file with only the new variable.
+    """
+    path = _global_variable_path(app)
     with _GLOBAL_VARIABLE_LOCK:
         data = _read_global_values(app)
         data[name] = str(value)
-        _write_global_values(app, data)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix='.sequent-global-', suffix='.tmp',
+                                              dir=os.path.dirname(path))
+        except OSError as exc:
+            raise MacroExecutionError(f'Unable to prepare global variable file: {exc}') from exc
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                # JSON escaping protects embedded double quotes, backslashes,
+                # CR/LF, tabs and all other control characters. Using ASCII
+                # escapes also makes malformed UTF-16 surrogate data from
+                # Windows clipboard input round-trip without a UTF-8 write
+                # error. json.load reconstructs the original Python string.
+                json.dump(data, stream, indent=2, ensure_ascii=True)
+                stream.write('\n')
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError) as exc:
+            raise MacroExecutionError(f'Unable to save global variables: {exc}') from exc
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 def get_variable(app, name, scope=None, default=''):
@@ -5167,168 +4960,6 @@ def set_variable(app, name, value, scope=None):
         set_global_var(app, name, value)
     else:
         app.variables[name] = str(value)
-
-
-
-# Optional Boolean guard for Read Clipboard. Existing actions remain unconditional.
-CLIPBOARD_OUTCOME_OPTIONS = ('Continue', 'Run Saved Macro', 'Jump to Label',
-                             'Stop Macro', 'Stop with Error')
-
-
-def sequent_clipboard_outcome(action, found):
-    key = 'if_found' if found else 'if_not_found'
-    behavior = action.get(key, 'Continue')
-    if behavior not in CLIPBOARD_OUTCOME_OPTIONS:
-        raise MacroExecutionError(f'Read Clipboard: unknown {key} behavior: {behavior!r}')
-    return behavior, str(action.get(key + '_target', '') or '').strip()
-
-
-def sequent_clipboard_outcome_editor(parent, app, current, title="READ CLIPBOARD RESULTS"):
-    """Fixed-position controls; preserve target selections when toggling."""
-    current = current or {}
-    section = tk.Frame(parent, bg=BG_PANEL)
-    section.pack(fill=tk.X, pady=(8, 12))
-    tk.Label(section, text=title, bg=BG_PANEL,
-             fg=SYNTAX_BLUE, font=('Segoe UI', 8, 'bold')).pack(anchor='w')
-    tk.Label(section, text='Found means clipboard text was captured or a keyword rule matched. '
-             'Not Found means empty clipboard text or no keyword rule matched. '
-             'A false precondition skips the action without branching.',
-             bg=BG_PANEL, fg=TEXT_MUTED, wraplength=430, justify=tk.LEFT).pack(anchor='w', pady=(3, 8))
-    presets = list(app.get_preset_names())
-    labels = [str(a.get('name')) for a in app.recorded_actions
-              if isinstance(a, dict) and a.get('type') == 'label' and a.get('name')]
-    settings = {}
-    for key, caption in (('if_found', 'IF FOUND'), ('if_not_found', 'IF NOT FOUND')):
-        card = tk.Frame(section, bg=BG_PANEL)
-        card.pack(fill=tk.X, pady=(0, 8))
-        tk.Label(card, text=caption, bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=('Segoe UI', 8, 'bold')).pack(anchor='w')
-        choice = tk.StringVar(value=current.get(key, 'Continue'))
-        menu = tk.OptionMenu(card, choice, *CLIPBOARD_OUTCOME_OPTIONS)
-        menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, highlightthickness=1,
-                    highlightbackground=BG_BORDER)
-        menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
-        menu.pack(fill=tk.X)
-        target_container = tk.Frame(card, bg=BG_PANEL)
-        target_container.pack(fill=tk.X)
-        selected = tk.StringVar(value=current.get(key + '_target', ''))
-        def redraw(*_, choice=choice, selected=selected, container=target_container):
-            for widget in container.winfo_children():
-                widget.destroy()
-            mode = choice.get()
-            if mode not in ('Run Saved Macro', 'Jump to Label'):
-                return
-            options = presets if mode == 'Run Saved Macro' else labels
-            tk.Label(container, text='Saved Macro:' if mode == 'Run Saved Macro' else 'Queue Label:',
-                     bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w', pady=(5, 2))
-            values = list(dict.fromkeys(([selected.get()] if selected.get() else []) + options))
-            if not values:
-                values = ['-- None available --']
-            target_menu = tk.OptionMenu(container, selected, *values)
-            target_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0)
-            target_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
-            target_menu.pack(fill=tk.X)
-        choice.trace_add('write', redraw)
-        redraw()
-        settings[key] = (choice, selected)
-    def read():
-        result = {}
-        for key, (choice, selected) in settings.items():
-            mode = choice.get()
-            if mode not in CLIPBOARD_OUTCOME_OPTIONS:
-                raise MacroExecutionError(f'Read Clipboard: invalid {key} option')
-            target = selected.get().strip() if mode in ('Run Saved Macro', 'Jump to Label') else ''
-            if mode in ('Run Saved Macro', 'Jump to Label'):
-                options = presets if mode == 'Run Saved Macro' else labels
-                if target not in options:
-                    raise MacroExecutionError(f'Read Clipboard: select an existing target for {key}')
-            result[key] = mode
-            result[key + '_target'] = target
-        return result
-    return read
-
-
-def sequent_clipboard_condition_passes(app, action):
-    if not action.get('condition_enabled', False):
-        return True
-    conditions = action.get('conditions', [])
-    if not conditions:
-        raise MacroExecutionError('Conditional action: enabled condition needs at least one rule')
-    result = None
-    for index, rule in enumerate(conditions):
-        name = str(rule.get('left_name', '')).strip()
-        if not name:
-            raise MacroExecutionError('Conditional action: missing source variable name')
-        missing = object()
-        left = get_variable(app, name, rule.get('left_scope', 'local'), default=missing)
-        if left is missing:
-            raise MacroExecutionError(f'Conditional action: variable {name!r} is undefined')
-        operator = rule.get('operator', '==')
-        if operator in ('empty', 'not empty', 'exists', 'missing'):
-            matched = dynamic_compare(left, operator, '')
-        else:
-            if rule.get('right_type', 'text') == 'variable':
-                other = str(rule.get('right_name', '')).strip()
-                if not other:
-                    raise MacroExecutionError('Conditional action: comparison variable name required')
-                right = get_variable(app, other, rule.get('right_scope', 'local'), default=missing)
-                if right is missing:
-                    raise MacroExecutionError(f'Conditional action: variable {other!r} is undefined')
-            else:
-                right = rule.get('right_text', '')
-            matched = dynamic_compare(left, operator, right)
-        if rule.get('negate', False):
-            matched = not matched
-        if result is None:
-            result = matched
-        else:
-            connector = rule.get('join', 'AND')
-            if connector == 'AND':
-                result = result and matched
-            elif connector == 'OR':
-                result = result or matched
-            else:
-                raise MacroExecutionError(f'Conditional action: invalid connector {connector!r}')
-    return bool(result)
-
-
-def resolve_find_text_target(app, action):
-    """Resolve literal/local/global OCR targets at execution time."""
-    source = action.get('text_source', 'Literal')
-    if source == 'Literal':
-        value = str(action.get('text', '')).strip()
-    elif source in ('Local', 'Global'):
-        name = str(action.get('text_variable', '')).strip()
-        if not name:
-            raise MacroExecutionError('Find Text variable name is empty')
-        scope = source.lower()
-        bare, _ = variable_identity(name, scope)
-        sentinel = object()
-        value = get_variable(app, bare, scope, sentinel)
-        if value is sentinel:
-            raise MacroExecutionError(f'Find Text {source.lower()} variable {bare!r} does not exist')
-        value = str(value).strip()
-    else:
-        raise MacroExecutionError(f'Unknown Find Text source: {source!r}')
-    if not value:
-        raise MacroExecutionError('Find Text search value is empty')
-    return value
-
-
-def save_find_text_coordinates(app, action, box):
-    """Save matched anchor coordinates and click coordinates independently."""
-    if not box or (action.get('if_found') != 'Save Coordinates to Variables' and not any(action.get(k) for k in ('save_x_variable', 'save_y_variable', 'save_click_x_variable', 'save_click_y_variable'))):
-        return
-    x, y = color_anchor_position(box, action.get('anchor', 'Center'))
-    click_x, click_y = color_click_target(action, box)
-    scope = str(action.get('coordinate_scope', 'Local')).lower()
-    if scope not in ('local', 'global'):
-        raise MacroExecutionError('Invalid Find Text coordinate scope')
-    for field, value in (('save_x_variable', x), ('save_y_variable', y),
-                         ('save_click_x_variable', click_x), ('save_click_y_variable', click_y)):
-        name = str(action.get(field, '')).strip()
-        if name:
-            set_variable(app, name, str(value), scope)
 
 
 def capture_clipboard_variable(app, action):
@@ -5369,7 +5000,7 @@ def sequent_text_file_path(app, filename):
         path = os.path.abspath(os.path.join(root, value))
         if os.path.commonpath((root, path)) != root:
             raise MacroExecutionError('Relative text file paths must stay in the presets/text_files folder')
-    if os.path.basename(path).lower() == 'globals.json':
+    if os.path.normcase(path) == os.path.normcase(_global_variable_path(app)):
         raise MacroExecutionError('globals.json is reserved for Sequent variables; select a .txt file')
     return path
 
@@ -5415,23 +5046,6 @@ def sequent_clipboard_to_file(app, action):
         set_variable(app, name, value, scope)
     return {'path':path, 'length':len(value), 'variable':name if assign else None,
             'scope':scope if assign else None}
-
-
-def sequent_text_file_is_nonempty(app, action):
-    """Inspect UTF-8 text without modifying the destination on an empty file."""
-    path = sequent_text_file_path(app, action.get('path', 'defect_description.txt'))
-    try:
-        with open(path, 'rb') as stream:
-            data = stream.read(SEQUENT_TEXT_FILE_LIMIT + 1)
-    except OSError as exc:
-        raise MacroExecutionError(f'Unable to open text file {path!r}: {exc}') from exc
-    if len(data) > SEQUENT_TEXT_FILE_LIMIT:
-        raise MacroExecutionError('Text file exceeds the 16 MiB text-file limit')
-    try:
-        value = data.decode('utf-8', errors='surrogatepass')
-    except UnicodeError as exc:
-        raise MacroExecutionError('Text file must contain UTF-8 text') from exc
-    return bool(value)
 
 
 def sequent_text_file_to_variable(app, action):
@@ -5910,11 +5524,9 @@ class SequentDynamicEngine:
         else:
             area = validated_capture_area(action.get('area'))
             if typ == 'find_color':
-                color = str(action.get('color', '#FFFFFF')).upper()
-                tolerance = action.get('tolerance', 8)
-                box = self.app.cached_screen_match(action,
-                    lambda region: self.app.search_color_in_area(*region, color, tolerance=tolerance),
-                    signature=(color, tolerance))
+                box = self.app.search_color_in_area(
+                    *area, str(action.get('color', '#FFFFFF')).upper(),
+                    tolerance=action.get('tolerance', 8))
             elif typ == 'find_text':
                 opts = {'match_mode': action.get('match_mode', 'Contains'),
                         'scan_mode': action.get('scan_mode', 'Balanced'),
@@ -5927,17 +5539,14 @@ class SequentDynamicEngine:
                 for attempt in range(attempts):
                     if not idle and not self.app.playing:
                         raise MacroCancelled('Text search cancelled')
-                    target = resolve_find_text_target(self.app, action)
-                    box = self.app.cached_screen_match(action,
-                        lambda region: self.app.find_text_rect(*region, target, **opts),
-                        signature=(target, tuple(sorted(opts.items()))))
+                    box = self.app.find_text_rect(*area, action.get('text', ''), **opts)
                     if box is not None:
                         break
                     if attempt + 1 < attempts:
                         self._pause(0.15, idle=idle)
                 if box is not None and action.get('confirm_match', False):
                     self._pause(0.12, idle=idle)
-                    second = self.app.find_text_rect(*area, resolve_find_text_target(self.app, action), **opts)
+                    second = self.app.find_text_rect(*area, action.get('text', ''), **opts)
                     if not idle and not self.app.playing:
                         raise MacroCancelled('Text confirmation cancelled')
                     if second is None:
@@ -5951,21 +5560,11 @@ class SequentDynamicEngine:
                         else:
                             box = second
             else:
-                path = self.interpolate(action.get('path', ''))
-                try:
-                    stat = os.stat(path)
-                    template_identity = (os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
-                except OSError:
-                    template_identity = (path,)
-                box = self.app.cached_screen_match(action,
-                    lambda region: self.find_image(dict(action, area=list(region))),
-                    signature=(template_identity, action.get('confidence'), action.get('scale_mode')))
+                box = self.find_image(action)
             if not idle and not self.app.playing:
                 raise MacroCancelled('Screen search cancelled after detection')
             result = {'type':typ, 'found': bool(box), 'success':True}
             if box:
-                if typ == 'find_text':
-                    save_find_text_coordinates(self.app, action, box)
                 result.update(self._click_box(action, box))
         # Stop can also happen while a click/hover is being dispatched.
         if not idle and not self.app.playing:
@@ -6216,7 +5815,7 @@ class SequentDynamicEngine:
                 if hasattr(self.app, 'trace_action'):
                     self.app.trace_action('compare_text',
                         'ERROR' if compare_error else 'MATCH' if result['matched'] else 'MISMATCH')
-                if behavior in ('Continue', 'Save Coordinates to Variables'):
+                if behavior == 'Continue':
                     index += 1
                     continue
                 if behavior == 'Set Variable':
@@ -6377,10 +5976,6 @@ class SequentDynamicEngine:
             if typ in SCREEN_RECOGNITION_TYPES:
                 match = self._recognize_screen_action(action, idle=idle)
                 behavior, target = sequent_screen_outcome_config(action, match['found'])
-                if behavior == 'Save Coordinates to Variables' and typ == 'find_text' and match['found']:
-                    # Coordinates were saved by _recognize_screen_action on a successful match.
-                    # Treat this branch as a normal continuation.
-                    behavior = 'Continue'
                 if behavior == 'Continue':
                     index += 1
                     if not idle:
@@ -6411,86 +6006,6 @@ class SequentDynamicEngine:
                     outcome = 'found' if match['found'] else 'not found'
                     raise MacroExecutionError(f'{name}: {outcome}; configured to stop with error')
                 raise MacroExecutionError(f'Unknown screen branch behavior: {behavior}')
-
-            if typ == 'load_text_variable' and ('if_found' in action or 'if_not_found' in action):
-                # Empty means zero characters, not whitespace-only text.
-                # Missing/unreadable/invalid files remain errors, not empty results.
-                found = sequent_text_file_is_nonempty(self.app, action)
-                if found:
-                    sequent_text_file_to_variable(self.app, action)
-                behavior, target = sequent_clipboard_outcome(action, found)
-                if behavior == 'Continue':
-                    index += 1
-                    continue
-                if behavior == 'Run Saved Macro':
-                    if not target or target not in self.app.get_preset_names():
-                        raise MacroExecutionError(f'Load Text File macro {target!r} is missing')
-                    return {'switch': 'preset', 'target': target}
-                if behavior == 'Jump to Label':
-                    destination = next((i for i, item in enumerate(actions)
-                                        if item.get('type') == 'label' and item.get('name') == target), None)
-                    if destination is None:
-                        raise MacroExecutionError(f'Load Text File label {target!r} is missing')
-                    frames.clear()
-                    index = destination + 1
-                    continue
-                if behavior == 'Stop Macro':
-                    return {'cancelled': True}
-                if behavior == 'Stop with Error':
-                    raise MacroExecutionError('Load Text File: ' + ('nonempty' if found else 'empty') +
-                                              '; configured to stop with error')
-                raise MacroExecutionError(f'Unknown Load Text File branch behavior: {behavior}')
-
-            if typ == 'read_clipboard':
-                # Keep the existing optional variable guard. False means skip,
-                # not an IF NOT FOUND result.
-                if not sequent_clipboard_condition_passes(self.app, action):
-                    index += 1
-                    continue
-                mode = action.get('mode', 'keywords')
-                if mode == 'keywords':
-                    # Read once and pass the exact snapshot to the rule matcher.
-                    clipboard_text = get_clipboard_text()
-                    matches = apply_clipboard_keyword_rules(self.app, action, clipboard_text)
-                    found = bool(matches)
-                elif mode in ('capture', 'file'):
-                    clipboard_text = get_clipboard_text()
-                    found = bool(clipboard_text)
-                    if found:
-                        if mode == 'capture':
-                            # Reuse existing capture logic, but avoid a second clipboard read.
-                            name = action.get('var_name', 'clipboard_text')
-                            variable_identity(name, action.get('var_scope'))
-                            set_variable(self.app, name, clipboard_text, action.get('var_scope'))
-                        else:
-                            # File mode uses the existing safe atomic file writer.
-                            sequent_clipboard_to_file(self.app, action)
-                else:
-                    raise MacroExecutionError(f'Unknown Read Clipboard mode: {mode!r}')
-                if not found and mode in ('capture', 'file') and 'if_not_found' not in action:
-                    raise MacroExecutionError('Clipboard has no text (or is temporarily unavailable)')
-                behavior, target = sequent_clipboard_outcome(action, found)
-                if behavior == 'Continue':
-                    index += 1
-                    continue
-                if behavior == 'Run Saved Macro':
-                    if not target or target not in self.app.get_preset_names():
-                        raise MacroExecutionError(f'Read Clipboard macro {target!r} is missing')
-                    return {'switch': 'preset', 'target': target}
-                if behavior == 'Jump to Label':
-                    destination = next((i for i, item in enumerate(actions)
-                                        if item.get('type') == 'label' and item.get('name') == target), None)
-                    if destination is None:
-                        raise MacroExecutionError(f'Read Clipboard label {target!r} is missing')
-                    frames.clear()
-                    index = destination + 1
-                    continue
-                if behavior == 'Stop Macro':
-                    return {'cancelled': True}
-                if behavior == 'Stop with Error':
-                    raise MacroExecutionError('Read Clipboard: ' + ('found' if found else 'not found') +
-                                              '; configured to stop with error')
-                raise MacroExecutionError(f'Unknown clipboard branch behavior: {behavior}')
 
             if typ=='trigger_start':index+=1;continue
             
@@ -6675,7 +6190,7 @@ class VSCodeQueueViewer(tk.Frame):
 
         self.scrollbar = ModernScrollBar(
             self, command=self._on_scrollbar_scroll,
-            width=12, bg_trough=BG_PANEL
+            width=18, bg_trough=BG_SCROLL_TRACK
         )
         self.scroll_sep = tk.Frame(self, bg=BG_BORDER, width=1)
 
@@ -6871,31 +6386,28 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter.configure(width=5)
 
     def search_queue(self, query):
-        """Highlight matches and jump the queue scrollbar to the first result."""
+        """Highlights and scrolls to matching text in the action queue."""
         self.code_text.tag_remove("search_highlight", "1.0", "end")
-        query = str(query or "")
         if not query:
             return
-
-        self.code_text.tag_configure(
-            "search_highlight", background=COLOR_ACCENT, foreground=TEXT_ON_ACCENT)
+            
+        self.code_text.tag_configure("search_highlight", background=COLOR_ACCENT, foreground=TEXT_ON_ACCENT)
+        
         start_pos = "1.0"
         first_match = None
         while True:
-            match = self.code_text.search(query, start_pos, stopindex="end", nocase=True)
-            if not match:
+            # nocase=True makes the search case-insensitive
+            start_pos = self.code_text.search(query, start_pos, stopindex="end", nocase=True)
+            if not start_pos:
                 break
-            if first_match is None:
-                first_match = match
-            end_pos = self.code_text.index(f"{match}+{len(query)}c")
-            self.code_text.tag_add("search_highlight", match, end_pos)
+            if not first_match:
+                first_match = start_pos
+            end_pos = f"{start_pos}+{len(query)}c"
+            self.code_text.tag_add("search_highlight", start_pos, end_pos)
             start_pos = end_pos
-
-        if first_match is not None:
-            # .see() only guarantees visibility, often leaving the first match
-            # near the bottom. yview(index) moves it to the top of the viewport.
-            self.code_text.yview(first_match)
-            self.gutter.yview_moveto(self.code_text.yview()[0])
+            
+        if first_match:
+            self.code_text.see(first_match)
 
     def append_line(self, text, color=TEXT_PRIMARY, auto_scroll=True):
         self.line_count += 1
@@ -7350,8 +6862,7 @@ class VSCodeQueueViewer(tk.Frame):
             "wait_text": "Wait for Text",
             "find_color": "Find Color & Click",
             "find_text": "Find Text & Click",
-            "click": "Mouse Action",
-            "move": "Mouse Action",
+            "click": "Smart UI Element & Click",  # Edit any recorded click to make it adaptive.
             **{spec[0]: label for label,spec in DYNAMIC_ACTION_SPECS.items()},
             "label": "Label Marker",
             "goto": "Jump to Label",
@@ -7496,17 +7007,6 @@ class VSCodeQueueViewer(tk.Frame):
             font=("Segoe UI", 9), bd=0, relief="flat")
         self._action_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), pady=7)
         self._action_search_entry.bind("<Return>", self._select_first_search_result)
-        self._action_favorites = getattr(self, '_action_favorites', set())
-        self._action_collapsed = getattr(self, '_action_collapsed', set())
-        self._action_filter = tk.StringVar(value='All')
-        filter_bar = tk.Frame(nav, bg=BG_SIDEBAR)
-        filter_bar.pack(fill=tk.X, padx=10, pady=(0, 8))
-        for title in ('All', 'Favorites'):
-            btn = tk.Label(filter_bar, text=title, bg=BG_INPUT, fg=TEXT_PRIMARY,
-                           font=('Segoe UI', 8), padx=11, pady=5, cursor='hand2')
-            btn.pack(side=tk.LEFT, padx=(0, 5))
-            btn.bind('<Button-1>', lambda e, t=title: self._action_filter.set(t))
-        self._action_filter.trace_add('write', lambda *_: self._rebuild_action_picker())
 
         picker_area = tk.Frame(nav, bg=BG_SIDEBAR)
         picker_area.pack(fill=tk.BOTH, expand=True, padx=(4, 2), pady=(0, 8))
@@ -7640,20 +7140,6 @@ class VSCodeQueueViewer(tk.Frame):
                 canvas.yview_scroll(amount, "units")
                 return "break"
 
-    def _toggle_action_category(self, category):
-        if category in self._action_collapsed:
-            self._action_collapsed.remove(category)
-        else:
-            self._action_collapsed.add(category)
-        self._rebuild_action_picker()
-
-    def _toggle_action_favorite(self, name):
-        if name in self._action_favorites:
-            self._action_favorites.remove(name)
-        else:
-            self._action_favorites.add(name)
-        self._rebuild_action_picker()
-
     def _rebuild_action_picker(self):
         if not self.sub_menu or not self.sub_menu.winfo_exists():
             return
@@ -7661,140 +7147,61 @@ class VSCodeQueueViewer(tk.Frame):
         old_scroll = self._action_picker_canvas.yview()[0]
         for child in self._action_picker_inner.winfo_children():
             child.destroy()
-        all_items = {name: (name, desc, icon) for _, actions in self.ACTION_PICKER_GROUPS
-                     for name, desc, icon in actions}
-        groups = []
-        favorites = [all_items[name] for name in sorted(self._action_favorites) if name in all_items]
-        if favorites:
-            groups.append(('Favorites', favorites))
-        if self._action_filter.get() != 'Favorites':
-            groups.extend(self.ACTION_PICKER_GROUPS)
+
         matches = []
-        for category, actions in groups:
-            visible = [item for item in actions if
-                       (not search or search in category.casefold() or
-                        search in item[0].casefold() or search in item[1].casefold())]
+        for category, actions in self.ACTION_PICKER_GROUPS:
+            visible = [item for item in actions if not search or
+                       search in category.casefold() or
+                       search in item[0].casefold() or
+                       search in item[1].casefold()]
             if not visible:
                 continue
-            section = tk.Frame(self._action_picker_inner, bg=BG_SIDEBAR)
-            section.pack(fill=tk.X, padx=(8, 9), pady=(8, 0))
-            is_closed = category in self._action_collapsed and not search
-            heading = tk.Label(section, text=('▸  ' if is_closed else '▾  ') +
-                               category.upper() + f'  ({len(visible)})',
-                               font=('Segoe UI', 8, 'bold'), fg=TEXT_MUTED,
-                               bg=BG_SIDEBAR, anchor='w', cursor='hand2', pady=5)
-            heading.pack(fill=tk.X)
-            heading.bind('<Button-1>', lambda e, c=category: self._toggle_action_category(c))
+            tk.Label(self._action_picker_inner, text=category.upper(),
+                     font=("Segoe UI", 8, "bold"), fg=TEXT_MUTED,
+                     bg=BG_SIDEBAR, anchor="w").pack(
+                         fill=tk.X, padx=14, pady=(14, 5))
             for name, description, sigil in visible:
-                if name not in matches:
-                    matches.append(name)
-                if is_closed:
-                    continue
-                selected = name == self._selected_action_name
-                color = BG_SELECTED if selected else BG_SIDEBAR
-                row = tk.Frame(self._action_picker_inner, bg=color, cursor='hand2', pady=5)
-                row.pack(fill=tk.X, padx=(7, 9), pady=1)
-                use_gradient = selected and bool(getattr(self.app, 'gradient_enabled', False))
-                if use_gradient:
-                    gradient_bg = SequentSelectionGradient(
-                        row, COLOR_ACCENT, self.app.gradient_second_color, bg=color)
-                    gradient_bg.place(x=0, y=0, relwidth=1, relheight=1)
-                    gradient_bg.tk.call('lower', str(gradient_bg))
-                    gradient_bg.bind('<Button-1>', lambda e, n=name: self._switch_action_view(
-                        n, self._action_menu_line_num, self._action_menu_edit_idx))
-                    # Text-bearing widgets use representative gradient samples;
-                    # the canvas paints the full selected surface behind them.
-                    inks = sequent_gradient_colors(COLOR_ACCENT, self.app.gradient_second_color, 8)
-                    icon_bg, label_bg, star_bg = inks[1], inks[4], inks[7]
-                else:
-                    icon_bg = label_bg = star_bg = color
-                ico = SequentIcon(row, sequent_icon_for_action(name), color=SYNTAX_BLUE,
-                                  bg=icon_bg, size=17,
-                                  override_key=sequent_icon_slot('action', name), slot_label=name)
-                ico.pack(side=tk.LEFT, padx=(8, 8))
-                label = tk.Label(row, text=name, bg=label_bg,
-                                 fg=accent_text_color(COLOR_ACCENT) if use_gradient else TEXT_PRIMARY,
-                                 font=('Segoe UI', 9, 'bold' if selected else 'normal'),
-                                 anchor='w', cursor='hand2')
-                label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-                star = tk.Label(row, text='★' if name in self._action_favorites else '☆',
-                                bg=star_bg, fg=(accent_text_color(COLOR_ACCENT) if use_gradient else
-                                    (COLOR_ACCENT if name in self._action_favorites else TEXT_MUTED)),
-                                font=('Segoe UI', 13), cursor='hand2', padx=7)
-                star.pack(side=tk.RIGHT)
-                star.bind('<Button-1>', lambda e, n=name: self._toggle_action_favorite(n))
-                for widget in (row, ico, label):
-                    widget.bind('<Button-1>', lambda e, n=name: self._switch_action_view(
-                        n, self._action_menu_line_num, self._action_menu_edit_idx))
+                matches.append(name)
+                selected = (name == self._selected_action_name)
+                row_color = BG_SELECTED if selected else BG_SIDEBAR
+                tile = tk.Frame(self._action_picker_inner, bg=row_color,
+                                cursor="hand2", padx=9, pady=8)
+                tile.pack(fill=tk.X, padx=(4, 8), pady=2)
+                accent = SequentRoundedAccentBar(
+                    tile, thickness=3, background=row_color,
+                    accent=COLOR_ACCENT if selected else '', inset=4)
+                accent.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 9))
+                tag = SequentIcon(tile, sequent_icon_for_action(name),
+                                  color=SYNTAX_BLUE, bg=BG_INPUT, size=24,
+                                  override_key=sequent_icon_slot('action', name),
+                                  slot_label=name)
+                tag.pack(side=tk.LEFT, padx=(0, 8))
+                names = tk.Frame(tile, bg=row_color)
+                names.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                name_lbl = tk.Label(
+                    names, text=name, font=("Segoe UI", 9, "bold"),
+                    bg=row_color, fg=TEXT_PRIMARY, anchor="w")
+                name_lbl.pack(fill=tk.X)
+                summary = tk.Label(
+                    names, text=description, font=("Segoe UI", 8),
+                    bg=row_color, fg=TEXT_MUTED, anchor="w", justify="left",
+                    wraplength=170)
+                summary.pack(fill=tk.X, pady=(2, 0))
+                for widget in (tile, accent, tag, names, name_lbl, summary):
+                    widget.bind("<Button-1>",
+                                lambda e, n=name: self._switch_action_view(
+                                    n, self._action_menu_line_num,
+                                    self._action_menu_edit_idx))
         self._visible_action_names = matches
         if not matches:
-            tk.Label(self._action_picker_inner, text='No matching actions',
-                     bg=BG_SIDEBAR, fg=TEXT_MUTED).pack(pady=24)
+            tk.Label(self._action_picker_inner,
+                     text="No matching actions.\nTry another search.",
+                     font=("Segoe UI", 9), bg=BG_SIDEBAR,
+                     fg=TEXT_MUTED, justify="center").pack(padx=8, pady=32)
         self._action_picker_inner.update_idletasks()
-        self._action_picker_canvas.configure(scrollregion=self._action_picker_canvas.bbox('all'))
-        self._action_picker_canvas.yview_moveto(0 if search else old_scroll)
-
-    def open_action_command_palette(self, event=None):
-        """Fast searchable action chooser; opens the existing editor unchanged."""
-        if getattr(self, '_command_palette', None) is not None:
-            try:
-                if self._command_palette.winfo_exists():
-                    self._command_palette.lift()
-                    self._palette_search.focus_set()
-                    return 'break'
-            except tk.TclError:
-                pass
-        win = tk.Toplevel(self.app.root)
-        self._command_palette = win
-        win.title('Sequent — Insert Action')
-        win.configure(bg=BG_PANEL)
-        win.geometry('480x420')
-        win.transient(self.app.root)
-        win.bind('<Escape>', lambda e: win.destroy())
-        tk.Label(win, text='INSERT ACTION', bg=BG_PANEL, fg=TEXT_PRIMARY,
-                 font=('Segoe UI', 11, 'bold')).pack(anchor='w', padx=18, pady=(16, 7))
-        query = tk.StringVar()
-        entry = tk.Entry(win, textvariable=query, bg=BG_INPUT, fg=TEXT_PRIMARY,
-                         insertbackground=TEXT_PRIMARY, font=('Segoe UI', 11), bd=0)
-        entry.pack(fill=tk.X, padx=18, ipady=8)
-        self._palette_search = entry
-        result_frame = tk.Frame(win, bg=BG_PANEL)
-        result_frame.pack(fill=tk.BOTH, expand=True, padx=18, pady=12)
-        scroll_canvas = tk.Canvas(result_frame, bg=BG_PANEL, bd=0, highlightthickness=0)
-        scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ModernScrollBar(result_frame, command=scroll_canvas.yview,
-                                    width=12, bg_trough=BG_PANEL)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        scroll_canvas.configure(yscrollcommand=scrollbar.set)
-        inner = tk.Frame(scroll_canvas, bg=BG_PANEL)
-        item = scroll_canvas.create_window((0, 0), window=inner, anchor='nw')
-        inner.bind('<Configure>', lambda e: scroll_canvas.configure(scrollregion=scroll_canvas.bbox('all')))
-        scroll_canvas.bind('<Configure>', lambda e: scroll_canvas.itemconfigure(item, width=e.width))
-        actions = [(name, desc) for _, group in self.ACTION_PICKER_GROUPS for name, desc, _ in group]
-        results = []
-        def choose(name):
-            win.destroy()
-            # Use the normal add-action workflow, preserving all action editors.
-            line_num = max(2, len(self.app.recorded_actions) + 2)
-            self.open_action_submenu(line_num, None)
-            if self.sub_menu and self.sub_menu.winfo_exists():
-                self._switch_action_view(name, self._action_menu_line_num, self._action_menu_edit_idx)
-        def refresh(*_):
-            for child in inner.winfo_children():
-                child.destroy()
-            term = query.get().strip().casefold()
-            results[:] = [name for name, desc in actions if term in name.casefold() or term in desc.casefold()]
-            for name in results:
-                line = tk.Label(inner, text='  ' + name, anchor='w', bg=BG_PANEL,
-                                fg=TEXT_PRIMARY, font=('Segoe UI', 9), pady=7, cursor='hand2')
-                line.pack(fill=tk.X)
-                line.bind('<Button-1>', lambda e, n=name: choose(n))
-            scroll_canvas.yview_moveto(0)
-        query.trace_add('write', refresh)
-        entry.bind('<Return>', lambda e: choose(results[0]) if results else None)
-        refresh()
-        entry.focus_set()
-        return 'break'
+        self._action_picker_canvas.configure(
+            scrollregion=self._action_picker_canvas.bbox("all"))
+        self._action_picker_canvas.yview_moveto(old_scroll)
 
     def _switch_action_view(self, action_type, line_num, edit_idx=None):
         if not self.sub_menu or not self.sub_menu.winfo_exists():
@@ -7809,10 +7216,7 @@ class VSCodeQueueViewer(tk.Frame):
         }
         self._selected_action_title.config(text=action_type)
         self._selected_action_desc.config(text=descriptions.get(action_type, ""))
-        try:
-            self._rebuild_action_picker()
-        except (tk.TclError, ValueError) as exc:
-            print(f"Action Library highlight refresh failed: {exc}")
+        self._rebuild_action_picker()
 
         for child in self.action_content_frame.winfo_children():
             child.destroy()
@@ -7837,7 +7241,6 @@ class VSCodeQueueViewer(tk.Frame):
             "Gate Check": self._render_gate_check_view,
             "Label Marker": self._render_label_view,
             "Jump to Label": self._render_goto_view,
-            "Mouse Action": self._render_mouse_action_view,
         }
         renderers.get(action_type, self._render_dynamic_action_view)(line_num, edit_idx=edit_idx)
         self._action_editor_canvas.yview_moveto(0)
@@ -8700,108 +8103,6 @@ class VSCodeQueueViewer(tk.Frame):
                                  activebackground=COLOR_ACCENT)
         mode_menu.pack(fill=tk.X, pady=(0, 10))
 
-        # Optional guard sits in its own packed container immediately below the operation.
-        condition_enabled = tk.BooleanVar(value=bool(current.get('condition_enabled', False)) if current else False)
-        condition_section = tk.Frame(body, bg=BG_PANEL)
-        condition_section.pack(fill=tk.X, pady=(0, 10))
-        condition_toggle = tk.Checkbutton(
-            condition_section, text='Run only when conditions match',
-            variable=condition_enabled, bg=BG_PANEL, fg=TEXT_PRIMARY,
-            selectcolor=BG_INPUT, activebackground=BG_PANEL)
-        condition_toggle.pack(anchor='w')
-        condition_fields = tk.Frame(condition_section, bg=BG_PANEL)
-        condition_rows = []
-        operators = ('==', '!=', 'contains', 'not contains', 'startswith',
-                     'endswith', '>', '>=', '<', '<=', 'empty', 'not empty', 'regex')
-
-        def condition_menu(parent, variable, options):
-            menu = tk.OptionMenu(parent, variable, *options)
-            menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0,
-                        highlightthickness=1, highlightbackground=BG_BORDER)
-            menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-            menu.pack(fill=tk.X, pady=(1, 5))
-            return menu
-
-        def condition_entry(parent, label, initial=''):
-            tk.Label(parent, text=label, bg=BG_PANEL, fg=TEXT_MUTED,
-                     font=('Segoe UI', 8)).pack(anchor='w')
-            entry = tk.Entry(parent, bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
-                             highlightbackground=BG_BORDER, highlightthickness=1, bd=0)
-            entry.insert(0, str(initial))
-            entry.pack(fill=tk.X, ipady=3, pady=(1, 5))
-            return entry
-
-        def add_condition(saved=None):
-            saved = saved or {}
-            card = tk.Frame(condition_fields, bg=BG_PANEL,
-                            highlightbackground=BG_BORDER, highlightthickness=1, padx=7, pady=7)
-            card.pack(fill=tk.X, pady=(0, 7))
-            record = {'card': card}
-            if condition_rows:
-                tk.Label(card, text='Combine with previous rule:', bg=BG_PANEL,
-                         fg=TEXT_MUTED).pack(anchor='w')
-                record['join'] = tk.StringVar(value=saved.get('join', 'AND'))
-                condition_menu(card, record['join'], ('AND', 'OR'))
-            else:
-                record['join'] = tk.StringVar(value='AND')
-            record['negate'] = tk.BooleanVar(value=bool(saved.get('negate', False)))
-            tk.Checkbutton(card, text='NOT (invert this condition)', variable=record['negate'],
-                           bg=BG_PANEL, fg=TEXT_PRIMARY, selectcolor=BG_INPUT).pack(anchor='w')
-            record['left_name'] = condition_entry(card, 'Variable Name', saved.get('left_name', ''))
-            tk.Label(card, text='Variable Scope', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
-            record['left_scope'] = tk.StringVar(value=saved.get('left_scope', 'local').title())
-            condition_menu(card, record['left_scope'], ('Local', 'Global'))
-            tk.Label(card, text='Comparison', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
-            record['operator'] = tk.StringVar(value=saved.get('operator', '=='))
-            condition_menu(card, record['operator'], operators)
-            record['right_type'] = tk.StringVar(value=saved.get('right_type', 'text').title())
-            right_section = tk.Frame(card, bg=BG_PANEL)
-            right_section.pack(fill=tk.X)
-            tk.Label(right_section, text='Compare against', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
-            condition_menu(right_section, record['right_type'], ('Text', 'Variable'))
-            text_frame = tk.Frame(right_section, bg=BG_PANEL)
-            record['right_text'] = condition_entry(text_frame, 'Text Value', saved.get('right_text', ''))
-            variable_rhs = tk.Frame(right_section, bg=BG_PANEL)
-            record['right_name'] = condition_entry(variable_rhs, 'Variable Name', saved.get('right_name', ''))
-            tk.Label(variable_rhs, text='Variable Scope', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
-            record['right_scope'] = tk.StringVar(value=saved.get('right_scope', 'local').title())
-            condition_menu(variable_rhs, record['right_scope'], ('Local', 'Global'))
-            def refresh_rhs(*_):
-                text_frame.pack_forget()
-                variable_rhs.pack_forget()
-                if record['operator'].get() not in ('empty', 'not empty'):
-                    (variable_rhs if record['right_type'].get() == 'Variable' else text_frame).pack(fill=tk.X)
-            record['right_type'].trace_add('write', refresh_rhs)
-            record['operator'].trace_add('write', refresh_rhs)
-            refresh_rhs()
-            def remove():
-                condition_rows.remove(record)
-                card.destroy()
-            tk.Button(card, text='Remove Condition', command=remove, bg=BG_INPUT,
-                      fg=COLOR_DANGER, bd=0).pack(anchor='e')
-            condition_rows.append(record)
-
-        saved_conditions = current.get('conditions', []) if current else []
-        for rule in saved_conditions:
-            if isinstance(rule, dict):
-                add_condition(rule)
-        if not condition_rows:
-            add_condition()
-        tk.Button(condition_fields, text='+ Add Condition', command=add_condition,
-                  bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0).pack(fill=tk.X, pady=(0, 5))
-        tk.Label(condition_fields, text='Conditions are evaluated before reading the clipboard. '
-                 'A false result skips this action; disabled means normal behavior.',
-                 bg=BG_PANEL, fg=TEXT_MUTED, wraplength=430, justify=tk.LEFT).pack(fill=tk.X)
-        def refresh_condition(*_):
-            if condition_enabled.get():
-                condition_fields.pack(fill=tk.X, pady=(5, 0))
-            else:
-                condition_fields.pack_forget()
-        condition_enabled.trace_add('write', refresh_condition)
-        refresh_condition()
-
-        read_clipboard_outcomes = sequent_clipboard_outcome_editor(body, self.app, current)
-
         variable_frame = tk.Frame(body, bg=BG_PANEL)
         variable_frame.pack(fill=tk.X)
         tk.Label(variable_frame, text='Default Destination Variable:', font=('Segoe UI', 8, 'bold'),
@@ -9014,40 +8315,6 @@ class VSCodeQueueViewer(tk.Frame):
             scope = scope_var.get().lower()
             mode = next(k for k, v in labels.items() if v == mode_var.get())
             action = {'type': 'read_clipboard', 'mode': mode}
-            try:
-                action.update(read_clipboard_outcomes())
-            except MacroExecutionError as exc:
-                self.app.update_status(str(exc), COLOR_DANGER)
-                return
-            if condition_enabled.get():
-                if not condition_rows:
-                    self.app.update_status('Add at least one clipboard condition', COLOR_DANGER)
-                    return
-                rules = []
-                for idx, row in enumerate(condition_rows):
-                    lhs = row['left_name'].get().strip()
-                    rhs_type = row['right_type'].get().lower()
-                    rhs_name = row['right_name'].get().strip()
-                    operator = row['operator'].get()
-                    if not lhs or (operator not in ('empty', 'not empty') and
-                                   rhs_type == 'variable' and not rhs_name):
-                        self.app.update_status('Complete all clipboard condition variable names', COLOR_DANGER)
-                        return
-                    try:
-                        variable_identity(lhs, row['left_scope'].get().lower())
-                        if rhs_type == 'variable' and operator not in ('empty', 'not empty'):
-                            variable_identity(rhs_name, row['right_scope'].get().lower())
-                    except MacroExecutionError as exc:
-                        self.app.update_status(str(exc), COLOR_DANGER)
-                        return
-                    rules.append({
-                        'left_name': lhs, 'left_scope': row['left_scope'].get().lower(),
-                        'operator': operator, 'right_type': rhs_type,
-                        'right_text': row['right_text'].get(), 'right_name': rhs_name,
-                        'right_scope': row['right_scope'].get().lower(),
-                        'negate': row['negate'].get(),
-                        'join': row['join'].get() if idx else 'AND'})
-                action.update(condition_enabled=True, conditions=rules)
             if mode != 'file' or also_set_var.get():
                 try:
                     variable_identity(name, scope)
@@ -9259,112 +8526,6 @@ class VSCodeQueueViewer(tk.Frame):
         ModernButton(body, text=label, bg_color=COLOR_SUCCESS if edit_idx is not None
                      else COLOR_ACCENT, hover_color='#1d8a4b' if edit_idx is not None
                      else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
-
-    def _render_mouse_action_view(self, line_num, edit_idx=None):
-        """Edit recorded mouse coordinates and click type without UIA conversion."""
-        body = self.action_content_frame
-        old = (self.app.recorded_actions[edit_idx] if edit_idx is not None else {})
-        def caption(label):
-            tk.Label(body, text=label, bg=BG_PANEL, fg=TEXT_MUTED,
-                     font=('Segoe UI', 9, 'bold'), anchor='w').pack(fill=tk.X, pady=(8, 3))
-        caption('Mouse Action')
-        initial = old.get('mouse_action', 'Hover' if old.get('type') == 'move' else
-                          ('Right Click' if old.get('btn') == 'right' else 'Left Click'))
-        kind = tk.StringVar(value=initial)
-        options = ('Left Click', 'Right Click', 'Double Click', 'Hover')
-        menu = tk.OptionMenu(body, kind, *options)
-        menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, highlightthickness=1,
-                    highlightbackground=BG_BORDER)
-        menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
-        menu.pack(fill=tk.X)
-        axes = {}
-        for axis in ('x', 'y'):
-            caption(f'{axis.upper()} Coordinate Source')
-            source = tk.StringVar(value=old.get(f'{axis}_source', 'Fixed'))
-            selector = tk.OptionMenu(body, source, 'Fixed', 'Variable')
-            selector.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0)
-            selector['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
-            selector.pack(fill=tk.X)
-            # Keep conditional fields in a dedicated slot immediately below this selector.
-            slot = tk.Frame(body, bg=BG_PANEL)
-            slot.pack(fill=tk.X, pady=(4, 5))
-            fixed_frame = tk.Frame(slot, bg=BG_PANEL)
-            variable_frame = tk.Frame(slot, bg=BG_PANEL)
-            tk.Label(fixed_frame, text=f'{axis.upper()} Position', bg=BG_PANEL,
-                     fg=TEXT_MUTED).pack(anchor='w')
-            fixed = tk.Entry(fixed_frame, bg=BG_INPUT, fg=TEXT_PRIMARY,
-                             insertbackground=TEXT_PRIMARY)
-            fixed.insert(0, str(old.get(axis, 0)))
-            fixed.pack(fill=tk.X, ipady=4)
-            tk.Label(variable_frame, text='Variable Name', bg=BG_PANEL,
-                     fg=TEXT_MUTED).pack(anchor='w')
-            name = tk.Entry(variable_frame, bg=BG_INPUT, fg=TEXT_PRIMARY,
-                            insertbackground=TEXT_PRIMARY)
-            name.insert(0, old.get(f'{axis}_var', ''))
-            name.pack(fill=tk.X, ipady=4)
-            tk.Label(variable_frame, text='Variable Scope', bg=BG_PANEL,
-                     fg=TEXT_MUTED).pack(anchor='w', pady=(5, 2))
-            scope = tk.StringVar(value=old.get(f'{axis}_scope', 'local').title())
-            sm = tk.OptionMenu(variable_frame, scope, 'Local', 'Global')
-            sm.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0)
-            sm['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY)
-            sm.pack(fill=tk.X)
-            def refresh(*_, src=source, ff=fixed_frame, vf=variable_frame):
-                ff.pack_forget()
-                vf.pack_forget()
-                (vf if src.get() == 'Variable' else ff).pack(fill=tk.X)
-            source.trace_add('write', refresh)
-            refresh()
-            axes[axis] = (source, fixed, name, scope)
-        if edit_idx is None:
-            caption('Insert Position')
-            position = tk.StringVar(value=f'Before Line {line_num}')
-            pm = tk.OptionMenu(body, position, f'Before Line {line_num}', f'After Line {line_num}')
-            pm.config(bg=BG_INPUT, fg=TEXT_PRIMARY)
-            pm.pack(fill=tk.X)
-        def save():
-            action = dict(old)
-            action.pop('win_title', None)
-            action.pop('rel_x', None)
-            action.pop('rel_y', None)
-            action['type'] = 'move' if kind.get() == 'Hover' else 'click'
-            action['mouse_action'] = kind.get()
-            action['btn'] = 'right' if kind.get() == 'Right Click' else 'left'
-            for axis, (source, fixed, name, scope) in axes.items():
-                action[f'{axis}_source'] = source.get()
-                if source.get() == 'Variable':
-                    value = name.get().strip()
-                    if not value:
-                        messagebox.showerror('Missing Variable', f'Enter a {axis.upper()} variable name.', parent=self.sub_menu)
-                        return
-                    try:
-                        value, _ = variable_identity(value, scope.get().lower())
-                    except MacroExecutionError as exc:
-                        messagebox.showerror('Invalid Variable', str(exc), parent=self.sub_menu)
-                        return
-                    action[f'{axis}_var'] = value
-                    action[f'{axis}_scope'] = scope.get().lower()
-                else:
-                    try:
-                        action[axis] = int(fixed.get().strip())
-                    except ValueError:
-                        messagebox.showerror('Invalid Coordinate', f'{axis.upper()} must be an integer.', parent=self.sub_menu)
-                        return
-                    action.pop(f'{axis}_var', None)
-                    action.pop(f'{axis}_scope', None)
-            if edit_idx is not None:
-                self.app.recorded_actions[edit_idx] = action
-                idx = edit_idx
-            else:
-                idx = max(0, min(len(self.app.recorded_actions),
-                    line_num - (1 if 'After' in position.get() else 2)))
-                self.app.recorded_actions.insert(idx, action)
-            self.app.display_actions_in_queue(self.app.recorded_actions)
-            self.app.set_active_action_index(idx)
-            self.close_sub_menu()
-        ModernButton(body, text='Save Changes' if edit_idx is not None else 'Add Mouse Action',
-                     bg_color=COLOR_SUCCESS, hover_color=COLOR_ACCENT_HOV,
-                     command=save).pack(fill=tk.X, pady=(14, 4))
 
     def _render_type_variable_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
@@ -9697,107 +8858,6 @@ class VSCodeQueueViewer(tk.Frame):
         prompt_entry.insert(0, curr_act.get("prompt", "Enter value:") if (curr_act and curr_act.get("type") == "prompt_input") else "Enter value:")
         prompt_entry.focus_set()
 
-        # Optional guard sits in its own packed container immediately below the operation.
-        condition_enabled = tk.BooleanVar(value=bool(curr_act.get('condition_enabled', False)) if curr_act else False)
-        condition_section = tk.Frame(body, bg=BG_PANEL)
-        condition_section.pack(fill=tk.X, pady=(8, 10))
-        condition_toggle = tk.Checkbutton(
-            condition_section, text='Run only when conditions match',
-            variable=condition_enabled, bg=BG_PANEL, fg=TEXT_PRIMARY,
-            selectcolor=BG_INPUT, activebackground=BG_PANEL)
-        condition_toggle.pack(anchor='w')
-        condition_fields = tk.Frame(condition_section, bg=BG_PANEL)
-        condition_rows = []
-        operators = ('==', '!=', 'contains', 'not contains', 'startswith',
-                     'endswith', '>', '>=', '<', '<=', 'empty', 'not empty', 'regex')
-
-        def condition_menu(parent, variable, options):
-            menu = tk.OptionMenu(parent, variable, *options)
-            menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0,
-                        highlightthickness=1, highlightbackground=BG_BORDER)
-            menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-            menu.pack(fill=tk.X, pady=(1, 5))
-            return menu
-
-        def condition_entry(parent, label, initial=''):
-            tk.Label(parent, text=label, bg=BG_PANEL, fg=TEXT_MUTED,
-                     font=('Segoe UI', 8)).pack(anchor='w')
-            entry = tk.Entry(parent, bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
-                             highlightbackground=BG_BORDER, highlightthickness=1, bd=0)
-            entry.insert(0, str(initial))
-            entry.pack(fill=tk.X, ipady=3, pady=(1, 5))
-            return entry
-
-        def add_condition(saved=None):
-            saved = saved or {}
-            card = tk.Frame(condition_fields, bg=BG_PANEL,
-                            highlightbackground=BG_BORDER, highlightthickness=1, padx=7, pady=7)
-            card.pack(fill=tk.X, pady=(0, 7))
-            record = {'card': card}
-            if condition_rows:
-                tk.Label(card, text='Combine with previous rule:', bg=BG_PANEL,
-                         fg=TEXT_MUTED).pack(anchor='w')
-                record['join'] = tk.StringVar(value=saved.get('join', 'AND'))
-                condition_menu(card, record['join'], ('AND', 'OR'))
-            else:
-                record['join'] = tk.StringVar(value='AND')
-            record['negate'] = tk.BooleanVar(value=bool(saved.get('negate', False)))
-            tk.Checkbutton(card, text='NOT (invert this condition)', variable=record['negate'],
-                           bg=BG_PANEL, fg=TEXT_PRIMARY, selectcolor=BG_INPUT).pack(anchor='w')
-            record['left_name'] = condition_entry(card, 'Variable Name', saved.get('left_name', ''))
-            tk.Label(card, text='Variable Scope', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
-            record['left_scope'] = tk.StringVar(value=saved.get('left_scope', 'local').title())
-            condition_menu(card, record['left_scope'], ('Local', 'Global'))
-            tk.Label(card, text='Comparison', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
-            record['operator'] = tk.StringVar(value=saved.get('operator', '=='))
-            condition_menu(card, record['operator'], operators)
-            record['right_type'] = tk.StringVar(value=saved.get('right_type', 'text').title())
-            right_section = tk.Frame(card, bg=BG_PANEL)
-            right_section.pack(fill=tk.X)
-            tk.Label(right_section, text='Compare against', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
-            condition_menu(right_section, record['right_type'], ('Text', 'Variable'))
-            text_frame = tk.Frame(right_section, bg=BG_PANEL)
-            record['right_text'] = condition_entry(text_frame, 'Text Value', saved.get('right_text', ''))
-            variable_rhs = tk.Frame(right_section, bg=BG_PANEL)
-            record['right_name'] = condition_entry(variable_rhs, 'Variable Name', saved.get('right_name', ''))
-            tk.Label(variable_rhs, text='Variable Scope', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
-            record['right_scope'] = tk.StringVar(value=saved.get('right_scope', 'local').title())
-            condition_menu(variable_rhs, record['right_scope'], ('Local', 'Global'))
-            def refresh_rhs(*_):
-                text_frame.pack_forget()
-                variable_rhs.pack_forget()
-                if record['operator'].get() not in ('empty', 'not empty'):
-                    (variable_rhs if record['right_type'].get() == 'Variable' else text_frame).pack(fill=tk.X)
-            record['right_type'].trace_add('write', refresh_rhs)
-            record['operator'].trace_add('write', refresh_rhs)
-            refresh_rhs()
-            def remove():
-                condition_rows.remove(record)
-                card.destroy()
-            tk.Button(card, text='Remove Condition', command=remove, bg=BG_INPUT,
-                      fg=COLOR_DANGER, bd=0).pack(anchor='e')
-            condition_rows.append(record)
-
-        saved_conditions = curr_act.get('conditions', []) if curr_act and curr_act.get('type') == 'prompt_input' else []
-        for rule in saved_conditions:
-            if isinstance(rule, dict):
-                add_condition(rule)
-        if not condition_rows:
-            add_condition()
-        tk.Button(condition_fields, text='+ Add Condition', command=add_condition,
-                  bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0).pack(fill=tk.X, pady=(0, 5))
-        tk.Label(condition_fields, text='Conditions are evaluated before requesting input. '
-                 'A false result skips this action; disabled means normal behavior.',
-                 bg=BG_PANEL, fg=TEXT_MUTED, wraplength=430, justify=tk.LEFT).pack(fill=tk.X)
-        def refresh_condition(*_):
-            if condition_enabled.get():
-                condition_fields.pack(fill=tk.X, pady=(5, 0))
-            else:
-                condition_fields.pack_forget()
-        condition_enabled.trace_add('write', refresh_condition)
-        refresh_condition()
-
-
         var_row = tk.Frame(body, bg=BG_PANEL)
         var_row.pack(fill=tk.X, pady=(0, 6))
 
@@ -9823,39 +8883,10 @@ class VSCodeQueueViewer(tk.Frame):
             pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
             pos_menu.pack(fill=tk.X, pady=(4, 8))
 
-        def collect_input_conditions():
-            if not condition_enabled.get():
-                return {'condition_enabled': False, 'conditions': []}
-            if not condition_rows:
-                raise MacroExecutionError('Add at least one Request Input condition')
-            rules = []
-            for idx, row in enumerate(condition_rows):
-                lhs = row['left_name'].get().strip()
-                rhs_type = row['right_type'].get().lower()
-                rhs_name = row['right_name'].get().strip()
-                operator = row['operator'].get()
-                if not lhs or (operator not in ('empty', 'not empty') and rhs_type == 'variable' and not rhs_name):
-                    raise MacroExecutionError('Complete all condition variable names')
-                variable_identity(lhs, row['left_scope'].get().lower())
-                if rhs_type == 'variable' and operator not in ('empty', 'not empty'):
-                    variable_identity(rhs_name, row['right_scope'].get().lower())
-                rules.append({
-                    'left_name': lhs, 'left_scope': row['left_scope'].get().lower(),
-                    'operator': operator, 'right_type': rhs_type,
-                    'right_text': row['right_text'].get(), 'right_name': rhs_name,
-                    'right_scope': row['right_scope'].get().lower(),
-                    'negate': row['negate'].get(), 'join': row['join'].get() if idx else 'AND'})
-            return {'condition_enabled': True, 'conditions': rules}
-
         def submit():
             p_text = prompt_entry.get().strip() or "Enter value:"
             v_name = var_entry.get().strip() or "user_data"
             d_val = def_entry.get()
-            try:
-                guard = collect_input_conditions()
-            except MacroExecutionError as exc:
-                self.app.update_status(str(exc), COLOR_DANGER)
-                return
 
             if edit_idx is not None:
                 self.app.recorded_actions[edit_idx] = {
@@ -9863,8 +8894,7 @@ class VSCodeQueueViewer(tk.Frame):
                     "prompt": p_text,
                     "var_name": v_name,
                     "var_scope": scope_var.get().lower(),
-                    "default": d_val,
-                    **guard
+                    "default": d_val
                 }
                 self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.app.set_active_action_index(edit_idx)
@@ -9879,8 +8909,7 @@ class VSCodeQueueViewer(tk.Frame):
                     "prompt": p_text,
                     "var_name": v_name,
                     "var_scope": scope_var.get().lower(),
-                    "default": d_val,
-                    **guard
+                    "default": d_val
                 })
                 self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.app.update_status(f"Added Request Input for '{v_name}'", COLOR_SUCCESS)
@@ -10227,12 +9256,6 @@ class VSCodeQueueViewer(tk.Frame):
                          'empty, or invalid file leaves the variable unchanged.',
                      bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
                      wraplength=460, justify='left').pack(fill=tk.X, pady=4)
-        load_text_outcomes = None
-        if type_name == 'load_text_variable':
-            tk.Label(body, text='IF FOUND = file has text. IF NOT FOUND = file is empty. '
-                     'Missing or unreadable files remain errors.', bg=BG_PANEL,
-                     fg=TEXT_MUTED, wraplength=460, justify='left').pack(fill=tk.X, pady=(3, 5))
-            load_text_outcomes = sequent_clipboard_outcome_editor(body, self.app, old, title="LOAD TEXT FILE RESULTS")
         if type_name=='trigger_start':
             tk.Label(body,text='Place this as the FIRST action in the sequence to arm auto-start. '
                          'Sequent checks for a new window, changed clipboard, or a new/modified file '
@@ -10316,8 +9339,6 @@ class VSCodeQueueViewer(tk.Frame):
                         val=json.loads(val)
                         if not isinstance(val,list):raise ValueError(f'{key}: expected a JSON list')
                     action[key]=val
-                if load_text_outcomes is not None:
-                    action.update(load_text_outcomes())
                 if 'var_scope' in action:
                     action['var_scope'] = str(action['var_scope']).lower()
                 if 'var_name' in action and action.get('var_scope') == 'global':
@@ -10658,41 +9679,6 @@ class VSCodeQueueViewer(tk.Frame):
                 and self.app.recorded_actions[edit_idx].get("type") == "find_color"
                 else {})
 
-        cache_enabled = tk.BooleanVar(value=bool(curr.get('position_cache', True)))
-        cache_fallback = tk.BooleanVar(value=bool(curr.get('cache_fallback', True)))
-        cache_radius = tk.StringVar(value=str(curr.get('cache_radius', 100)))
-        cache_controls = tk.Frame(body, bg=BG_PANEL)
-        cache_controls.pack(fill=tk.X, pady=(5, 8))
-        tk.Checkbutton(cache_controls, text='Search last known position first',
-                       variable=cache_enabled, bg=BG_PANEL, fg=TEXT_PRIMARY,
-                       selectcolor=BG_INPUT).pack(anchor='w')
-        cache_details = tk.Frame(cache_controls, bg=BG_PANEL)
-        radius_row = tk.Frame(cache_details, bg=BG_PANEL)
-        radius_row.pack(fill=tk.X)
-        tk.Label(radius_row, text='Search padding (pixels):', bg=BG_PANEL,
-                 fg=TEXT_MUTED).pack(side=tk.LEFT)
-        tk.Entry(radius_row, textvariable=cache_radius, width=7, bg=BG_INPUT,
-                 fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY).pack(side=tk.LEFT, padx=7)
-        tk.Checkbutton(cache_details, text='Fall back to full search if not found',
-                       variable=cache_fallback, bg=BG_PANEL, fg=TEXT_PRIMARY,
-                       selectcolor=BG_INPUT).pack(anchor='w')
-        def refresh_cache_controls(*_):
-            cache_details.pack_forget()
-            if cache_enabled.get():
-                cache_details.pack(fill=tk.X)
-        cache_enabled.trace_add('write', refresh_cache_controls)
-        refresh_cache_controls()
-
-        def cache_settings():
-            try:
-                radius = int(cache_radius.get())
-                if not 16 <= radius <= 1000:
-                    raise ValueError()
-            except ValueError:
-                raise MacroExecutionError('Cache padding must be between 16 and 1000 pixels')
-            return {'position_cache': bool(cache_enabled.get()),
-                    'cache_fallback': bool(cache_fallback.get()), 'cache_radius': radius}
-
         def text_label(parent, label):
             return tk.Label(parent, text=label, font=("Segoe UI", 8, "bold"),
                             bg=BG_PANEL, fg=TEXT_MUTED)
@@ -10859,11 +9845,6 @@ class VSCodeQueueViewer(tk.Frame):
             except MacroExecutionError as exc:
                 error_lbl.config(text=str(exc))
                 return
-            try:
-                updated_action.update(cache_settings())
-            except MacroExecutionError as exc:
-                error_lbl.config(text=str(exc))
-                return
             updated_action.update({"type": "find_color", "area": area,
                                    "color": color, "anchor": anchor_var.get(),
                                    "tolerance": tolerance, "ox": ox, "oy": oy,
@@ -10899,41 +9880,6 @@ class VSCodeQueueViewer(tk.Frame):
                 if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
                 and self.app.recorded_actions[edit_idx].get('type') == 'find_image'
                 else {})
-
-        cache_enabled = tk.BooleanVar(value=bool(curr.get('position_cache', True)))
-        cache_fallback = tk.BooleanVar(value=bool(curr.get('cache_fallback', True)))
-        cache_radius = tk.StringVar(value=str(curr.get('cache_radius', 100)))
-        cache_controls = tk.Frame(body, bg=BG_PANEL)
-        cache_controls.pack(fill=tk.X, pady=(5, 8))
-        tk.Checkbutton(cache_controls, text='Search last known position first',
-                       variable=cache_enabled, bg=BG_PANEL, fg=TEXT_PRIMARY,
-                       selectcolor=BG_INPUT).pack(anchor='w')
-        cache_details = tk.Frame(cache_controls, bg=BG_PANEL)
-        radius_row = tk.Frame(cache_details, bg=BG_PANEL)
-        radius_row.pack(fill=tk.X)
-        tk.Label(radius_row, text='Search padding (pixels):', bg=BG_PANEL,
-                 fg=TEXT_MUTED).pack(side=tk.LEFT)
-        tk.Entry(radius_row, textvariable=cache_radius, width=7, bg=BG_INPUT,
-                 fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY).pack(side=tk.LEFT, padx=7)
-        tk.Checkbutton(cache_details, text='Fall back to full search if not found',
-                       variable=cache_fallback, bg=BG_PANEL, fg=TEXT_PRIMARY,
-                       selectcolor=BG_INPUT).pack(anchor='w')
-        def refresh_cache_controls(*_):
-            cache_details.pack_forget()
-            if cache_enabled.get():
-                cache_details.pack(fill=tk.X)
-        cache_enabled.trace_add('write', refresh_cache_controls)
-        refresh_cache_controls()
-
-        def cache_settings():
-            try:
-                radius = int(cache_radius.get())
-                if not 16 <= radius <= 1000:
-                    raise ValueError()
-            except ValueError:
-                raise MacroExecutionError('Cache padding must be between 16 and 1000 pixels')
-            return {'position_cache': bool(cache_enabled.get()),
-                    'cache_fallback': bool(cache_fallback.get()), 'cache_radius': radius}
 
         def heading(text):
             tk.Label(body, text=text, bg=BG_PANEL, fg=TEXT_MUTED,
@@ -11159,7 +10105,6 @@ class VSCodeQueueViewer(tk.Frame):
                 raise MacroExecutionError('Offset X and Y must be whole numbers') from exc
             action = dict(curr)
             action.update(get_outcomes())
-            action.update(cache_settings())
             action.update({'type':'find_image', 'area':area,
                            'path':path_entry.get().strip(),
                            'confidence':confidence_entry.get().strip(),
@@ -11273,41 +10218,6 @@ class VSCodeQueueViewer(tk.Frame):
                 and self.app.recorded_actions[edit_idx].get("type") == "find_text"
                 else {})
 
-        cache_enabled = tk.BooleanVar(value=bool(curr.get('position_cache', True)))
-        cache_fallback = tk.BooleanVar(value=bool(curr.get('cache_fallback', True)))
-        cache_radius = tk.StringVar(value=str(curr.get('cache_radius', 100)))
-        cache_controls = tk.Frame(body, bg=BG_PANEL)
-        cache_controls.pack(fill=tk.X, pady=(5, 8))
-        tk.Checkbutton(cache_controls, text='Search last known position first',
-                       variable=cache_enabled, bg=BG_PANEL, fg=TEXT_PRIMARY,
-                       selectcolor=BG_INPUT).pack(anchor='w')
-        cache_details = tk.Frame(cache_controls, bg=BG_PANEL)
-        radius_row = tk.Frame(cache_details, bg=BG_PANEL)
-        radius_row.pack(fill=tk.X)
-        tk.Label(radius_row, text='Search padding (pixels):', bg=BG_PANEL,
-                 fg=TEXT_MUTED).pack(side=tk.LEFT)
-        tk.Entry(radius_row, textvariable=cache_radius, width=7, bg=BG_INPUT,
-                 fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY).pack(side=tk.LEFT, padx=7)
-        tk.Checkbutton(cache_details, text='Fall back to full search if not found',
-                       variable=cache_fallback, bg=BG_PANEL, fg=TEXT_PRIMARY,
-                       selectcolor=BG_INPUT).pack(anchor='w')
-        def refresh_cache_controls(*_):
-            cache_details.pack_forget()
-            if cache_enabled.get():
-                cache_details.pack(fill=tk.X)
-        cache_enabled.trace_add('write', refresh_cache_controls)
-        refresh_cache_controls()
-
-        def cache_settings():
-            try:
-                radius = int(cache_radius.get())
-                if not 16 <= radius <= 1000:
-                    raise ValueError()
-            except ValueError:
-                raise MacroExecutionError('Cache padding must be between 16 and 1000 pixels')
-            return {'position_cache': bool(cache_enabled.get()),
-                    'cache_fallback': bool(cache_fallback.get()), 'cache_radius': radius}
-
         def text_label(parent, label):
             return tk.Label(parent, text=label, font=("Segoe UI", 8, "bold"),
                             bg=BG_PANEL, fg=TEXT_MUTED)
@@ -11372,67 +10282,12 @@ class VSCodeQueueViewer(tk.Frame):
                      bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
                      command=pick_new_area).pack(fill=tk.X, pady=(0, 12))
 
-        # Search source: literal text or a runtime-resolved local/global variable.
-        text_label(body, "Search Target:").pack(anchor="w", pady=(0, 3))
-        initial_source = curr.get("text_source", "Literal")
-        source_var = tk.StringVar(value="Search for variables" if initial_source in ("Local", "Global") else "Search for text")
-        source_menu = tk.OptionMenu(body, source_var, "Search for text", "Search for variables")
-        source_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 9),
-                           highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
-        source_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-        source_menu.pack(fill=tk.X, pady=(0, 8))
-
-        # Keep a permanent layout slot. Repacking the panels directly into body
-        # moved them below later controls, making the fields appear to disappear.
-        target_slot = tk.Frame(body, bg=BG_PANEL)
-        target_slot.pack(fill=tk.X, pady=(0, 8))
-        target_slot.grid_columnconfigure(0, weight=1)
-
-        literal_panel = tk.Frame(target_slot, bg=BG_PANEL)
-        literal_panel.grid(row=0, column=0, sticky="ew")
-        text_label(literal_panel, "Target Text:").pack(anchor="w", pady=(0, 2))
-        txt_entry = tk.Entry(literal_panel, bg=BG_INPUT, fg=TEXT_PRIMARY,
-                             font=("Segoe UI", 9), insertbackground=TEXT_PRIMARY,
-                             bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        txt_row = tk.Frame(body, bg=BG_PANEL)
+        txt_row.pack(fill=tk.X, pady=(0, 8))
+        text_label(txt_row, "Target Text:").pack(side=tk.LEFT)
+        txt_entry = tk.Entry(txt_row, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         txt_entry.insert(0, curr.get("text", ""))
-        txt_entry.pack(fill=tk.X, ipady=3)
-
-        variable_panel = tk.Frame(target_slot, bg=BG_PANEL)
-        variable_panel.grid(row=0, column=0, sticky="ew")
-        text_label(variable_panel, "Variable Name:").pack(anchor="w", pady=(0, 2))
-        variable_entry = tk.Entry(variable_panel, bg=BG_INPUT, fg=SYNTAX_PURPLE,
-                                  font=("Consolas", 10, "bold"), insertbackground=TEXT_PRIMARY,
-                                  bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        variable_entry.insert(0, curr.get("text_variable", ""))
-        variable_entry.pack(fill=tk.X, ipady=3)
-        variable_scope = self._add_variable_scope_picker(variable_panel,
-                            {"var_name": curr.get("text_variable") or "target",
-                             "var_scope": "global" if initial_source == "Global" else "local"})
-
-        def update_search_source(*_):
-            # grid_remove retains widget contents and geometry metadata.
-            literal_panel.grid_remove()
-            variable_panel.grid_remove()
-            if source_var.get() == "Search for variables":
-                variable_panel.grid()
-            else:
-                literal_panel.grid()
-        source_var.trace_add("write", update_search_source)
-        update_search_source()
-
-        def target_settings():
-            if source_var.get() == "Search for variables":
-                name = variable_entry.get().strip()
-                if not name:
-                    raise ValueError("Enter a variable name to search for.")
-                scope = variable_scope.get()
-                variable_identity(name, scope)
-                return {"text_source": scope, "text_variable": name,
-                        "text": txt_entry.get().strip()}
-            value = txt_entry.get().strip()
-            if not value:
-                raise ValueError("Target text cannot be empty.")
-            return {"text_source": "Literal", "text_variable": "", "text": value}
+        txt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0), ipady=3)
 
         off_row = tk.Frame(body, bg=BG_PANEL)
         off_row.pack(fill=tk.X, pady=(0, 7))
@@ -11530,7 +10385,9 @@ class VSCodeQueueViewer(tk.Frame):
                 if area[2] * area[3] > 16_000_000:
                     raise ValueError("Search region is over 16 million pixels. Select a smaller area.")
                 ox, oy = int(ox_entry.get().strip()), int(oy_entry.get().strip())
-                search_settings = target_settings()
+                target_text = txt_entry.get().strip()
+                if not target_text:
+                    raise ValueError("Target text cannot be empty.")
             except ValueError as exc:
                 error_lbl.config(text=str(exc) or "Enter valid integer coordinates and offsets.")
                 return
@@ -11541,13 +10398,8 @@ class VSCodeQueueViewer(tk.Frame):
             except MacroExecutionError as exc:
                 error_lbl.config(text=str(exc))
                 return
-            try:
-                updated_action.update(cache_settings())
-            except MacroExecutionError as exc:
-                error_lbl.config(text=str(exc))
-                return
             updated_action.update({"type": "find_text", "area": area,
-                                   **search_settings, "anchor": anchor_var.get(),
+                                   "text": target_text, "anchor": anchor_var.get(),
                                    "ox": ox, "oy": oy, "action": act_var.get(),
                                    "match_mode": match_var.get(), "scan_mode": scan_var.get(),
                                    "occurrence": occurrence_var.get(),
@@ -11572,7 +10424,9 @@ class VSCodeQueueViewer(tk.Frame):
             try:
                 coords = [int(field.get().strip()) for field in area_entries]
                 validated_capture_area(coords)
-                target = resolve_find_text_target(self.app, target_settings())
+                target = txt_entry.get().strip()
+                if not target:
+                    raise ValueError('Enter text to search for')
                 options = {'match_mode': match_var.get(), 'scan_mode': scan_var.get(),
                            'occurrence': occurrence_var.get()}
             except (ValueError, MacroExecutionError) as exc:
@@ -11640,7 +10494,7 @@ class ModernScrollableFrame(tk.Frame):
         super().__init__(parent, bg=bg, **kwargs)
 
         self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
-        self.scrollbar = ModernScrollBar(self, command=self.canvas.yview, width=12, bg_trough=BG_PANEL)
+        self.scrollbar = ModernScrollBar(self, command=self.canvas.yview, width=18, bg_trough=BG_SCROLL_TRACK)
         self.scrollable_frame = tk.Frame(self.canvas, bg=bg)
 
         self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
@@ -12161,15 +11015,10 @@ class SequentHotkeyField(tk.Frame):
         return "break"
 
 class SidebarButton(tk.Frame):
-    def __init__(self, parent, text, command, app=None, **kwargs):
+    def __init__(self, parent, text, command, **kwargs):
         super().__init__(parent, bg=BG_SIDEBAR, cursor="hand2", **kwargs)
-        self.app_ref = app
         self.command = command
         self.active = False
-        self.selection_gradient = SequentSelectionGradient(self, COLOR_ACCENT, COLOR_ACCENT,
-                                                            bg=BG_SIDEBAR)
-        self.selection_gradient.place_forget()
-        self.selection_gradient.bind('<Button-1>', self.on_click)
         
         self.indicator = SequentRoundedAccentBar(
             self, thickness=4, background=BG_SIDEBAR, accent='', inset=5)
@@ -12213,26 +11062,8 @@ class SidebarButton(tk.Frame):
         self.configure(bg=color)
         self.label.configure(bg=color, fg=fg_color)
         self.icon.paint(bg=color, color=fg_color)
-        app = self.app_ref
-        gradient = bool(getattr(app, 'gradient_enabled', False))
-        self.indicator.set_gradient(COLOR_ACCENT if is_active else '',
-            getattr(app, 'gradient_second_color', None) if gradient and is_active else None)
-        self.indicator.configure(bg=color)
-        if is_active and gradient:
-            end = getattr(app, 'gradient_second_color', COLOR_ACCENT)
-            self.selection_gradient.set_colors(COLOR_ACCENT, end)
-            self.selection_gradient.place(x=0, y=0, relwidth=1, relheight=1)
-            self.selection_gradient.tk.call('lower', str(self.selection_gradient))
-            # Match each foreground widget to its position on the gradient.
-            width = max(1, self.winfo_width())
-            inks = sequent_gradient_colors(COLOR_ACCENT, end, 128)
-            def sampled(widget):
-                x = widget.winfo_x() + widget.winfo_width() // 2
-                return inks[min(127, max(0, int(127*x/width)))]
-            self.label.configure(bg=sampled(self.label), fg=accent_text_color(COLOR_ACCENT))
-            self.icon.paint(bg=sampled(self.icon), color=accent_text_color(COLOR_ACCENT))
-        else:
-            self.selection_gradient.place_forget()
+        self.indicator.set_accent(COLOR_ACCENT if is_active else '',
+                                  background=color)
 
 class GhostReticle:
     def __init__(self, root):
@@ -12685,7 +11516,7 @@ class GhostReticle:
                             found_box = app.search_color_in_area(*area, act.get("color", "#FFFFFF"), tolerance=act.get("tolerance", 8))
                         elif act.get('type') == 'find_text':
                             found_box = app.find_text_rect(
-                                *area, resolve_find_text_target(app, act),
+                                *area, act.get("text", ""),
                                 match_mode=act.get('match_mode','Contains'),
                                 scan_mode=act.get('scan_mode','Balanced'),
                                 occurrence=act.get('occurrence','First'))
@@ -13405,8 +12236,8 @@ class StudioTimeline(tk.Frame):
         self.last_drawn_marker_count = 0
         self.canvas = tk.Canvas(self, bg=colors['background'], bd=0,
                                 highlightthickness=0, relief='flat', cursor='crosshair')
-        self.xbar = ModernHorizontalScrollBar(self, command=self.canvas.xview, height=12, bg_trough=colors['panel'])
-        self.ybar = ModernScrollBar(self, command=self.canvas.yview, width=12, bg_trough=colors['panel'])
+        self.xbar = tk.Scrollbar(self, orient='horizontal', command=self.canvas.xview)
+        self.ybar = tk.Scrollbar(self, orient='vertical', command=self.canvas.yview)
         self.canvas.configure(xscrollcommand=self.xbar.set, yscrollcommand=self.ybar.set)
         self.canvas.grid(row=0, column=0, sticky='nsew')
         self.ybar.grid(row=0, column=1, sticky='ns')
@@ -13669,218 +12500,385 @@ class StudioTimeline(tk.Frame):
 
 
 
-class SequentWorkflowWindow:
-    """Non-destructive visual workflow explorer for the existing action queue.
+class SequentGraphEditor(tk.Frame):
+    """Integrated editable graph workspace. Standard library only.
 
-    Phase 1: graph visualization, pan/zoom, selection, and inspector.
-    Does not rewrite execution order or action dictionaries.
+    Graph edges define a linear execution path when compiled. Branch/loop
+    structures must be authored using Sequent's existing structured actions;
+    graph edges are never silently treated as conditional logic.
     """
-    NODE_W = 230
-    NODE_H = 76
-
-    def __init__(self, app):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg="#171B24")
         self.app = app
-        self.win = tk.Toplevel(app.root)
-        self.win.title("Sequent — Visual Workflow")
-        self.win.geometry("1120x720")
-        self.win.minsize(680, 420)
-        self.win.configure(bg="#171B24")
-        self.win.protocol("WM_DELETE_WINDOW", self.close)
-        self.scale = 1.0
-        self.pan_x, self.pan_y = 65, 65
+        self.nodes = {}
+        self.edges = []
         self.selected = None
-        self.positions = {}
-        self._drag = None
-        self._pan = None
-        self._snapshot = []
+        self.zoom_factor = 1.0
+        self.pan = [48.0, 48.0]
+        self.drag = None
+        self.history = []
+        self.future = []
+        self.link_source = None
+        self.node_w, self.node_h = 224, 82
         self._build()
-        self.refresh()
+        self.import_queue()
 
-    def close(self):
-        self.app._workflow_window = None
-        self.win.destroy()
+    def _button(self, parent, label, command):
+        return tk.Button(parent, text=label, command=command, bg="#323C50", fg="#EDF1FA",
+                         activebackground="#4C5872", activeforeground="#FFFFFF",
+                         relief="flat", bd=0, padx=9, pady=6, cursor="hand2")
 
     def _build(self):
-        top = tk.Frame(self.win, bg="#202633", height=52)
-        top.pack(side=tk.TOP, fill=tk.X)
-        top.pack_propagate(False)
-        tk.Label(top, text="◈  VISUAL WORKFLOW", bg="#202633", fg="#F0F3FF",
-                 font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, padx=16)
-        for title, callback in (("Refresh", self.refresh),
-                                ("Fit", self.fit),
-                                ("−", lambda: self.zoom(.85)),
-                                ("+", lambda: self.zoom(1.15))):
-            tk.Button(top, text=title, command=callback, bg="#303A4C",
-                      fg="#E5E9F4", relief=tk.FLAT, bd=0,
-                      activebackground="#45516A", activeforeground="#FFFFFF",
-                      padx=11, pady=5).pack(side=tk.RIGHT, padx=4, pady=8)
-        main = tk.PanedWindow(self.win, orient=tk.HORIZONTAL, bg="#171B24",
-                              sashwidth=5, bd=0, relief=tk.FLAT)
-        main.pack(fill=tk.BOTH, expand=True)
-        self.canvas = tk.Canvas(main, bg="#171B24", bd=0,
-                                highlightthickness=0, cursor="fleur")
-        main.add(self.canvas, minsize=350, stretch="always")
-        side = tk.Frame(main, bg="#202633", width=270)
-        main.add(side, minsize=220, stretch="never")
-        tk.Label(side, text="INSPECTOR", bg="#202633", fg="#9EAEC7",
-                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(18, 8))
-        self.info = tk.Text(side, bg="#202633", fg="#E6EBF6", bd=0,
-                            relief=tk.FLAT, wrap=tk.WORD, font=("Consolas", 10),
-                            state=tk.DISABLED, padx=14, pady=8)
-        self.info.pack(fill=tk.BOTH, expand=True)
-        tk.Button(side, text="Select in Action Queue", command=self.select_queue,
-                  bg="#424A70", fg="#FFFFFF", relief=tk.FLAT, bd=0,
-                  padx=12, pady=9).pack(fill=tk.X, padx=12, pady=12)
-        tk.Label(self.win, text="Drag nodes to arrange • Drag empty space to pan • Mouse wheel to zoom • Click a node to inspect • Layout is visual only",
-                 bg="#202633", fg="#AEB9CD", anchor="w",
-                 font=("Segoe UI", 9)).pack(side=tk.BOTTOM, fill=tk.X, ipady=6)
+        toolbar = tk.Frame(self, bg="#222A38")
+        toolbar.pack(fill="x")
+        for label, fn in (("Import Queue", self.import_queue), ("Apply to Queue", self.apply_queue),
+                          ("New Node", self.new_node), ("Connect", self.begin_link),
+                          ("Disconnect", self.unlink), ("Delete", self.delete_node),
+                          ("Undo", self.undo), ("Redo", self.redo),
+                          ("Save Graph", self.save_graph), ("Open Graph", self.open_graph),
+                          ("Fit", self.fit)):
+            self._button(toolbar, label, fn).pack(side="left", padx=2, pady=7)
+        self.status = tk.StringVar(value="Import Queue copies actions into a separate graph. Apply to Queue commits changes.")
+        tk.Label(self, textvariable=self.status, bg="#222A38", fg="#B4C0D6",
+                 anchor="w", padx=12).pack(side="bottom", fill="x")
+        split = tk.PanedWindow(self, orient="horizontal", sashwidth=5, bg="#171B24", bd=0)
+        split.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(split, bg="#171B24", bd=0, highlightthickness=0)
+        split.add(self.canvas, minsize=330, stretch="always")
+        inspector = tk.Frame(split, bg="#222A38", width=265)
+        split.add(inspector, minsize=215, stretch="never")
+        tk.Label(inspector, text="NODE INSPECTOR", bg="#222A38", fg="#C9D3E8",
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(15, 10))
+        tk.Label(inspector, text="Action type", bg="#222A38", fg="#B6C2D6").pack(anchor="w", padx=12)
+        self.type_var = tk.StringVar()
+        self.type_entry = tk.Entry(inspector, textvariable=self.type_var, bg="#171D29", fg="#FFFFFF",
+                                   insertbackground="#FFFFFF", relief="flat")
+        self.type_entry.pack(fill="x", padx=12, pady=(3, 10), ipady=6)
+        tk.Label(inspector, text="Action JSON (existing Sequent schema)", bg="#222A38",
+                 fg="#B6C2D6", wraplength=220, justify="left").pack(anchor="w", padx=12)
+        self.editor = tk.Text(inspector, bg="#171D29", fg="#E9EEFA", insertbackground="#FFFFFF",
+                              relief="flat", wrap="word", font=("Consolas", 9), undo=True)
+        self.editor.pack(fill="both", expand=True, padx=12, pady=(4, 8))
+        self._button(inspector, "Update Selected Node", self.update_selected).pack(fill="x", padx=12, pady=(0, 8))
+        tk.Label(inspector, text="Connect: select source, click Connect, then click target.\n"
+                 "Drag nodes to move; drag background to pan; wheel to zoom.\n"
+                 "Graph order is committed only when Apply to Queue succeeds.",
+                 bg="#222A38", fg="#AAB6CB", justify="left", wraplength=225).pack(fill="x", padx=12, pady=(0, 12))
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._motion)
-        self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "drag", None))
         self.canvas.bind("<MouseWheel>", self._wheel)
-        self.canvas.bind("<Button-4>", lambda e: self.zoom(1.1, e.x, e.y))
-        self.canvas.bind("<Button-5>", lambda e: self.zoom(.9, e.x, e.y))
+        self.canvas.bind("<Button-4>", lambda e: self._zoom(1.1, e.x, e.y))
+        self.canvas.bind("<Button-5>", lambda e: self._zoom(.9, e.x, e.y))
         self.canvas.bind("<Configure>", lambda e: self.draw())
+        self.bind("<Control-z>", lambda e: self.undo())
+        self.bind("<Control-y>", lambda e: self.redo())
 
-    def refresh(self):
-        self._snapshot = list(self.app.recorded_actions)
-        self.positions = {i: self.positions.get(i, (i % 4 * 300, i // 4 * 170))
-                          for i in range(len(self._snapshot))}
-        if self.selected is not None and self.selected >= len(self._snapshot):
+    def _snapshot(self):
+        import copy
+        return copy.deepcopy((self.nodes, self.edges))
+
+    def _checkpoint(self):
+        self.history.append(self._snapshot())
+        if len(self.history)>80: self.history.pop(0)
+        self.future.clear()
+
+    def undo(self):
+        if self.history:
+            self.future.append(self._snapshot())
+            self.nodes, self.edges = self.history.pop()
             self.selected = None
+            self._inspect()
+            self.draw()
+
+    def redo(self):
+        if self.future:
+            self.history.append(self._snapshot())
+            self.nodes, self.edges = self.future.pop()
+            self.selected = None
+            self._inspect()
+            self.draw()
+
+    def import_queue(self):
+        import copy, uuid
+        self._checkpoint()
+        self.nodes.clear()
+        self.edges.clear()
+        previous = None
+        for i, action in enumerate(self.app.recorded_actions):
+            uid = uuid.uuid4().hex
+            self.nodes[uid] = {"x": float((i%4)*285), "y": float((i//4)*160),
+                               "action": copy.deepcopy(action)}
+            if previous: self.edges.append([previous, uid])
+            previous = uid
+        self.selected = None
+        self._inspect()
         self.draw()
-        self.inspect()
+        self.status.set(f"Imported {len(self.nodes)} actions. Changes are not applied to Playback yet.")
 
-    def _to_screen(self, x, y):
-        return self.pan_x + x * self.scale, self.pan_y + y * self.scale
+    def new_node(self):
+        import uuid
+        self._checkpoint()
+        uid = uuid.uuid4().hex
+        self.nodes[uid] = {"x": (130-self.pan[0])/self.zoom_factor,
+                           "y": (100-self.pan[1])/self.zoom_factor,
+                           "action": {"type": "delay", "seconds": 1.0}}
+        self.selected = uid
+        self._inspect()
+        self.draw()
 
-    def _to_world(self, x, y):
-        return (x-self.pan_x)/self.scale, (y-self.pan_y)/self.scale
+    def delete_node(self):
+        if self.selected not in self.nodes: return
+        self._checkpoint()
+        uid = self.selected
+        del self.nodes[uid]
+        self.edges = [edge for edge in self.edges if uid not in edge]
+        self.selected = None
+        self._inspect()
+        self.draw()
 
-    def draw(self):
-        c = self.canvas
-        c.delete("all")
-        width, height = c.winfo_width(), c.winfo_height()
-        spacing = 32 * self.scale
-        if spacing >= 10:
-            for x in range(int(self.pan_x % spacing), width, int(spacing)):
-                for y in range(int(self.pan_y % spacing), height, int(spacing)):
-                    c.create_oval(x, y, x+1, y+1, fill="#303848", outline="")
-        accent = getattr(self.app, "accent_color", "#8B5CF6")
-        for i in range(len(self._snapshot)-1):
-            ax, ay = self.positions[i]
-            bx, by = self.positions[i+1]
-            x1,y1 = self._to_screen(ax+self.NODE_W, ay+self.NODE_H/2)
-            x2,y2 = self._to_screen(bx, by+self.NODE_H/2)
-            mid = (x1+x2)/2
-            c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,fill="#64728C",
-                          width=max(1,2*self.scale),smooth=True)
-        for i, action in enumerate(self._snapshot):
-            x,y = self.positions[i]
-            x1,y1 = self._to_screen(x,y)
-            x2,y2 = self._to_screen(x+self.NODE_W,y+self.NODE_H)
-            if x2 < 0 or y2 < 0 or x1 > width or y1 > height:
-                continue
-            chosen = i == self.selected
-            border = accent if chosen else "#46546B"
-            c.create_rectangle(x1,y1,x2,y2,fill="#293244",
-                               outline=border,width=2 if chosen else 1,
-                               tags=(f"node_{i}", "node"))
-            bar = max(3,5*self.scale)
-            c.create_rectangle(x1,y1,x1+bar,y2,fill=accent,outline="",
-                               tags=(f"node_{i}", "node"))
-            kind = str(action.get("type", "Action")).replace("_"," ").title()
-            label = str(action.get("label") or action.get("name") or kind)
-            label = label[:34] + ("…" if len(label)>34 else "")
-            c.create_text(x1+14*self.scale,y1+21*self.scale,anchor="w",
-                          text=f"{i+1:03d}  {kind[:27]}",fill="#AAB8D0",
-                          font=("Segoe UI",max(7,int(9*self.scale))),
-                          tags=(f"node_{i}", "node"))
-            c.create_text(x1+14*self.scale,y1+48*self.scale,anchor="w",
-                          text=label,fill="#F2F5FA",
-                          font=("Segoe UI",max(8,int(11*self.scale)),"bold"),
-                          tags=(f"node_{i}", "node"))
-        if not self._snapshot:
-            c.create_text(width/2,height/2,
-                          text="No actions in the queue yet.\nRecord or add actions, then click Refresh.",
-                          fill="#B3BED0",font=("Segoe UI",13),justify="center")
+    def begin_link(self):
+        if self.selected in self.nodes:
+            self.link_source = self.selected
+            self.status.set("Click a destination node to create a directed connection.")
+        else:
+            self.status.set("Select the source node first.")
 
-    def _hit(self, x, y):
-        wx,wy = self._to_world(x,y)
-        for i in reversed(range(len(self._snapshot))):
-            nx,ny = self.positions[i]
-            if nx <= wx <= nx+self.NODE_W and ny <= wy <= ny+self.NODE_H:
-                return i
+    def unlink(self):
+        if self.selected in self.nodes:
+            self._checkpoint()
+            self.edges = [e for e in self.edges if self.selected not in e]
+            self.draw()
+
+    def _connect(self, a, b):
+        if a == b or a not in self.nodes or b not in self.nodes: return
+        # Each node has one outgoing and one incoming edge. No ambiguous graphs.
+        self._checkpoint()
+        self.edges = [e for e in self.edges if e[0]!=a and e[1]!=b]
+        self.edges.append([a,b])
+        self.draw()
+
+    def _inspect(self):
+        import json
+        self.editor.delete("1.0", "end")
+        if self.selected in self.nodes:
+            action = self.nodes[self.selected]["action"]
+            self.type_var.set(str(action.get("type", "")))
+            self.editor.insert("1.0", json.dumps(action, indent=2, ensure_ascii=False))
+        else:
+            self.type_var.set("")
+
+    def update_selected(self):
+        import json
+        from tkinter import messagebox
+        if self.selected not in self.nodes: return
+        try:
+            action = json.loads(self.editor.get("1.0", "end"))
+            if not isinstance(action, dict): raise ValueError("Action must be a JSON object")
+            kind = self.type_var.get().strip()
+            if not kind: raise ValueError("Action type cannot be empty")
+            action["type"] = kind
+        except (ValueError, TypeError) as exc:
+            messagebox.showerror("Invalid action", str(exc), parent=self)
+            return
+        self._checkpoint()
+        self.nodes[self.selected]["action"] = action
+        self.draw()
+        self.status.set("Node action updated. Apply to Queue to commit.")
+
+    def _ordered_ids(self):
+        if not self.nodes: return []
+        indegree = {key:0 for key in self.nodes}
+        outgoing = {}
+        for a,b in self.edges:
+            if a not in indegree or b not in indegree: raise ValueError("Dangling connection")
+            indegree[b] += 1
+            if a in outgoing: raise ValueError("Multiple outgoing edges are not supported")
+            outgoing[a] = b
+        if any(n>1 for n in indegree.values()): raise ValueError("Multiple incoming edges are not supported")
+        roots = [key for key,n in indegree.items() if n==0]
+        if len(roots)!=1: raise ValueError("Workflow must have exactly one starting node")
+        order, seen = [], set()
+        current = roots[0]
+        while current is not None and current not in seen:
+            seen.add(current)
+            order.append(current)
+            current = outgoing.get(current)
+        if len(order)!=len(self.nodes):
+            raise ValueError("Workflow has disconnected nodes or a cycle; connect every node in one path")
+        return order
+
+    def apply_queue(self):
+        import copy
+        from tkinter import messagebox
+        if self.app.playing or self.app.recording:
+            messagebox.showwarning("Workflow", "Stop playback and recording before applying a workflow.", parent=self)
+            return
+        try:
+            order = self._ordered_ids()
+            actions = [copy.deepcopy(self.nodes[uid]["action"]) for uid in order]
+            for action in actions:
+                if not isinstance(action,dict) or not action.get("type"):
+                    raise ValueError("Every node must contain an action type")
+        except ValueError as exc:
+            messagebox.showerror("Cannot apply workflow", str(exc), parent=self)
+            return
+        if not messagebox.askyesno("Apply workflow", f"Replace the current Action Queue with {len(actions)} graph actions?\n\nSave your current macro first if needed.", parent=self):
+            return
+        self.app.recorded_actions = actions
+        self.app.current_action_idx = 0
+        self.app.breakpoints.clear()
+        self.app.display_actions_in_queue(actions)
+        self.status.set(f"Applied {len(actions)} actions to Playback. Run from Playback.")
+
+    def save_graph(self):
+        import json
+        from tkinter import filedialog, messagebox
+        filename = filedialog.asksaveasfilename(parent=self, defaultextension=".sequentgraph.json",
+                    filetypes=[("Sequent graph", "*.json")])
+        if not filename: return
+        try:
+            payload = {"format":"sequent-visual-graph", "version":1,
+                       "nodes":self.nodes, "edges":self.edges}
+            with open(filename,"w",encoding="utf-8") as f: json.dump(payload,f,indent=2)
+            self.status.set("Graph saved: " + filename)
+        except (OSError, TypeError, ValueError) as exc:
+            messagebox.showerror("Save graph failed",str(exc),parent=self)
+
+    def open_graph(self):
+        import json
+        from tkinter import filedialog, messagebox
+        filename = filedialog.askopenfilename(parent=self,filetypes=[("Sequent graph", "*.json")])
+        if not filename: return
+        try:
+            with open(filename,encoding="utf-8") as f: payload=json.load(f)
+            if payload.get("format")!="sequent-visual-graph" or payload.get("version")!=1:
+                raise ValueError("Unsupported graph format")
+            nodes,edges=payload["nodes"],payload["edges"]
+            if not isinstance(nodes,dict) or not isinstance(edges,list):
+                raise ValueError("Invalid graph structure")
+            for uid,node in nodes.items():
+                if not isinstance(uid,str) or not isinstance(node,dict) or not isinstance(node.get("action"),dict):
+                    raise ValueError("Invalid node")
+                if not isinstance(node.get("x"),(int,float)) or not isinstance(node.get("y"),(int,float)):
+                    raise ValueError("Invalid node coordinates")
+            for edge in edges:
+                if not isinstance(edge,list) or len(edge)!=2 or any(x not in nodes for x in edge):
+                    raise ValueError("Invalid edge")
+        except (OSError,ValueError,TypeError,KeyError) as exc:
+            messagebox.showerror("Open graph failed",str(exc),parent=self)
+            return
+        self._checkpoint()
+        self.nodes,self.edges=nodes,edges
+        self.selected=None
+        self._inspect()
+        self.draw()
+        self.status.set("Graph opened. Review and Apply to Queue to use it.")
+
+    def _screen(self,x,y):
+        return self.pan[0]+x*self.zoom_factor,self.pan[1]+y*self.zoom_factor
+
+    def _world(self,x,y):
+        return (x-self.pan[0])/self.zoom_factor,(y-self.pan[1])/self.zoom_factor
+
+    def _hit(self,x,y):
+        x,y=self._world(x,y)
+        for uid,node in reversed(list(self.nodes.items())):
+            if node["x"]<=x<=node["x"]+self.node_w and node["y"]<=y<=node["y"]+self.node_h:
+                return uid
         return None
 
-    def _press(self,event):
-        hit = self._hit(event.x,event.y)
-        self.selected = hit
-        self.inspect()
-        if hit is None:
-            self._pan = (event.x,event.y,self.pan_x,self.pan_y)
-            self._drag = None
+    def _press(self,e):
+        uid=self._hit(e.x,e.y)
+        if self.link_source is not None:
+            if uid is not None:
+                self._connect(self.link_source,uid)
+                self.status.set("Connection updated.")
+            self.link_source=None
+            return
+        self.selected=uid
+        self._inspect()
+        if uid:
+            node=self.nodes[uid]
+            wx,wy=self._world(e.x,e.y)
+            self.drag=("node",uid,wx-node["x"],wy-node["y"])
+            self._checkpoint()
         else:
-            wx,wy = self._to_world(event.x,event.y)
-            nx,ny = self.positions[hit]
-            self._drag = (hit,wx-nx,wy-ny)
-            self._pan = None
+            self.drag=("pan",e.x,e.y,*self.pan)
         self.draw()
 
-    def _motion(self,event):
-        if self._drag is not None:
-            idx,dx,dy = self._drag
-            wx,wy = self._to_world(event.x,event.y)
-            self.positions[idx] = (wx-dx,wy-dy)
-        elif self._pan is not None:
-            sx,sy,px,py = self._pan
-            self.pan_x,self.pan_y = px+event.x-sx,py+event.y-sy
+    def _motion(self,e):
+        if not self.drag: return
+        if self.drag[0]=="node":
+            _,uid,dx,dy=self.drag
+            x,y=self._world(e.x,e.y)
+            self.nodes[uid]["x"]=round((x-dx)/12)*12
+            self.nodes[uid]["y"]=round((y-dy)/12)*12
+        else:
+            _,sx,sy,px,py=self.drag
+            self.pan=[px+e.x-sx,py+e.y-sy]
         self.draw()
 
-    def _release(self,event):
-        self._drag = None
-        self._pan = None
+    def _wheel(self,e):
+        self._zoom(1.1 if e.delta>0 else .9,e.x,e.y)
 
-    def _wheel(self,event):
-        self.zoom(1.1 if event.delta>0 else .9,event.x,event.y)
-
-    def zoom(self,factor,x=None,y=None):
-        x = self.canvas.winfo_width()/2 if x is None else x
-        y = self.canvas.winfo_height()/2 if y is None else y
-        wx,wy = self._to_world(x,y)
-        self.scale = min(2.2,max(.45,self.scale*factor))
-        self.pan_x,self.pan_y = x-wx*self.scale,y-wy*self.scale
+    def _zoom(self,mul,x,y):
+        wx,wy=self._world(x,y)
+        self.zoom_factor=min(2.0,max(.4,self.zoom_factor*mul))
+        self.pan=[x-wx*self.zoom_factor,y-wy*self.zoom_factor]
         self.draw()
 
     def fit(self):
-        if not self.positions:
-            return
-        max_x = max(x+self.NODE_W for x,y in self.positions.values())
-        max_y = max(y+self.NODE_H for x,y in self.positions.values())
-        self.scale = max(.45,min(1.0,(self.canvas.winfo_width()-80)/max_x,
-                                (self.canvas.winfo_height()-80)/max_y))
-        self.pan_x,self.pan_y = 40,40
+        if not self.nodes: return
+        minx=min(n["x"] for n in self.nodes.values())
+        miny=min(n["y"] for n in self.nodes.values())
+        maxx=max(n["x"]+self.node_w for n in self.nodes.values())
+        maxy=max(n["y"]+self.node_h for n in self.nodes.values())
+        w=max(200,self.canvas.winfo_width()-80)
+        h=max(150,self.canvas.winfo_height()-80)
+        self.zoom_factor=min(1.4,max(.4,min(w/(maxx-minx),h/(maxy-miny))))
+        self.pan=[40-minx*self.zoom_factor,40-miny*self.zoom_factor]
         self.draw()
 
-    def inspect(self):
-        self.info.configure(state=tk.NORMAL)
-        self.info.delete("1.0",tk.END)
-        if self.selected is None:
-            self.info.insert(tk.END,"Select a node to inspect its existing action settings.")
-        else:
-            action = self._snapshot[self.selected]
-            self.info.insert(tk.END,f"ACTION {self.selected+1}\n\n")
-            for key,value in action.items():
-                display = repr(value)
-                if len(display)>220:
-                    display=display[:217]+"..."
-                self.info.insert(tk.END,f"{key}\n  {display}\n\n")
-        self.info.configure(state=tk.DISABLED)
-
-    def select_queue(self):
-        if self.selected is not None:
-            self.app.set_active_action_index(self.selected)
-            self.app.root.lift()
+    def draw(self):
+        c=self.canvas
+        c.delete("all")
+        width,height=c.winfo_width(),c.winfo_height()
+        grid=32*self.zoom_factor
+        if grid>=10:
+            for x in range(int(self.pan[0]%grid),width,int(grid)):
+                for y in range(int(self.pan[1]%grid),height,int(grid)):
+                    c.create_oval(x,y,x+1,y+1,fill="#30394A",outline="")
+        for a,b in self.edges:
+            if a not in self.nodes or b not in self.nodes: continue
+            na,nb=self.nodes[a],self.nodes[b]
+            x1,y1=self._screen(na["x"]+self.node_w,na["y"]+self.node_h/2)
+            x2,y2=self._screen(nb["x"],nb["y"]+self.node_h/2)
+            mid=(x1+x2)/2
+            c.create_line(x1,y1,mid,y1,mid,y2,x2,y2,fill="#8296B6",width=2,smooth=True,arrow="last")
+        for uid,node in self.nodes.items():
+            x,y=self._screen(node["x"],node["y"])
+            x2,y2=self._screen(node["x"]+self.node_w,node["y"]+self.node_h)
+            if x2<0 or y2<0 or x>width or y>height: continue
+            accent=getattr(self.app,"accent_color","#9361FF")
+            c.create_rectangle(x,y,x2,y2,fill="#293449",outline=accent if uid==self.selected else "#53627A",
+                               width=3 if uid==self.selected else 1)
+            c.create_rectangle(x,y,x+5*self.zoom_factor,y2,fill=accent,outline="")
+            action=node["action"]
+            kind=str(action.get("type","Action"))
+            label=str(action.get("label") or action.get("name") or kind)
+            c.create_text(x+15*self.zoom_factor,y+23*self.zoom_factor,anchor="w",text=kind[:26].upper(),
+                          fill="#B5C4DE",font=("Segoe UI",max(7,int(9*self.zoom_factor)),"bold"))
+            c.create_text(x+15*self.zoom_factor,y+52*self.zoom_factor,anchor="w",text=label[:28],
+                          fill="#FFFFFF",font=("Segoe UI",max(8,int(11*self.zoom_factor))))
+            r=max(3,5*self.zoom_factor)
+            c.create_oval(x-r,y+self.node_h*self.zoom_factor/2-r,x+r,y+self.node_h*self.zoom_factor/2+r,
+                          fill="#7A8AA5",outline="")
+            c.create_oval(x2-r,y+self.node_h*self.zoom_factor/2-r,x2+r,y+self.node_h*self.zoom_factor/2+r,
+                          fill=accent,outline="")
+        if not self.nodes:
+            c.create_text(width/2,height/2,text="Empty graph — click New Node or Import Queue",
+                          fill="#B5C2D7",font=("Segoe UI",12))
 
 class BuiltInMacroApp:
     def __init__(self, root):
@@ -13981,8 +12979,6 @@ class BuiltInMacroApp:
         self.theme_mode = "Dark"
         self.light_mode = False  # Kept for backward-compatible settings files.
         self.accent_color = DEFAULT_ACCENT_COLOR
-        self.gradient_enabled = False
-        self.gradient_second_color = "#00D4FF"
         self._effective_theme = "dark"
         self._system_theme_job = None
         self.entertain_me = True
@@ -14059,9 +13055,6 @@ class BuiltInMacroApp:
         self.root.configure(bg=BG_APP)
 
         self.setup_ui()
-        self._workflow_window = None
-        self.root.bind("<Control-Shift-w>", self.open_visual_workflow, add="+")
-        self.root.bind("<Control-Shift-W>", self.open_visual_workflow, add="+")
         self.ghost_reticle = GhostReticle(self.root)
         self._reticle_edit_index = None
         self.refresh_preset_menu()
@@ -14073,20 +13066,6 @@ class BuiltInMacroApp:
         self._autosave_job = self.root.after(600, self._autosave_tick)
 
     
-    def open_visual_workflow(self, event=None):
-        """Open a safe, separate visual explorer without changing macro execution."""
-        existing = getattr(self, "_workflow_window", None)
-        if existing is not None:
-            try:
-                if existing.win.winfo_exists():
-                    existing.win.lift()
-                    existing.refresh()
-                    return "break"
-            except tk.TclError:
-                pass
-        self._workflow_window = SequentWorkflowWindow(self)
-        return "break"
-
     def set_app_window(self):
         # This helper is also invoked after the Mini HUD and screen selection.
         # Never switch a natively managed window back to borderless mode.
@@ -14515,8 +13494,8 @@ class BuiltInMacroApp:
         display = tk.Text(container, wrap='none', bg=BG_INPUT, fg=TEXT_PRIMARY,
                           font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
                           highlightthickness=0, bd=0)
-        vertical = ModernScrollBar(container, command=display.yview, width=12, bg_trough=BG_PANEL)
-        horizontal = ModernHorizontalScrollBar(container, command=display.xview, height=12, bg_trough=BG_PANEL)
+        vertical = tk.Scrollbar(container, orient='vertical', command=display.yview)
+        horizontal = tk.Scrollbar(container, orient='horizontal', command=display.xview)
         display.config(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
         vertical.pack(side=tk.RIGHT, fill=tk.Y)
         horizontal.pack(side=tk.BOTTOM, fill=tk.X)
@@ -14625,7 +13604,7 @@ class BuiltInMacroApp:
                     with _GLOBAL_VARIABLE_LOCK:
                         all_values=_read_global_values(self)
                         all_values.pop(name,None)
-                        _write_global_values(self, all_values)
+                        self._write_json_atomically(_global_variable_path(self),all_values)
                 except (MacroExecutionError,OSError) as exc:
                     messagebox.showerror('Delete variable',str(exc),parent=window);return
             listing.selection_clear(0,tk.END)
@@ -14965,13 +13944,6 @@ class BuiltInMacroApp:
         top_bar = tk.Frame(self.main_container, bg=BG_HEADER, height=49)
         top_bar.pack(fill=tk.X)
         top_bar.pack_propagate(False)
-        # A slim gradient edge provides a real dual-color surface without
-        # replacing native Tk button backgrounds or reducing text contrast.
-        self.header_gradient = SequentGradientStrip(
-            self.main_container, self.accent_color,
-            self.gradient_second_color if self.gradient_enabled else self.accent_color,
-            height=4, bg=BG_HEADER)
-        self.header_gradient.pack(fill=tk.X)
         top_bar.bind("<Button-1>", self.start_drag)
         top_bar.bind("<B1-Motion>", self.drag_window)
 
@@ -15148,6 +14120,7 @@ class BuiltInMacroApp:
         self.frame_playback = tk.Frame(self.content_frame, bg=BG_APP)
         self.frame_sequencer = tk.Frame(self.content_frame, bg=BG_APP)
         self.frame_debug = tk.Frame(self.content_frame, bg=BG_APP)
+        self.frame_workflow = tk.Frame(self.content_frame, bg=BG_APP)
         # Settings is a peer of the independent Playback/Sequencer docks.
         # If it stays nested in content_frame, the dock windows always paint
         # above it during page transitions, obscuring the Settings controls.
@@ -15167,6 +14140,8 @@ class BuiltInMacroApp:
         self.build_sequencer_view()
         self.build_settings_view()
         self.build_debug_view()
+        self.workflow_editor = SequentGraphEditor(self.frame_workflow, self)
+        self.workflow_editor.pack(fill=tk.BOTH, expand=True)
         # Separate transition canvas (for page effects, not sidebar movement).
         self.overlay = tk.Canvas(self.root, bg=BG_APP, highlightthickness=0)
         self.show_tab(initial_tab, animate=animate)
@@ -15312,24 +14287,28 @@ class BuiltInMacroApp:
                  anchor="w").pack(fill=tk.X, pady=(3, 0))
         tk.Frame(self.sidebar_frame, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(0, 12))
         self.btn_tab_playback = SidebarButton(
-            self.sidebar_frame, text="PLAYBACK", app=self,
+            self.sidebar_frame, text="PLAYBACK",
             command=lambda: self.show_tab("playback"))
         self.btn_tab_playback.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_sequencer = SidebarButton(
-            self.sidebar_frame, text="STUDIO", app=self,
+            self.sidebar_frame, text="STUDIO",
             command=lambda: self.show_tab("sequencer"))
         self.btn_tab_sequencer.pack(fill=tk.X, padx=7, pady=2)
+        self.btn_tab_workflow = SidebarButton(
+            self.sidebar_frame, text="VISUAL WORKFLOW",
+            command=lambda: self.show_tab("workflow", animate=False))
+        self.btn_tab_workflow.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_debug = SidebarButton(
-            self.sidebar_frame, text='DEBUG TOOLS', app=self,
+            self.sidebar_frame, text='DEBUG TOOLS',
             command=lambda: self.show_tab('debug_tools'))
         self.btn_tab_debug.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_settings = SidebarButton(
-            self.sidebar_frame, text="SETTINGS", app=self,
+            self.sidebar_frame, text="SETTINGS",
             command=lambda: self.show_tab("settings"))
         self.btn_tab_settings.pack(fill=tk.X, padx=7, pady=2)
         tk.Frame(self.sidebar_frame, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(20, 10))
         self.btn_tab_guide = SidebarButton(
-            self.sidebar_frame, text="GUIDED TOUR", app=self, command=self.start_walkthrough)
+            self.sidebar_frame, text="GUIDED TOUR", command=self.start_walkthrough)
         self.btn_tab_guide.pack(fill=tk.X, padx=7, pady=(0, 12))
         tk.Label(self.sidebar_frame, text="Ctrl+F in Action Library\nF7 Record   •   F9 Run",
                  bg=BG_SIDEBAR, fg=TEXT_MUTED, justify="left",
@@ -15697,8 +14676,6 @@ class BuiltInMacroApp:
         # Trigger the search dynamically as the user types
         self.queue_search_var.trace_add("write", lambda *args: self.queue_viewer.search_queue(self.queue_search_var.get()))
         self.queue_viewer = VSCodeQueueViewer(queue_dock, app_instance=self)
-        self.root.bind('<Control-Shift-P>', self.queue_viewer.open_action_command_palette, add='+')
-        self.root.bind('<Control-Shift-p>', self.queue_viewer.open_action_command_palette, add='+')
         self.queue_viewer.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self.queue_viewer.append_line("// Awaiting input...", SYNTAX_GREEN)
         for seq, dx, dy in [
@@ -16747,56 +15724,37 @@ class BuiltInMacroApp:
 
         Thread(target=worker, daemon=True).start()
 
-    def _mouse_action_position(self, action):
-        coordinates = []
-        for axis in ('x', 'y'):
-            if action.get(f'{axis}_source') == 'Variable':
-                name = action.get(f'{axis}_var', '')
-                scope = action.get(f'{axis}_scope', 'local')
-                sentinel = object()
-                value = get_variable(self, name, scope, sentinel)
-                if value is sentinel:
-                    raise MacroExecutionError(f'Mouse {axis.upper()} variable {name!r} ({scope}) is not defined')
-                try:
-                    number = float(value)
-                    if not math.isfinite(number):
-                        raise ValueError('nonfinite')
-                    coordinates.append(round(number))
-                except (ValueError, TypeError, OverflowError):
-                    raise MacroExecutionError(f'Mouse {axis.upper()} variable {name!r} must contain a number')
-            else:
-                coordinates.append(int(action.get(axis, 0)))
-        tx, ty = coordinates
-        if (action.get('win_title') and
-                not any(action.get(f'{axis}_source') == 'Variable' for axis in ('x', 'y'))):
-            hwnd = find_window_by_title_substr(action['win_title'])
-            if hwnd:
-                tx, ty = client_to_screen_pos(hwnd, action.get('rel_x', tx), action.get('rel_y', ty))
-        return tx, ty
-
     def execute_single_action(self, action, *, idle=False):
         act_type = action.get("type")
         def report(message,color):
             self.root.after(0,lambda m=message,c=color:self.update_status(m,c))
         if act_type in DYNAMIC_ACTION_TYPES:
             return self.dynamic_engine.execute(action, idle=idle)
-        if act_type in ('move', 'click'):
-            tx, ty = self._mouse_action_position(action)
+        if act_type == "move":
+            tx,ty=action.get('x',0),action.get('y',0)
+            if action.get('win_title'):
+                hwnd=find_window_by_title_substr(action['win_title'])
+                if hwnd:tx,ty=client_to_screen_pos(hwnd,action.get('rel_x',tx),action.get('rel_y',ty))
             if self.human_bezier:
-                steps = 18 if act_type == 'move' else 14
-                for x, y in calculate_bezier_trajectory(get_mouse_pos(), (tx, ty), steps):
-                    move_mouse(x, y)
-                    time.sleep(max(0.001, 0.008 / self.playback_speed))
+                for x,y in calculate_bezier_trajectory(get_mouse_pos(),(tx,ty),18):
+                    move_mouse(x,y)
+                    time.sleep(max(0.001,0.008/self.playback_speed))
             else:
                 move_mouse(tx, ty)
-                if act_type == 'move' and self.fluid_mouse:
+                if self.fluid_mouse:
                     time.sleep(max(0.001, 0.010 / max(0.1, self.playback_speed)))
-            if act_type == 'click':
-                wait_for_cursor_settled(tx, ty)
-                click(action.get('btn', 'left'))
-                if action.get('mouse_action') == 'Double Click':
-                    time.sleep(0.08)
-                    click('left')
+        elif act_type == "click":
+            tx, ty = action.get("x", 0), action.get("y", 0)
+            if action.get('win_title'):
+                hwnd=find_window_by_title_substr(action['win_title'])
+                if hwnd:tx,ty=client_to_screen_pos(hwnd,action.get('rel_x',tx),action.get('rel_y',ty))
+            if self.human_bezier:
+                for x,y in calculate_bezier_trajectory(get_mouse_pos(),(tx,ty),14):
+                    move_mouse(x,y)
+                    time.sleep(max(0.001,0.006/self.playback_speed))
+            else:move_mouse(tx, ty)
+            wait_for_cursor_settled(tx, ty)
+            click(action.get("btn", "left"))
         elif act_type == "scroll":
             tx,ty=action.get('x',0),action.get('y',0)
             if action.get('win_title'):
@@ -16820,9 +15778,6 @@ class BuiltInMacroApp:
             else:
                 report("Disclaimer accepted", COLOR_SUCCESS)
         elif act_type == "prompt_input":
-            if not sequent_clipboard_condition_passes(self, action):
-                report('Request Input skipped: condition was false', SYNTAX_ORANGE)
-                return
             prompt_txt = action.get("prompt", "Enter input:")
             default_val = action.get("default", "")
             var_name = action.get("var_name", "user_data")
@@ -16835,9 +15790,6 @@ class BuiltInMacroApp:
             scope_name = variable_identity(var_name, action.get("var_scope"))[1]
             report(f"Saved '{var_name}' as {scope_name.title()} ({len(str(entered_val))} characters)", COLOR_SUCCESS)
         elif act_type == "read_clipboard":
-            if not sequent_clipboard_condition_passes(self, action):
-                report('Read Clipboard skipped: condition was false', SYNTAX_ORANGE)
-                return
             # Pre-existing presets without mode still perform keyword checks.
             mode = action.get('mode', 'keywords')
             if mode == 'capture':
@@ -16914,10 +15866,8 @@ class BuiltInMacroApp:
         elif act_type == "find_color":
             area = action.get("area", [0, 0, 100, 100])
             hex_color = action.get("color", "#FFFFFF").upper()
-            found_box = self.cached_screen_match(action,
-                lambda region: self.search_color_in_area(*region, hex_color,
-                    tolerance=action.get('tolerance', 8)),
-                signature=(hex_color, action.get('tolerance', 8)))
+            found_box = self.search_color_in_area(*area, hex_color,
+                            tolerance=action.get("tolerance", 8))
 
             if not idle and not self.playing:
                 raise MacroCancelled('Playback stopped during target search')
@@ -16932,18 +15882,16 @@ class BuiltInMacroApp:
                 raise MacroExecutionError(f"Color {hex_color} not found in search area")
         elif act_type == "find_text":
             area = action.get("area", [0, 0, 100, 100])
-            target_text = resolve_find_text_target(self, action)
-            opts = {'match_mode':action.get('match_mode','Contains'),
-                    'scan_mode':action.get('scan_mode','Balanced'),
-                    'occurrence':action.get('occurrence','First')}
-            found_box = self.cached_screen_match(action,
-                lambda region: self.find_text_rect(*region, target_text, **opts),
-                signature=(target_text, tuple(sorted(opts.items()))))
+            target_text = action.get("text", "")
+            found_box = self.find_text_rect(
+                *area, target_text,
+                match_mode=action.get('match_mode','Contains'),
+                scan_mode=action.get('scan_mode','Balanced'),
+                occurrence=action.get('occurrence','First'))
 
             if not idle and not self.playing:
                 raise MacroCancelled('Playback stopped during target search')
             if found_box:
-                save_find_text_coordinates(self, action, found_box)
                 mode, tx, ty = perform_color_target_action(action, found_box, self.playback_speed)
                 self.root.after(0, lambda b=found_box: self.draw_highlight_box(*b, COLOR_SUCCESS, 800))
                 self.root.after(0, lambda m=mode, x=tx, y=ty: self._report_text_execution(m, x, y))
@@ -17491,50 +16439,6 @@ class BuiltInMacroApp:
                 gdi32.DeleteDC(mem_dc)
             user32.ReleaseDC(None, screen_dc)
 
-    def cached_screen_match(self, action, detector, *, signature=None):
-        """Validate last match locally, then fall back to original search bounds.
-
-        Cache is in memory only; never trust coordinates without a fresh match.
-        """
-        area = validated_capture_area(action.get('area'))
-        if not action.get('position_cache', True) or (action.get('type') == 'find_text' and
-                str(action.get('occurrence', 'First')).lower() != 'first'):
-            return detector(area)
-        cache = getattr(self, '_sequent_position_cache', None)
-        if cache is None:
-            cache = {}
-            self._sequent_position_cache = cache
-        # Action identity persists during playback, while edits create new dictionaries.
-        key = id(action)
-        identity = (action.get('type'), tuple(area), repr(signature))
-        previous = cache.get(key)
-        if previous and previous[0] == identity:
-            bounds = previous[1]
-            try:
-                radius = max(16, min(1000, int(action.get('cache_radius', 100))))
-            except (TypeError, ValueError, OverflowError):
-                radius = 100
-            x,y,w,h = area
-            left = max(x, int(bounds[0]) - radius)
-            top = max(y, int(bounds[1]) - radius)
-            right = min(x+w, int(bounds[2]) + radius)
-            bottom = min(y+h, int(bounds[3]) + radius)
-            if right > left and bottom > top:
-                match = detector((left,top,right-left,bottom-top))
-                if match is not None:
-                    cache[key] = (identity, tuple(match))
-                    return match
-            if not action.get('cache_fallback', True):
-                return None
-        match = detector(area)
-        if match is not None:
-            if len(cache) >= 256:
-                cache.clear()
-            cache[key] = (identity, tuple(match))
-        else:
-            cache.pop(key, None)
-        return match
-
     def find_text_rect(self, x, y, w, h, target_text, match_any=False, *,
                        match_mode="Contains", scan_mode="Balanced", occurrence="First"):
         """Recognize text in absolute screen pixels with optional enhanced OCR.
@@ -18029,12 +16933,6 @@ try {{
                     self.accent_color = normalize_accent_color(config.get("accent_color", DEFAULT_ACCENT_COLOR))
                 except ValueError:
                     self.accent_color = DEFAULT_ACCENT_COLOR
-                self.gradient_enabled = bool(config.get("gradient_enabled", False))
-                try:
-                    self.gradient_second_color = normalize_accent_color(
-                        config.get("gradient_second_color", "#00D4FF"))
-                except ValueError:
-                    self.gradient_second_color = "#00D4FF"
                 self.entertain_me = config.get("entertain_me", True)
                 BuiltInMacroApp.entertain_mode = self.entertain_me
                 self.playback_speed = config.get("playback_speed", 1.0)
@@ -18062,8 +16960,6 @@ try {{
             "light_mode": self.theme_mode == "Light",  # Compatibility with older Sequent versions
             "theme_mode": self.theme_mode,
             "accent_color": self.accent_color,
-            "gradient_enabled": self.gradient_enabled,
-            "gradient_second_color": self.gradient_second_color,
             "entertain_me": self.entertain_me,
             "playback_speed": self.playback_speed,
             "action_delay": self.action_delay,
@@ -18673,30 +17569,6 @@ try {{
         sequent_toolbar_button(accent_row, "Apply", self.apply_accent_hex).pack(side=tk.LEFT, padx=(0, 6))
         sequent_toolbar_button(accent_row, "Customize...", self.choose_accent_color).pack(side=tk.LEFT)
 
-        gradient_row = tk.Frame(parent, bg=BG_PANEL)
-        gradient_row.pack(fill=tk.X, pady=(8, 3))
-        self.gradient_enabled_var = tk.BooleanVar(value=self.gradient_enabled)
-        tk.Checkbutton(gradient_row, text="Two-color gradient accents",
-                       variable=self.gradient_enabled_var, command=self.apply_gradient_settings,
-                       bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_PANEL,
-                       selectcolor=BG_INPUT).pack(side=tk.LEFT)
-        second_row = tk.Frame(parent, bg=BG_PANEL)
-        second_row.pack(fill=tk.X, pady=(2, 4))
-        tk.Label(second_row, text="Second Gradient Color", bg=BG_PANEL,
-                 fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
-        self.gradient_second_var = tk.StringVar(value=self.gradient_second_color)
-        tk.Entry(second_row, textvariable=self.gradient_second_var, width=10,
-                 bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
-                 relief="flat").pack(side=tk.LEFT, padx=(0, 6), ipady=4)
-        sequent_toolbar_button(second_row, "Apply Gradient",
-                               self.apply_gradient_settings).pack(side=tk.LEFT, padx=(0, 6))
-        sequent_toolbar_button(second_row, "Customize...",
-                               self.choose_gradient_second_color).pack(side=tk.LEFT)
-        self.gradient_preview = SequentGradientStrip(
-            parent, self.accent_color, self.gradient_second_color, height=9, bg=BG_PANEL)
-        self.gradient_preview.pack(fill=tk.X, pady=(2, 8))
-        self.gradient_second_var.trace_add('write', lambda *_: self._preview_gradient_settings())
-
         presets_row = tk.Frame(parent, bg=BG_PANEL)
         presets_row.pack(fill=tk.X, pady=(0, 9))
         tk.Label(presets_row, text="Quick Colors", font=("Segoe UI", 9),
@@ -18737,8 +17609,6 @@ try {{
                 "theme_mode": self.theme_mode,
                 "light_mode": self.theme_mode == "Light",
                 "accent_color": self.accent_color,
-            "gradient_enabled": self.gradient_enabled,
-            "gradient_second_color": self.gradient_second_color,
             })
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=".",
                                              prefix="sequent_settings_", suffix=".tmp",
@@ -18783,43 +17653,6 @@ try {{
             return
         self._accent_color_dialog = SequentAccentColorDialog(self)
 
-    def choose_gradient_second_color(self):
-        existing = getattr(self, "_accent_color_dialog", None)
-        if existing is not None and existing.window.winfo_exists():
-            existing.window.lift()
-            return
-        self._accent_color_dialog = SequentAccentColorDialog(self, target="secondary")
-
-    def set_gradient_second_color(self, value):
-        color = normalize_accent_color(value)
-        self.gradient_second_color = color
-        if hasattr(self, 'gradient_second_var'):
-            self.gradient_second_var.set(color)
-        self._persist_appearance()
-        self.apply_theme(self.resolve_theme_mode())
-        self._preview_gradient_settings()
-
-    def _preview_gradient_settings(self):
-        if not hasattr(self, 'gradient_preview'):
-            return
-        try:
-            color = normalize_accent_color(self.gradient_second_var.get())
-            self.gradient_preview.set_colors(self.accent_color, color)
-        except ValueError:
-            pass
-
-    def apply_gradient_settings(self):
-        try:
-            second = normalize_accent_color(self.gradient_second_var.get())
-        except ValueError as exc:
-            self.update_status(str(exc), COLOR_DANGER)
-            return
-        self.gradient_enabled = bool(self.gradient_enabled_var.get())
-        self.gradient_second_color = second
-        self._persist_appearance()
-        self.apply_theme(self.resolve_theme_mode())
-        self.update_status("Gradient accents updated", COLOR_SUCCESS)
-
     def set_accent_color(self, value):
         color = normalize_accent_color(value)
         if self.accent_color == color:
@@ -18827,7 +17660,6 @@ try {{
                 self.accent_hex_var.set(color)
             return
         self.accent_color = color
-        self._preview_gradient_settings()
         self._persist_appearance()
         self.apply_theme(self.resolve_theme_mode())
         self.update_status(f"Accent color: {color}", COLOR_SUCCESS)
@@ -18954,13 +17786,6 @@ try {{
         self._theme_rebuilding = True
 
         self._update_theme_tokens(theme_name)
-        if getattr(self, 'header_gradient', None) is not None:
-            try:
-                self.header_gradient.set_colors(
-                    self.accent_color,
-                    self.gradient_second_color if self.gradient_enabled else self.accent_color)
-            except tk.TclError:
-                pass
         sequent_retheme_ide_windows(self)
         if getattr(self, 'native_chrome', None) is not None:
             self.native_chrome.refresh_dwm_frame()
@@ -19507,12 +18332,6 @@ try {{
         if not is_new_source and old_scroll:
             self.queue_viewer.code_text.yview_moveto(old_scroll[0])
             self.queue_viewer.gutter.yview_moveto(old_scroll[0])
-        # Queue redraws replace all text and tags. Reapply the active search
-        # after restoring scroll, so the first match remains in view.
-        if hasattr(self, "queue_search_var"):
-            active_query = self.queue_search_var.get().strip()
-            if active_query:
-                self.queue_viewer.search_queue(active_query)
     
     def _place_settings_page(self):
         """Place the Settings form at rest; never move it per animation frame.
@@ -19744,13 +18563,14 @@ try {{
         if hasattr(self, "_settings_motion_view"):
             self._clear_settings_motion()
         current = self.current_tab_name
-        if current in ("playback", "sequencer", "settings", "debug_tools"):
+        if current in ("playback", "sequencer", "settings", "debug_tools", "workflow"):
             self._set_tab_heading(current)
         for name, frame in (
             ("playback", self.frame_playback),
             ("sequencer", self.frame_sequencer),
             ("settings", self.frame_settings),
             ("debug_tools", self.frame_debug),
+            ("workflow", self.frame_workflow),
         ):
             if name != current:
                 frame.place_forget()
@@ -19767,6 +18587,7 @@ try {{
             if current == 'playback': self.frame_playback.tkraise()
             elif current == 'sequencer': self.frame_sequencer.tkraise()
             elif current == 'debug_tools': self.frame_debug.tkraise()
+            elif current == 'workflow': self.frame_workflow.tkraise()
         if hasattr(self, "sidebar_host") and self.sidebar_host.winfo_exists():
             self.sidebar_host.lift()
 
@@ -19774,6 +18595,7 @@ try {{
         headings = {
             "playback": ("Playback", "Record, edit and execute actions"),
             "sequencer": ("Automation Studio", "Compose macro chains on a visual timeline"),
+            "workflow": ("Visual Workflow", "Design, connect and inspect macro actions"),
             "debug_tools": ("Debug Tools", "Inspect, troubleshoot and organize Sequent workflows"),
             "settings": ("Settings", "Customize your automation workspace"),
         }
@@ -19793,11 +18615,14 @@ try {{
         headings = {
             "playback": ("Playback", "Record, edit and execute actions"),
             "sequencer": ("Automation Studio", "Compose macro chains on a visual timeline"),
+            "workflow": ("Visual Workflow", "Design, connect and inspect macro actions"),
             "debug_tools": ("Debug Tools", "Inspect, troubleshoot and organize Sequent workflows"),
             "settings": ("Settings", "Customize your automation workspace"),
         }
         if tab_name not in headings:
             return
+        if tab_name == "workflow":
+            animate = False
 
         old_tab = getattr(self, "current_tab_name", None)
         if old_tab == tab_name:
@@ -19823,6 +18648,7 @@ try {{
         self.btn_tab_playback.set_active(tab_name == "playback")
         self.btn_tab_sequencer.set_active(tab_name == "sequencer")
         self.btn_tab_debug.set_active(tab_name == 'debug_tools')
+        self.btn_tab_workflow.set_active(tab_name == 'workflow')
         self.btn_tab_settings.set_active(tab_name == "settings")
         if tab_name == "sequencer":
             self.refresh_sequencer_preset_dropdown()
@@ -19833,9 +18659,10 @@ try {{
             "sequencer": self.frame_sequencer,
             "settings": self.frame_settings,
             "debug_tools": self.frame_debug,
+            "workflow": self.frame_workflow,
         }
 
-        if (not animate or not self.entertain_me or old_tab not in tab_frames):
+        if (not animate or old_tab == "workflow" or not self.entertain_me or old_tab not in tab_frames):
             self._set_tab_heading(tab_name)
             self._settle_tab_transition()
             return
@@ -19846,7 +18673,7 @@ try {{
         for name, frame in tab_frames.items():
             if name not in (old_tab, tab_name):
                 frame.place_forget()
-        order = {"playback": 0, "sequencer": 1, "debug_tools": 2, "settings": 3}
+        order = {"playback": 0, "sequencer": 1, "workflow": 2, "debug_tools": 3, "settings": 4}
         direction = 1 if order[tab_name] > order[old_tab] else -1
         self._tab_transition_from = old_tab
         self._tab_transition_to = tab_name
@@ -19868,6 +18695,8 @@ try {{
             self.frame_settings.place_forget()
         elif tab_name == "debug_tools":
             self.frame_debug.place_forget()
+        elif tab_name == "workflow":
+            self.frame_workflow.place_forget()
 
     def _start_tab_animation_phase(self, phase):
         """Stage one real page at a time: exit first, then enter."""
