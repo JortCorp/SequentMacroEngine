@@ -3807,6 +3807,326 @@ class ModernHorizontalScrollBar(ModernScrollBar):
 
 # New actions are stored as plain dictionaries alongside legacy recorded actions.
 # Editor field: (key, label, kind, initial[, choice options]).
+
+# --- Window placement guides: no screen capture and no external dependencies ---
+SEQUENT_GUIDE_OPERATIONS = ('Show / Update Box', 'Hide Box', 'Clear All Boxes')
+SEQUENT_GUIDE_CLEAR_COLOR = '#FA02FA'  # Windows -transparentcolor canvas key.
+
+
+def sequent_validate_placement_guide(action):
+    """Validate before posting a Tk event; never use arbitrary Python/Tk code from macros."""
+    operation = str(action.get('operation', 'Show / Update Box'))
+    if operation not in SEQUENT_GUIDE_OPERATIONS:
+        raise MacroExecutionError('Unknown window placement guide operation: ' + operation)
+    if operation == 'Clear All Boxes':
+        return {'operation':operation}
+    guide_id = str(action.get('guide_id', 'main-window')).strip()
+    if not guide_id or len(guide_id) > 80 or any(ord(ch) < 32 for ch in guide_id):
+        raise MacroExecutionError('Guide ID must be 1–80 printable characters')
+    result = {'operation':operation, 'guide_id':guide_id}
+    if operation == 'Show / Update Box':
+        box = dynamic_area(action.get('box', [160,120,850,570]))
+        if box[2] < 40 or box[3] < 40:
+            raise MacroExecutionError('Guide rectangle must be at least 40 × 40 pixels')
+        label = str(action.get('label', '')).strip()
+        if len(label) > 120 or '\n' in label or '\r' in label:
+            raise MacroExecutionError('Guide label must fit on one line (max 120 chars)')
+        try:
+            duration = float(action.get('duration', 0))
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise MacroExecutionError('Guide auto-hide must be a number of seconds') from exc
+        if not math.isfinite(duration) or duration < 0 or duration > 86400:
+            raise MacroExecutionError('Guide auto-hide must be between 0 and 86400 seconds')
+        try:
+            color = normalize_accent_color(str(action.get('color','#58BDE9')))
+        except ValueError as exc:
+            raise MacroExecutionError('Guide border color: ' + str(exc)) from exc
+        result.update(box=list(box), label=label, color=color, duration=duration)
+    return result
+
+
+class SequentPlacementGuideOverlay:
+    """Single click-through, transparent virtual-desktop canvas for all visible guides."""
+    def __init__(self, root):
+        self.root = root
+        self.guides = {}
+        self.jobs = {}
+        self.window = None
+        self.canvas = None
+        self.bounds = None
+
+    def _ensure_canvas(self):
+        bounds = get_virtual_desktop_bounds()
+        if bounds[2] <= 0 or bounds[3] <= 0:
+            raise MacroExecutionError('No usable virtual desktop for placement guides')
+        if self.window is not None and self.window.winfo_exists():
+            if bounds != self.bounds:
+                position_toplevel_on_screen(self.window, *bounds, activate=False)
+                self.canvas.config(width=bounds[2], height=bounds[3])
+                self.bounds = bounds
+            return
+        self.bounds = bounds
+        win = tk.Toplevel(self.root)
+        self.window = win
+        win.withdraw()
+        win.overrideredirect(True)
+        win.configure(bg=SEQUENT_GUIDE_CLEAR_COLOR)
+        win.attributes('-topmost', True)
+        try:
+            win.wm_attributes('-transparentcolor', SEQUENT_GUIDE_CLEAR_COLOR)
+        except tk.TclError:
+            # Non-Windows development environment; real Sequent targets Windows.
+            win.attributes('-alpha', 0.35)
+        self.canvas = tk.Canvas(win, bg=SEQUENT_GUIDE_CLEAR_COLOR,
+                                highlightthickness=0, bd=0, width=bounds[2], height=bounds[3])
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        position_toplevel_on_screen(win, *bounds, activate=False)
+        if os.name == 'nt':
+            set_overlay_input_passthrough(win, True)
+            exclude_overlay_from_capture(win)
+
+    def _cancel_timer(self, guide_id):
+        job = self.jobs.pop(guide_id, None)
+        if job is not None:
+            try: self.root.after_cancel(job)
+            except tk.TclError: pass
+
+    def show(self, action):
+        guide_id = action['guide_id']
+        self._cancel_timer(guide_id)
+        self.guides[guide_id] = dict(action)
+        self.draw()
+        if action.get('duration', 0) > 0:
+            self.jobs[guide_id] = self.root.after(
+                max(1, int(action['duration'] * 1000)),
+                lambda item=guide_id: self.hide(item))
+
+    def hide(self, guide_id):
+        self._cancel_timer(guide_id)
+        self.guides.pop(guide_id, None)
+        self.draw()
+
+    def clear(self):
+        for guide_id in list(self.jobs):
+            self._cancel_timer(guide_id)
+        self.guides.clear()
+        self.draw()
+
+    def draw(self):
+        if not self.guides:
+            if self.window is not None:
+                try: self.window.destroy()
+                except tk.TclError: pass
+            self.window = None
+            self.canvas = None
+            self.bounds = None
+            return
+        self._ensure_canvas()
+        canvas = self.canvas
+        canvas.delete('all')
+        vx,vy,vw,vh = self.bounds
+        for action in self.guides.values():
+            x,y,w,h = action['box']
+            left,top = x-vx, y-vy
+            right,bottom = left+w, top+h
+            ink = action['color']
+            # Transparent interior; dotted outline over actual application windows.
+            canvas.create_rectangle(left+2, top+2, right-2, bottom-2,
+                                    outline=ink, width=3, dash=(4,5))
+            if w > 25 and h > 25:
+                canvas.create_rectangle(left+8, top+8, right-8, bottom-8,
+                                        outline=ink, width=1, dash=(1,7))
+            label = action.get('label') or action['guide_id']
+            text_id = canvas.create_text(left+12, top+14, text=label, anchor='nw',
+                                         fill=accent_text_color(ink),
+                                         font=('Segoe UI', 11, 'bold'))
+            bounds = canvas.bbox(text_id)
+            if bounds:
+                # Keep the whole caption inside the guide where possible.
+                if bounds[2] > right - 8:
+                    canvas.coords(text_id, max(left+8, right-(bounds[2]-bounds[0])-12), top+14)
+                    bounds = canvas.bbox(text_id)
+                canvas.create_rectangle(bounds[0]-7, bounds[1]-5, bounds[2]+7,
+                                        bounds[3]+5, outline=ink, fill=ink)
+                canvas.tag_raise(text_id)
+        self.window.lift()
+
+
+def sequent_execute_placement_guide(app, action):
+    """Schedule GUI work on Tk's owner thread; macros execute on playback workers."""
+    request = sequent_validate_placement_guide(action)
+    def dispatch():
+        try:
+            if not app.root.winfo_exists():
+                return
+            if app.placement_guides is None:
+                app.placement_guides = SequentPlacementGuideOverlay(app.root)
+            overlays = app.placement_guides
+            if request['operation'] == 'Clear All Boxes':
+                overlays.clear()
+            elif request['operation'] == 'Hide Box':
+                overlays.hide(request['guide_id'])
+            else:
+                overlays.show(request)
+        except (tk.TclError, OSError, MacroExecutionError) as exc:
+            print('[Sequent] Placement guide:', exc)
+    try:
+        app.root.after(0, dispatch)
+    except (tk.TclError, RuntimeError) as exc:
+        raise MacroExecutionError('Cannot schedule placement guide: ' + str(exc)) from exc
+    return {'guide_operation':request['operation'], 'guide_id':request.get('guide_id','')}
+
+
+def sequent_draw_placement_guide(root, editor, start_box, caption, ink, on_done):
+    """Drag an outline, move it from inside, or resize using its edges/corners.
+
+    Editor and Sequent are hidden while picking so the user can align windows.
+    Return accepts the box, Escape cancels. Rectangles use absolute Win32 pixels.
+    """
+    vx,vy,vw,vh = get_virtual_desktop_bounds()
+    if vw <= 0 or vh <= 0:
+        raise MacroExecutionError('No usable desktop to draw on')
+    x,y,w,h = dynamic_area(start_box)
+    # Local canvas coordinates, with the initial box clipped to visible bounds.
+    left = min(max(0, x-vx), vw-40)
+    top = min(max(0, y-vy), vh-40)
+    rect = [left, top, min(vw, max(left+40, x-vx+w)),
+            min(vh, max(top+40, y-vy+h))]
+    picker = tk.Toplevel(root)
+    picker.withdraw()
+    picker.overrideredirect(True)
+    picker.configure(bg='#10151F')
+    picker.attributes('-topmost', True)
+    picker.attributes('-alpha', 0.48)
+    canvas = tk.Canvas(picker, bg='#10151F', highlightthickness=0, bd=0,
+                       cursor='crosshair', width=vw, height=vh)
+    canvas.pack(fill=tk.BOTH, expand=True)
+    state = {'active':None, 'origin':None, 'rect':None}
+
+    def normalize(box):
+        a,b,c,d = box
+        return [min(a,c), min(b,d), max(a,c), max(b,d)]
+
+    def paint():
+        canvas.delete('guide-draw')
+        a,b,c,d = normalize(rect)
+        canvas.create_rectangle(a,b,c,d,outline=ink, width=5, dash=(6,5),tags='guide-draw')
+        canvas.create_text(a+14,b+20,text=(caption or 'WINDOW POSITION'),anchor='nw',
+                           fill='#FFFFFF',font=('Segoe UI',15,'bold'),tags='guide-draw')
+        for hx in (a,(a+c)//2,c):
+            for hy in (b,(b+d)//2,d):
+                if hx == (a+c)//2 and hy == (b+d)//2:
+                    continue
+                canvas.create_rectangle(hx-7,hy-7,hx+7,hy+7,fill='#FFFFFF',
+                                        outline=ink,width=2,tags='guide-draw')
+        canvas.create_text(vw//2, vh-38,
+                           text=f'X: {a+vx}  Y: {b+vy}     Width: {c-a}  Height: {d-b}    |    Arrows: nudge, Shift+Arrows: 10px',
+                           fill='#FFFFFF',font=('Consolas',11,'bold'),tags='guide-draw')
+
+    def clamp(value, bottom, top):
+        return min(top,max(bottom,int(value)))
+
+    def hit_test(px,py):
+        a,b,c,d = normalize(rect)
+        near_x = 'l' if abs(px-a)<15 else ('r' if abs(px-c)<15 else '')
+        near_y = 't' if abs(py-b)<15 else ('b' if abs(py-d)<15 else '')
+        if near_x or near_y:
+            if b-15 <= py <= d+15 and a-15 <= px <= c+15:
+                return near_x+near_y or 'move'
+        if a <= px <= c and b <= py <= d:
+            return 'move'
+        return 'draw'
+
+    def mouse_down(event):
+        state['active'] = hit_test(event.x,event.y)
+        state['origin'] = (event.x,event.y)
+        state['rect'] = list(rect)
+        if state['active']=='draw':
+            rect[:] = [event.x,event.y,event.x+40,event.y+40]
+            paint()
+
+    def mouse_drag(event):
+        mode = state['active']
+        if not mode: return
+        sx,sy = state['origin']
+        dx,dy = event.x-sx,event.y-sy
+        a,b,c,d = state['rect']
+        if mode=='draw':
+            a = min(sx,event.x)
+            b = min(sy,event.y)
+            c = max(sx,event.x)
+            d = max(sy,event.y)
+            if c-a < 40: c = a+40
+            if d-b < 40: d = b+40
+        elif mode=='move':
+            dx = clamp(dx,-a,vw-c)
+            dy = clamp(dy,-b,vh-d)
+            a,b,c,d = a+dx,b+dy,c+dx,d+dy
+        else:
+            if 'l' in mode: a = clamp(a+dx, 0, c-40)
+            if 'r' in mode: c = clamp(c+dx, a+40, vw)
+            if 't' in mode: b = clamp(b+dy, 0, d-40)
+            if 'b' in mode: d = clamp(d+dy, b+40, vh)
+        a,b,c,d = normalize((a,b,c,d))
+        rect[:] = [clamp(a,0,vw-40),clamp(b,0,vh-40),
+                   clamp(c,40,vw),clamp(d,40,vh)]
+        paint()
+
+    def mouse_up(_event):
+        state['active'] = None
+
+    def nudge(event):
+        dx = (-1 if event.keysym=='Left' else 1 if event.keysym=='Right' else 0)
+        dy = (-1 if event.keysym=='Up' else 1 if event.keysym=='Down' else 0)
+        scale = 10 if (event.state & 0x0001) else 1
+        a,b,c,d = rect
+        dx = clamp(dx*scale,-a,vw-c)
+        dy = clamp(dy*scale,-b,vh-d)
+        rect[:] = [a+dx,b+dy,c+dx,d+dy]
+        paint()
+        return 'break'
+
+    def finish(accept):
+        a,b,c,d = normalize(rect)
+        try:
+            picker.destroy()
+        finally:
+            root.deiconify()
+            if editor.winfo_exists():
+                editor.deiconify()
+                editor.lift()
+                editor.focus_force()
+        if accept:
+            on_done([a+vx,b+vy,c-a,d-b])
+
+    controls = tk.Frame(picker,bg='#1B2634',padx=12,pady=8)
+    canvas.create_window(vw//2,12,window=controls,anchor='n')
+    tk.Label(controls, text='Drag empty space to draw  •  Drag inside to move  •  Drag handles to resize',
+             bg='#1B2634',fg='#FFFFFF',font=('Segoe UI',10,'bold')).pack(side=tk.LEFT,padx=8)
+    tk.Button(controls,text='  Cancel  ',command=lambda:finish(False),
+              bg='#334155',fg='white',relief='flat').pack(side=tk.LEFT,padx=6)
+    tk.Button(controls,text='  Use This Box  ',command=lambda:finish(True),
+              bg='#247FBA',fg='white',relief='flat').pack(side=tk.LEFT,padx=6)
+    canvas.bind('<ButtonPress-1>',mouse_down)
+    canvas.bind('<B1-Motion>',mouse_drag)
+    canvas.bind('<ButtonRelease-1>',mouse_up)
+    picker.bind('<Escape>',lambda e:finish(False))
+    picker.bind('<Return>',lambda e:finish(True))
+    for key in ('Left','Right','Up','Down'):
+        picker.bind('<'+key+'>',nudge)
+    try:
+        editor.withdraw()
+        root.withdraw()
+        position_toplevel_on_screen(picker,vx,vy,vw,vh,activate=True)
+        picker.focus_force()
+        paint()
+    except Exception:
+        picker.destroy()
+        root.deiconify()
+        if editor.winfo_exists(): editor.deiconify()
+        raise
+
+
 DYNAMIC_ACTION_SPECS = {
  'Smart UI Element & Click':('ui_element',[
    ('window','Target window title contains (blank = desktop)','text',''),
@@ -3829,6 +4149,14 @@ DYNAMIC_ACTION_SPECS = {
    ('interval','Polling interval seconds','float',0.5),
    ('on_error','When timed out','choice','stop',['stop','skip','goto']),
    ('fallback_label','Fallback label if goto','text','')]),
+ 'Window Placement Guide':('placement_guide',[
+   ('operation','Guide action','choice','Show / Update Box',
+    ['Show / Update Box','Hide Box','Clear All Boxes']),
+   ('guide_id','Guide ID (use the same ID to update / hide)','text','main-window'),
+   ('label','Visible label','text','Place application window here'),
+   ('box','Screen rectangle: x,y,width,height','area',[160,120,850,570]),
+   ('color','Dashed border color','text','#58BDE9'),
+   ('duration','Auto-hide after seconds (0 = until hidden)','float',0.0)]),
  'Run Macro':('run_macro',[
    ('preset','Saved macro name','text',''),
    ('mode','After running','choice','Run & Return',['Run & Return','Switch to Macro']),
@@ -4768,7 +5096,7 @@ DYNAMIC_ACTION_TYPES = frozenset({
     'end_if', 'loop_start', 'loop_end', 'loop_break', 'find_image', 'recovery',
     'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action', 'set_variable',
     'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro', 'text_process', 'macro_return',
-    'load_text_variable', 'compare_text', 'compare_variables'
+    'load_text_variable', 'compare_text', 'compare_variables', 'placement_guide'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end','loop_break'})
 
@@ -6220,6 +6548,8 @@ class SequentDynamicEngine:
             result = {'variable':destination, 'value':transformed}
         elif typ == 'load_text_variable':
             result = sequent_text_file_to_variable(self.app, action)
+        elif typ == 'placement_guide':
+            result = sequent_execute_placement_guide(self.app, action)
         elif typ == 'set_variable':
             name = action.get('var_name', '')
             variable_identity(name, action.get('var_scope'))
@@ -6822,6 +7152,7 @@ class VSCodeQueueViewer(tk.Frame):
             ("Search selected area", "Read an area and branch to a preset.", "OCR"),
             ("Find Color & Click", "Find a color in an area and click it.", "FC"),
             ("Find Text & Click", "Find text in an area and click it.", "FT"),
+            ("Window Placement Guide", "Draw, label and display clickable-through window-position guides.", "DG"),
         )),
         ("Variables & Inputs", (
             ("Set Variable", "Create or update a local/global variable.", "SV"),
@@ -8487,6 +8818,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Search selected area": self._render_search_area_view,
             "Find Color & Click": self._render_find_color_view,
             "Find Text & Click": self._render_find_text_view,
+            "Window Placement Guide": self._render_placement_guide_view,
             "Find Image & Click": self._render_find_image_view,
             "Wait for Text": self._render_wait_text_view,
             "Wait Pixel": self._render_wait_pixel_view,
@@ -10741,6 +11073,135 @@ class VSCodeQueueViewer(tk.Frame):
                      bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT,
                      hover_color=COLOR_ACCENT_HOV,
                      command=submit).pack(fill=tk.X, pady=(6, 12))
+
+    def _render_placement_guide_view(self, line_num, edit_idx=None):
+        """Screen-based drawing editor for dashed, labeled window location guides."""
+        body = self.action_content_frame
+        old = (self.app.recorded_actions[edit_idx] if edit_idx is not None
+               and 0 <= edit_idx < len(self.app.recorded_actions) else {})
+        if old.get('type') != 'placement_guide':
+            old = {}
+
+        def caption(value):
+            tk.Label(body,text=value,bg=BG_PANEL,fg=TEXT_MUTED,
+                     font=('Segoe UI',8,'bold'),anchor='w').pack(fill=tk.X,pady=(8,3))
+
+        def input_field(value):
+            entry = tk.Entry(body,bg=BG_INPUT,fg=TEXT_PRIMARY,
+                             insertbackground=TEXT_PRIMARY,font=('Consolas',10),
+                             highlightthickness=1,highlightbackground=BG_BORDER,bd=0)
+            entry.insert(0,str(value))
+            entry.pack(fill=tk.X,ipady=6)
+            return entry
+
+        caption('Guide sub-action')
+        operation = tk.StringVar(value=old.get('operation','Show / Update Box'))
+        choose = tk.OptionMenu(body,operation,*SEQUENT_GUIDE_OPERATIONS)
+        choose.config(bg=BG_INPUT,fg=TEXT_PRIMARY,bd=0,highlightbackground=BG_BORDER,
+                      highlightthickness=1,cursor='hand2')
+        choose['menu'].config(bg=BG_INPUT,fg=TEXT_PRIMARY,activebackground=COLOR_ACCENT)
+        choose.pack(fill=tk.X)
+
+        caption('Guide ID  •  matching IDs update or hide the same box')
+        identity = input_field(old.get('guide_id','main-window'))
+
+        caption('Label shown on the screen')
+        label_entry = input_field(old.get('label','Place application window here'))
+        caption('Position and size (absolute screen pixels)')
+        initial = old.get('box',[160,120,850,570])
+        coordinates = input_field(', '.join(str(v) for v in initial))
+        help_label = tk.Label(body,text='Supports multiple monitors, including negative X coordinates.',
+                              bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',8),anchor='w')
+        help_label.pack(fill=tk.X,pady=(3,4))
+
+        caption('Border / label color (#RRGGBB)')
+        color_entry = input_field(old.get('color','#58BDE9'))
+        caption('Automatically hide after (seconds; 0 = keep visible)')
+        duration_entry = input_field(old.get('duration',0))
+
+        error = tk.Label(body,text='',bg=BG_PANEL,fg=COLOR_DANGER,
+                         font=('Segoe UI',8),wraplength=430,justify='left')
+        error.pack(fill=tk.X,pady=(8,2))
+
+        def current():
+            data={'type':'placement_guide', 'operation':operation.get(),
+                  'guide_id':identity.get(), 'label':label_entry.get(),
+                  'box':coordinates.get(), 'color':color_entry.get(),
+                  'duration':duration_entry.get()}
+            return {'type':'placement_guide',**sequent_validate_placement_guide(data)}
+
+        def choose_box():
+            try:
+                if operation.get() != 'Show / Update Box':
+                    raise MacroExecutionError('Choose Show / Update Box to draw a rectangle')
+                box = dynamic_area(coordinates.get())
+                ink = normalize_accent_color(color_entry.get())
+                def selected(value):
+                    coordinates.delete(0,tk.END)
+                    coordinates.insert(0,', '.join(str(p) for p in value))
+                    error.config(text='Rectangle updated. Save the action to keep it.',fg=COLOR_SUCCESS)
+                sequent_draw_placement_guide(self.app.root,self.sub_menu,box,
+                                             label_entry.get(),ink,selected)
+            except (tk.TclError, ValueError, MacroExecutionError) as exc:
+                error.config(text=str(exc),fg=COLOR_DANGER)
+
+        def preview():
+            try:
+                data = current()
+                if data['operation'] != 'Show / Update Box':
+                    raise MacroExecutionError('Choose Show / Update Box to preview')
+                data['guide_id'] = '__sequent_guide_preview__'
+                data['duration'] = 4
+                sequent_execute_placement_guide(self.app,data)
+                error.config(text='Preview appears for four seconds (not saved).',fg=COLOR_SUCCESS)
+            except (ValueError,MacroExecutionError) as exc:
+                error.config(text=str(exc),fg=COLOR_DANGER)
+
+        def visibility(*_):
+            show = operation.get()=='Show / Update Box'
+            for widget in (label_entry,coordinates,color_entry,duration_entry):
+                widget.configure(state='normal' if show else 'disabled')
+            identity.configure(state='disabled' if operation.get()=='Clear All Boxes' else 'normal')
+
+        operation.trace_add('write',visibility)
+        visibility()
+        ModernButton(body,text='Draw / Move / Resize on Screen',bg_color=COLOR_ACCENT,
+                     hover_color=COLOR_ACCENT_HOV,command=choose_box).pack(fill=tk.X,pady=(10,4))
+        ModernButton(body,text='Preview Box for 4 Seconds',bg_color=BG_BORDER,
+                     hover_color=BG_HOVER,command=preview).pack(fill=tk.X,pady=(0,4))
+        ModernButton(body,text='Clear Visible Guides Now',bg_color=BG_BORDER,
+                     hover_color=BG_HOVER,command=self.app.clear_placement_guides).pack(fill=tk.X,pady=(0,8))
+        tk.Label(body,text='Guides are click-through during playback. Use a later Hide Box or '
+                 'Clear All Boxes action to remove them. Ctrl+Shift+G clears visible guides '
+                 'when Sequent has focus.',bg=BG_PANEL,fg=TEXT_MUTED,
+                 font=('Segoe UI',8),wraplength=420,justify='left').pack(fill=tk.X,pady=(2,8))
+
+        if edit_idx is None:
+            position = tk.StringVar(value=f'Before Line {line_num}')
+            tk.OptionMenu(body,position,f'Before Line {line_num}',
+                          f'After Line {line_num}').pack(fill=tk.X,pady=(3,8))
+
+        def save():
+            try:
+                action = current()
+                if edit_idx is not None:
+                    idx = edit_idx
+                    self.app.recorded_actions[idx] = action
+                else:
+                    idx = line_num-1 if 'After' in position.get() else line_num-2
+                    idx = max(0,min(idx,len(self.app.recorded_actions)))
+                    self.app.recorded_actions.insert(idx,action)
+                self.close_sub_menu()
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(idx)
+                self.app.update_status('Saved Window Placement Guide: ' +
+                                       action['operation'],COLOR_SUCCESS)
+            except (ValueError,MacroExecutionError,tk.TclError) as exc:
+                error.config(text=str(exc),fg=COLOR_DANGER)
+
+        ModernButton(body,text='Save Changes' if edit_idx is not None else 'Add Guide Action',
+                     bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT,
+                     hover_color=COLOR_ACCENT_HOV,command=save).pack(fill=tk.X,pady=(4,10))
 
     def _render_dynamic_action_view(self, line_num, edit_idx=None):
         """Consistent JSON-backed property editor for dynamic automation actions."""
@@ -16190,6 +16651,8 @@ class BuiltInMacroApp:
         self.is_binding = False
         self.active_hotkey_field = None
         self.recorded_actions = []
+        self.placement_guides = None  # Tk-managed overlay, created on first use.
+        self.root.bind('<Control-Shift-G>', lambda event: self.clear_placement_guides())
         # Autosave is bound to the actual loaded preset path, never to the
         # dropdown's display text (which may be changed by menu refreshes).
         self.autosave_presets = True
@@ -18560,6 +19023,9 @@ class BuiltInMacroApp:
             left = action.get('left_source', 'Literal Text')
             right = action.get('right_source', 'Literal Text')
             return f"text.compare({left} vs {right}, {action.get('mode','Exact Match')})"
+        if act_type == 'placement_guide':
+            op = action.get('operation', 'Show / Update Box')
+            return f"guide.{op}({action.get('guide_id', 'main-window')!r}, {action.get('label', '')!r})"
         if act_type == 'run_macro':
             target = str(action.get('preset', '')).strip()
             mode = action.get('mode', 'Run & Return')
@@ -23104,6 +23570,11 @@ try {{
         self.play_btn.set_state("normal", text=self.get_btn_text("stop_play"), bg=BG_BORDER, hover=BG_HOVER)
         
         Thread(target=self.run_sequence, daemon=True).start()
+
+    def clear_placement_guides(self):
+        """Dismiss all placement overlays without changing any saved macro."""
+        if self.placement_guides is not None:
+            self.placement_guides.clear()
 
     def stop_macro(self):
         # Capture view position before playhead reset
