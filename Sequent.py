@@ -10,7 +10,7 @@ import tempfile
 import hashlib
 import subprocess
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox, simpledialog, colorchooser
 from tkinter import font as tkfont
 from threading import Thread, RLock
 from queue import Queue, Empty
@@ -3813,8 +3813,82 @@ SEQUENT_GUIDE_OPERATIONS = ('Show / Update Box', 'Hide Box', 'Clear All Boxes')
 SEQUENT_GUIDE_CLEAR_COLOR = '#FA02FA'  # Windows -transparentcolor canvas key.
 
 
+def sequent_guide_rectangle(value):
+    """Validate screen guide geometry without the OCR capture's 16 MP limit.
+
+    Placement outlines allocate no screenshot pixel buffer, and may span any
+    number of 4K displays. Preserve old JSON [x,y,width,height] storage.
+    """
+    if isinstance(value, str):
+        value = [part.strip() for part in value.split(',')]
+    if not isinstance(value, (tuple, list)) or len(value) != 4:
+        raise MacroExecutionError('Guide box must be x, y, width, height')
+    try:
+        x, y, width, height = (int(float(part)) for part in value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MacroExecutionError('Guide coordinates must be finite numbers') from exc
+    if (width <= 0 or height <= 0 or
+            any(abs(v) > 1000000 for v in (x, y, width, height))):
+        raise MacroExecutionError('Guide box must have a positive size and valid screen coordinates')
+    return x, y, width, height
+
+
+SEQUENT_ANNOTATION_KINDS = ('rectangle', 'ellipse', 'line', 'arrow', 'pen', 'text')
+SEQUENT_ANNOTATION_STYLES = ('Solid', 'Dashed', 'Dotted')
+
+
+def sequent_guide_point(value):
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        raise MacroExecutionError('Annotation point must contain X and Y')
+    try:
+        coords = [int(float(v)) for v in value]
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise MacroExecutionError('Invalid annotation point') from exc
+    if any(abs(v) > 1000000 for v in coords):
+        raise MacroExecutionError('Annotation coordinates must be within ±1,000,000 pixels')
+    return coords
+
+
+def sequent_validate_annotation(value):
+    """Sanitize JSON annotation objects: no scripts, fonts, or unbounded paths."""
+    if not isinstance(value, dict):
+        raise MacroExecutionError('Each annotation must be an object')
+    kind = str(value.get('kind', '')).lower()
+    if kind not in SEQUENT_ANNOTATION_KINDS:
+        raise MacroExecutionError('Unsupported annotation type: ' + kind)
+    style = str(value.get('style', 'Solid'))
+    if style not in SEQUENT_ANNOTATION_STYLES:
+        raise MacroExecutionError('Invalid annotation outline style')
+    color = normalize_accent_color(str(value.get('color', '#58BDE9')))
+    try:
+        width = int(value.get('width', 3))
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise MacroExecutionError('Annotation line width must be a number') from exc
+    if not 1 <= width <= 18:
+        raise MacroExecutionError('Annotation line width must be 1–18 pixels')
+    result = {'kind':kind, 'style':style, 'color':color, 'width':width}
+    if kind in ('rectangle', 'ellipse', 'text'):
+        box = sequent_guide_rectangle(value.get('box'))
+        if box[2] < 8 or box[3] < 8:
+            raise MacroExecutionError('Annotation shape must be at least 8 pixels wide and tall')
+        result['box'] = list(box)
+    else:
+        points = value.get('points', [])
+        if not isinstance(points, (tuple, list)) or not 1 <= len(points) <= 4000:
+            raise MacroExecutionError('Annotation stroke needs 1–4,000 points')
+        result['points'] = [sequent_guide_point(pt) for pt in points]
+        if kind in ('line', 'arrow') and len(points) != 2:
+            raise MacroExecutionError('Line / arrow annotations require two endpoints')
+    if kind == 'text':
+        text = str(value.get('text', ''))
+        if len(text) > 1000 or text.count('\n') > 20:
+            raise MacroExecutionError('Text box may have up to 1,000 characters and 20 lines')
+        result['text'] = text
+    return result
+
+
 def sequent_validate_placement_guide(action):
-    """Validate before posting a Tk event; never use arbitrary Python/Tk code from macros."""
+    """Validate guides and arbitrary annotations before posting work to Tk."""
     operation = str(action.get('operation', 'Show / Update Box'))
     if operation not in SEQUENT_GUIDE_OPERATIONS:
         raise MacroExecutionError('Unknown window placement guide operation: ' + operation)
@@ -3824,72 +3898,230 @@ def sequent_validate_placement_guide(action):
     if not guide_id or len(guide_id) > 80 or any(ord(ch) < 32 for ch in guide_id):
         raise MacroExecutionError('Guide ID must be 1–80 printable characters')
     result = {'operation':operation, 'guide_id':guide_id}
-    if operation == 'Show / Update Box':
-        box = dynamic_area(action.get('box', [160,120,850,570]))
-        if box[2] < 40 or box[3] < 40:
-            raise MacroExecutionError('Guide rectangle must be at least 40 × 40 pixels')
-        label = str(action.get('label', '')).strip()
-        if len(label) > 120 or '\n' in label or '\r' in label:
-            raise MacroExecutionError('Guide label must fit on one line (max 120 chars)')
-        try:
-            duration = float(action.get('duration', 0))
-        except (ValueError, TypeError, OverflowError) as exc:
-            raise MacroExecutionError('Guide auto-hide must be a number of seconds') from exc
-        if not math.isfinite(duration) or duration < 0 or duration > 86400:
-            raise MacroExecutionError('Guide auto-hide must be between 0 and 86400 seconds')
-        try:
-            color = normalize_accent_color(str(action.get('color','#58BDE9')))
-        except ValueError as exc:
-            raise MacroExecutionError('Guide border color: ' + str(exc)) from exc
-        result.update(box=list(box), label=label, color=color, duration=duration)
+    if operation != 'Show / Update Box':
+        return result
+    box = sequent_guide_rectangle(action.get('box', [160,120,850,570]))
+    if box[2] < 40 or box[3] < 40:
+        raise MacroExecutionError('Guide rectangle must be at least 40 × 40 pixels')
+    label = str(action.get('label', '')).strip()
+    if len(label) > 120 or '\n' in label or '\r' in label:
+        raise MacroExecutionError('Guide label must fit on one line (max 120 chars)')
+    try:
+        duration = float(action.get('duration', 0))
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise MacroExecutionError('Guide auto-hide must be a number of seconds') from exc
+    if not math.isfinite(duration) or duration < 0 or duration > 86400:
+        raise MacroExecutionError('Guide auto-hide must be between 0 and 86400 seconds')
+    color = normalize_accent_color(str(action.get('color', '#58BDE9')))
+    label_color = normalize_accent_color(str(action.get('label_color', color)))
+    style = str(action.get('border_style', 'Dashed'))
+    if style not in SEQUENT_ANNOTATION_STYLES:
+        raise MacroExecutionError('Invalid guide border style')
+    try:
+        border_width = int(action.get('border_width', 3))
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise MacroExecutionError('Invalid guide border width') from exc
+    if not 1 <= border_width <= 18:
+        raise MacroExecutionError('Guide border width must be 1–18')
+    label_position = sequent_guide_point(
+        action.get('label_position', [box[0] + 12, box[1] + 14]))
+    annotations = action.get('annotations', [])
+    if not isinstance(annotations, list) or len(annotations) > 200:
+        raise MacroExecutionError('A guide can contain up to 200 annotation objects')
+    result.update(box=list(box), label=label, color=color, label_color=label_color,
+                  label_position=label_position, border_style=style,
+                  border_width=border_width, show_box=bool(action.get('show_box', True)),
+                  annotations=[sequent_validate_annotation(v) for v in annotations],
+                  duration=duration)
     return result
 
 
+def sequent_guide_dash(style):
+    if style == 'Dashed':
+        return (8, 6)
+    if style == 'Dotted':
+        return (2, 5)
+    return None
+
+
+def sequent_guide_draw_annotation(canvas, bounds, item):
+    """Render a single absolute-desktop annotation into one monitor canvas."""
+    mx, my, mw, mh = bounds
+    kind, color = item['kind'], item['color']
+    width = item.get('width', 3)
+    dash = sequent_guide_dash(item.get('style', 'Solid'))
+    if kind in ('rectangle', 'ellipse', 'text'):
+        x, y, w, h = item['box']
+        if x+w < mx or x > mx+mw or y+h < my or y > my+mh:
+            return
+        x0, y0, x1, y1 = x-mx, y-my, x+w-mx, y+h-my
+        if kind == 'rectangle':
+            canvas.create_rectangle(x0, y0, x1, y1, outline=color,
+                                    width=width, dash=dash)
+        elif kind == 'ellipse':
+            canvas.create_oval(x0, y0, x1, y1, outline=color,
+                              width=width, dash=dash)
+        else:
+            # Only draw the text from a single monitor to avoid duplicate
+            # partial glyphs where a text box crosses the monitor boundary.
+            if not mx <= x < mx+mw or not my <= y < my+mh:
+                return
+            canvas.create_rectangle(x0, y0, x1, y1, outline=color,
+                                    fill='#172231', width=width, dash=dash)
+            canvas.create_text(x0+8, y0+6, text=item.get('text', ''),
+                               anchor='nw', fill=color, width=max(30, w-16),
+                               font=('Segoe UI', 13))
+        return
+    points = item['points']
+    xs = [pt[0] for pt in points]
+    ys = [pt[1] for pt in points]
+    if max(xs) < mx-12 or min(xs) > mx+mw+12 or max(ys) < my-12 or min(ys) > my+mh+12:
+        return
+    coords = [coord for px,py in points for coord in (px-mx, py-my)]
+    if len(points) == 1:
+        x, y = coords
+        canvas.create_oval(x-width, y-width, x+width, y+width, fill=color, outline='')
+    else:
+        canvas.create_line(*coords, fill=color, width=width,
+                           dash=dash if kind != 'pen' else None,
+                           smooth=False, capstyle=tk.ROUND,
+                           joinstyle=tk.ROUND,
+                           arrow=tk.LAST if kind == 'arrow' else tk.NONE,
+                           arrowshape=(max(12, width*4), max(15, width*5), max(5, width*2)))
+
+
+def sequent_guide_render(canvas, bounds, action):
+    """Draw legacy placement box plus independently positioned annotations."""
+    mx, my, mw, mh = bounds
+    x, y, w, h = action['box']
+    if action.get('show_box', True) and x+w > mx and x < mx+mw and y+h > my and y < my+mh:
+        canvas.create_rectangle(x-mx, y-my, x+w-mx, y+h-my,
+                                outline=action['color'],
+                                width=action.get('border_width', 3),
+                                dash=sequent_guide_dash(action.get('border_style', 'Dashed')))
+    label = action.get('label') or (action['guide_id'] if action.get('show_box', True) else '')
+    if label:
+        lx, ly = action.get('label_position', [x+12, y+14])
+        if mx <= lx < mx+mw and my <= ly < my+mh:
+            ink = action.get('label_color', action['color'])
+            caption = canvas.create_text(lx-mx, ly-my, text=label, anchor='nw',
+                                         fill=accent_text_color(ink),
+                                         font=('Segoe UI', 11, 'bold'))
+            bbox = canvas.bbox(caption)
+            if bbox:
+                canvas.create_rectangle(bbox[0]-7, bbox[1]-5, bbox[2]+7, bbox[3]+5,
+                                        fill=ink, outline=ink)
+                canvas.tag_raise(caption)
+    for item in action.get('annotations', ()):
+        sequent_guide_draw_annotation(canvas, bounds, item)
+
+
+def sequent_guide_monitor_rectangles():
+    """Return every *active* monitor in absolute Win32 virtual-desktop pixels.
+
+    Do not make a single HWND spanning all screens. Tk and Windows can constrain
+    a huge top-level window to one monitor, especially with mixed resolutions.
+    Use native EnumDisplayMonitors rather than the primary-display screen size.
+    """
+    fallback = get_virtual_desktop_bounds()
+    if os.name != 'nt':
+        return [fallback]
+    rectangles = []
+    try:
+        user32 = ctypes.windll.user32
+        # The callback lives until EnumDisplayMonitors returns synchronously.
+        monitor_callback = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(SequentChromeRect), ctypes.c_ssize_t)
+
+        def collect(_monitor, _hdc, rect_ptr, _data):
+            if rect_ptr:
+                rect = rect_ptr.contents
+                width = int(rect.right - rect.left)
+                height = int(rect.bottom - rect.top)
+                if width > 0 and height > 0:
+                    rectangles.append((int(rect.left), int(rect.top), width, height))
+            return 1
+
+        callback = monitor_callback(collect)
+        user32.EnumDisplayMonitors.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, monitor_callback, ctypes.c_ssize_t]
+        user32.EnumDisplayMonitors.restype = ctypes.c_int
+        if not user32.EnumDisplayMonitors(None, None, callback, 0):
+            rectangles.clear()
+    except (AttributeError, OSError, TypeError, ValueError):
+        rectangles.clear()
+    # Put the primary monitor first so it owns picker controls and initial focus.
+    unique = list(dict.fromkeys(rectangles)) or [fallback]
+    unique.sort(key=lambda r: (0 if r[0] <= 0 < r[0]+r[2]
+                                and r[1] <= 0 < r[1]+r[3] else 1,
+                               r[1], r[0]))
+    return unique
+
+
 class SequentPlacementGuideOverlay:
-    """Single click-through, transparent virtual-desktop canvas for all visible guides."""
+    """Independent click-through canvas per monitor, in a shared screen space.
+
+    A saved guide has one absolute rectangle; each canvas renders only the part
+    visible on its own monitor. Supports any monitor count and negative offsets.
+    """
     def __init__(self, root):
         self.root = root
         self.guides = {}
         self.jobs = {}
+        self.monitors = {}  # (x, y, w, h) -> (Tk toplevel, canvas)
+        # Preserve the previous single-window attributes for other consumers.
         self.window = None
         self.canvas = None
         self.bounds = None
 
-    def _ensure_canvas(self):
-        bounds = get_virtual_desktop_bounds()
-        if bounds[2] <= 0 or bounds[3] <= 0:
-            raise MacroExecutionError('No usable virtual desktop for placement guides')
-        if self.window is not None and self.window.winfo_exists():
-            if bounds != self.bounds:
-                position_toplevel_on_screen(self.window, *bounds, activate=False)
-                self.canvas.config(width=bounds[2], height=bounds[3])
-                self.bounds = bounds
-            return
-        self.bounds = bounds
-        win = tk.Toplevel(self.root)
-        self.window = win
-        win.withdraw()
-        win.overrideredirect(True)
-        win.configure(bg=SEQUENT_GUIDE_CLEAR_COLOR)
-        win.attributes('-topmost', True)
-        try:
-            win.wm_attributes('-transparentcolor', SEQUENT_GUIDE_CLEAR_COLOR)
-        except tk.TclError:
-            # Non-Windows development environment; real Sequent targets Windows.
-            win.attributes('-alpha', 0.35)
-        self.canvas = tk.Canvas(win, bg=SEQUENT_GUIDE_CLEAR_COLOR,
-                                highlightthickness=0, bd=0, width=bounds[2], height=bounds[3])
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-        position_toplevel_on_screen(win, *bounds, activate=False)
-        if os.name == 'nt':
-            set_overlay_input_passthrough(win, True)
-            exclude_overlay_from_capture(win)
+    def _ensure_canvases(self):
+        screens = sequent_guide_monitor_rectangles()
+        expected = set(screens)
+        for bounds, (win, _canvas) in list(self.monitors.items()):
+            if bounds not in expected or not win.winfo_exists():
+                try:
+                    win.destroy()
+                except tk.TclError:
+                    pass
+                self.monitors.pop(bounds, None)
+        for bounds in screens:
+            if bounds in self.monitors:
+                continue
+            x, y, width, height = bounds
+            win = tk.Toplevel(self.root)
+            win.withdraw()
+            win.overrideredirect(True)
+            win.configure(bg=SEQUENT_GUIDE_CLEAR_COLOR)
+            win.attributes('-topmost', True)
+            try:
+                win.wm_attributes('-transparentcolor', SEQUENT_GUIDE_CLEAR_COLOR)
+            except tk.TclError:
+                win.attributes('-alpha', 0.35)  # Non-Windows test/fallback
+            canvas = tk.Canvas(win, bg=SEQUENT_GUIDE_CLEAR_COLOR,
+                               highlightthickness=0, bd=0,
+                               width=width, height=height)
+            canvas.pack(fill=tk.BOTH, expand=True)
+            try:
+                position_toplevel_on_screen(win, *bounds, activate=False)
+                if os.name == 'nt':
+                    set_overlay_input_passthrough(win, True)
+                    exclude_overlay_from_capture(win)
+            except Exception:
+                win.destroy()
+                raise
+            self.monitors[bounds] = (win, canvas)
+        self.bounds = get_virtual_desktop_bounds()
+        if screens:
+            self.window, self.canvas = self.monitors[screens[0]]
 
     def _cancel_timer(self, guide_id):
         job = self.jobs.pop(guide_id, None)
         if job is not None:
-            try: self.root.after_cancel(job)
-            except tk.TclError: pass
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
 
     def show(self, action):
         guide_id = action['guide_id']
@@ -3914,42 +4146,23 @@ class SequentPlacementGuideOverlay:
 
     def draw(self):
         if not self.guides:
-            if self.window is not None:
-                try: self.window.destroy()
-                except tk.TclError: pass
+            for win, _canvas in self.monitors.values():
+                try:
+                    win.destroy()
+                except tk.TclError:
+                    pass
+            self.monitors.clear()
             self.window = None
             self.canvas = None
             self.bounds = None
             return
-        self._ensure_canvas()
-        canvas = self.canvas
-        canvas.delete('all')
-        vx,vy,vw,vh = self.bounds
-        for action in self.guides.values():
-            x,y,w,h = action['box']
-            left,top = x-vx, y-vy
-            right,bottom = left+w, top+h
-            ink = action['color']
-            # Transparent interior; dotted outline over actual application windows.
-            canvas.create_rectangle(left+2, top+2, right-2, bottom-2,
-                                    outline=ink, width=3, dash=(4,5))
-            if w > 25 and h > 25:
-                canvas.create_rectangle(left+8, top+8, right-8, bottom-8,
-                                        outline=ink, width=1, dash=(1,7))
-            label = action.get('label') or action['guide_id']
-            text_id = canvas.create_text(left+12, top+14, text=label, anchor='nw',
-                                         fill=accent_text_color(ink),
-                                         font=('Segoe UI', 11, 'bold'))
-            bounds = canvas.bbox(text_id)
-            if bounds:
-                # Keep the whole caption inside the guide where possible.
-                if bounds[2] > right - 8:
-                    canvas.coords(text_id, max(left+8, right-(bounds[2]-bounds[0])-12), top+14)
-                    bounds = canvas.bbox(text_id)
-                canvas.create_rectangle(bounds[0]-7, bounds[1]-5, bounds[2]+7,
-                                        bounds[3]+5, outline=ink, fill=ink)
-                canvas.tag_raise(text_id)
-        self.window.lift()
+        self._ensure_canvases()
+        for screen, (win, canvas) in self.monitors.items():
+            canvas.delete('all')
+            mx, my, mw, mh = screen
+            for action in self.guides.values():
+                sequent_guide_render(canvas, screen, action)
+            win.lift()
 
 
 def sequent_execute_placement_guide(app, action):
@@ -3978,118 +4191,179 @@ def sequent_execute_placement_guide(app, action):
 
 
 def sequent_draw_placement_guide(root, editor, start_box, caption, ink, on_done):
-    """Drag an outline, move it from inside, or resize using its edges/corners.
+    """Draw/move/resize one guide across all physical monitors.
 
-    Editor and Sequent are hidden while picking so the user can align windows.
-    Return accepts the box, Escape cancels. Rectangles use absolute Win32 pixels.
+    Each display gets a monitor-sized Tk picker window, avoiding Windows' single
+    HWND sizing limits. Every pointer and box position uses *absolute* Win32
+    pixels, so drags can cross monitor boundaries (including negative X/Y).
     """
-    vx,vy,vw,vh = get_virtual_desktop_bounds()
-    if vw <= 0 or vh <= 0:
+    screens = sequent_guide_monitor_rectangles()
+    vx, vy, vw, vh = get_virtual_desktop_bounds()
+    if not screens or vw <= 0 or vh <= 0:
         raise MacroExecutionError('No usable desktop to draw on')
-    x,y,w,h = dynamic_area(start_box)
-    # Local canvas coordinates, with the initial box clipped to visible bounds.
-    left = min(max(0, x-vx), vw-40)
-    top = min(max(0, y-vy), vh-40)
-    rect = [left, top, min(vw, max(left+40, x-vx+w)),
-            min(vh, max(top+40, y-vy+h))]
-    picker = tk.Toplevel(root)
-    picker.withdraw()
-    picker.overrideredirect(True)
-    picker.configure(bg='#10151F')
-    picker.attributes('-topmost', True)
-    picker.attributes('-alpha', 0.48)
-    canvas = tk.Canvas(picker, bg='#10151F', highlightthickness=0, bd=0,
-                       cursor='crosshair', width=vw, height=vh)
-    canvas.pack(fill=tk.BOTH, expand=True)
-    state = {'active':None, 'origin':None, 'rect':None}
+    x, y, w, h = sequent_guide_rectangle(start_box)
+    # Preserve existing coordinates if in the virtual desktop; otherwise start
+    # on the primary monitor, where the guide is immediately editable.
+    if x+w <= vx or x >= vx+vw or y+h <= vy or y >= vy+vh:
+        px, py, pw, ph = screens[0]
+        x, y = px+min(60, max(0, pw-40)), py+min(60, max(0, ph-40))
+    x = max(vx, min(x, vx+vw-40))
+    y = max(vy, min(y, vy+vh-40))
+    rect = [x, y, min(vx+vw, max(x+40, x+w)),
+            min(vy+vh, max(y+40, y+h))]
+    pickers = []  # (monitor bounds, Toplevel, Canvas)
+    state = {'active':None, 'origin':None, 'rect':None,
+             'poll_job':None, 'closed':False}
 
     def normalize(box):
-        a,b,c,d = box
+        a, b, c, d = box
         return [min(a,c), min(b,d), max(a,c), max(b,d)]
 
     def paint():
-        canvas.delete('guide-draw')
-        a,b,c,d = normalize(rect)
-        canvas.create_rectangle(a,b,c,d,outline=ink, width=5, dash=(6,5),tags='guide-draw')
-        canvas.create_text(a+14,b+20,text=(caption or 'WINDOW POSITION'),anchor='nw',
-                           fill='#FFFFFF',font=('Segoe UI',15,'bold'),tags='guide-draw')
-        for hx in (a,(a+c)//2,c):
-            for hy in (b,(b+d)//2,d):
-                if hx == (a+c)//2 and hy == (b+d)//2:
-                    continue
-                canvas.create_rectangle(hx-7,hy-7,hx+7,hy+7,fill='#FFFFFF',
-                                        outline=ink,width=2,tags='guide-draw')
-        canvas.create_text(vw//2, vh-38,
-                           text=f'X: {a+vx}  Y: {b+vy}     Width: {c-a}  Height: {d-b}    |    Arrows: nudge, Shift+Arrows: 10px',
-                           fill='#FFFFFF',font=('Consolas',11,'bold'),tags='guide-draw')
+        a, b, c, d = normalize(rect)
+        coords = (f'X: {a}   Y: {b}   Width: {c-a}   Height: {d-b}'
+                  '   |   Arrows: nudge, Shift+Arrows: 10px')
+        for (mx, my, mw, mh), _picker, canvas in pickers:
+            canvas.delete('guide-draw')
+            lx, ly, rx, by = a-mx, b-my, c-mx, d-my
+            canvas.create_rectangle(lx, ly, rx, by, outline=ink,
+                                    width=5, dash=(6,5), tags='guide-draw')
+            if lx < mw and ly < mh and rx > 0 and by > 0:
+                canvas.create_text(max(14,lx+14), max(20,ly+20),
+                                   text=(caption or 'WINDOW POSITION'), anchor='nw',
+                                   fill='#FFFFFF', font=('Segoe UI',15,'bold'),
+                                   tags='guide-draw')
+            for hx in (a, (a+c)//2, c):
+                for hy in (b, (b+d)//2, d):
+                    if hx == (a+c)//2 and hy == (b+d)//2:
+                        continue
+                    if mx-8 <= hx <= mx+mw+8 and my-8 <= hy <= my+mh+8:
+                        px, py = hx-mx, hy-my
+                        canvas.create_rectangle(px-7, py-7, px+7, py+7,
+                                                fill='#FFFFFF', outline=ink,
+                                                width=2, tags='guide-draw')
+            canvas.create_text(mw//2, mh-38, text=coords, fill='#FFFFFF',
+                               font=('Consolas',11,'bold'), tags='guide-draw')
 
     def clamp(value, bottom, top):
-        return min(top,max(bottom,int(value)))
+        return min(top, max(bottom, int(value)))
 
-    def hit_test(px,py):
-        a,b,c,d = normalize(rect)
-        near_x = 'l' if abs(px-a)<15 else ('r' if abs(px-c)<15 else '')
-        near_y = 't' if abs(py-b)<15 else ('b' if abs(py-d)<15 else '')
-        if near_x or near_y:
-            if b-15 <= py <= d+15 and a-15 <= px <= c+15:
-                return near_x+near_y or 'move'
+    def pointer(event=None):
+        if os.name == 'nt':
+            return get_mouse_pos()  # DPI-aligned with Win32 window rectangles
+        if event is not None:
+            return int(event.x_root), int(event.y_root)
+        return None
+
+    def hit_test(px, py):
+        a, b, c, d = normalize(rect)
+        near_x = 'l' if abs(px-a) < 15 else ('r' if abs(px-c) < 15 else '')
+        near_y = 't' if abs(py-b) < 15 else ('b' if abs(py-d) < 15 else '')
+        if (near_x or near_y) and b-15 <= py <= d+15 and a-15 <= px <= c+15:
+            return near_x+near_y or 'move'
         if a <= px <= c and b <= py <= d:
             return 'move'
         return 'draw'
 
-    def mouse_down(event):
-        state['active'] = hit_test(event.x,event.y)
-        state['origin'] = (event.x,event.y)
-        state['rect'] = list(rect)
-        if state['active']=='draw':
-            rect[:] = [event.x,event.y,event.x+40,event.y+40]
-            paint()
-
-    def mouse_drag(event):
+    def update_drag(location):
+        if state['active'] is None or location is None:
+            return
+        mx, my = location
+        sx, sy = state['origin']
+        dx, dy = mx-sx, my-sy
+        a, b, c, d = state['rect']
         mode = state['active']
-        if not mode: return
-        sx,sy = state['origin']
-        dx,dy = event.x-sx,event.y-sy
-        a,b,c,d = state['rect']
-        if mode=='draw':
-            a = min(sx,event.x)
-            b = min(sy,event.y)
-            c = max(sx,event.x)
-            d = max(sy,event.y)
-            if c-a < 40: c = a+40
-            if d-b < 40: d = b+40
-        elif mode=='move':
-            dx = clamp(dx,-a,vw-c)
-            dy = clamp(dy,-b,vh-d)
-            a,b,c,d = a+dx,b+dy,c+dx,d+dy
+        if mode == 'draw':
+            a, c = sorted((sx, mx))
+            b, d = sorted((sy, my))
+            a = clamp(a, vx, vx+vw-40)
+            b = clamp(b, vy, vy+vh-40)
+            c = clamp(max(c, a+40), a+40, vx+vw)
+            d = clamp(max(d, b+40), b+40, vy+vh)
+        elif mode == 'move':
+            dx = clamp(dx, vx-a, vx+vw-c)
+            dy = clamp(dy, vy-b, vy+vh-d)
+            a, b, c, d = a+dx, b+dy, c+dx, d+dy
         else:
-            if 'l' in mode: a = clamp(a+dx, 0, c-40)
-            if 'r' in mode: c = clamp(c+dx, a+40, vw)
-            if 't' in mode: b = clamp(b+dy, 0, d-40)
-            if 'b' in mode: d = clamp(d+dy, b+40, vh)
-        a,b,c,d = normalize((a,b,c,d))
-        rect[:] = [clamp(a,0,vw-40),clamp(b,0,vh-40),
-                   clamp(c,40,vw),clamp(d,40,vh)]
+            if 'l' in mode: a = clamp(a+dx, vx, c-40)
+            if 'r' in mode: c = clamp(c+dx, a+40, vx+vw)
+            if 't' in mode: b = clamp(b+dy, vy, d-40)
+            if 'b' in mode: d = clamp(d+dy, b+40, vy+vh)
+        rect[:] = [a, b, c, d]
         paint()
 
-    def mouse_up(_event):
+    def cancel_poll():
+        job, state['poll_job'] = state['poll_job'], None
+        if job is not None:
+            try:
+                root.after_cancel(job)
+            except tk.TclError:
+                pass
+
+    def poll_drag():
+        state['poll_job'] = None
+        if state['closed'] or state['active'] is None:
+            return
+        if os.name == 'nt':
+            # Tk can stop delivering B1-Motion when the pointer crosses into
+            # another top-level. Poll the native cursor to bridge that boundary.
+            try:
+                async_state = ctypes.windll.user32.GetAsyncKeyState
+                async_state.argtypes = [ctypes.c_int]
+                async_state.restype = ctypes.c_short
+                if not (async_state(VK_LBUTTON) & 0x8000):
+                    state['active'] = None
+                    return
+                update_drag(pointer())
+            except (OSError, AttributeError):
+                pass
+        state['poll_job'] = root.after(16, poll_drag)
+
+    def mouse_down(event):
+        pos = pointer(event)
+        state['active'] = hit_test(*pos)
+        state['origin'] = pos
+        state['rect'] = list(rect)
+        if state['active'] == 'draw':
+            a, b = pos
+            rect[:] = [clamp(a, vx, vx+vw-40), clamp(b, vy, vy+vh-40),
+                       clamp(a+40, vx+40, vx+vw),
+                       clamp(b+40, vy+40, vy+vh)]
+            paint()
+        cancel_poll()
+        state['poll_job'] = root.after(16, poll_drag)
+
+    def mouse_drag(event):
+        update_drag(pointer(event))
+
+    def mouse_up(event):
+        update_drag(pointer(event))
         state['active'] = None
+        cancel_poll()
 
     def nudge(event):
-        dx = (-1 if event.keysym=='Left' else 1 if event.keysym=='Right' else 0)
-        dy = (-1 if event.keysym=='Up' else 1 if event.keysym=='Down' else 0)
-        scale = 10 if (event.state & 0x0001) else 1
-        a,b,c,d = rect
-        dx = clamp(dx*scale,-a,vw-c)
-        dy = clamp(dy*scale,-b,vh-d)
-        rect[:] = [a+dx,b+dy,c+dx,d+dy]
+        dx = (-1 if event.keysym == 'Left' else 1 if event.keysym == 'Right' else 0)
+        dy = (-1 if event.keysym == 'Up' else 1 if event.keysym == 'Down' else 0)
+        scale = 10 if event.state & 0x0001 else 1
+        a, b, c, d = rect
+        dx = clamp(dx*scale, vx-a, vx+vw-c)
+        dy = clamp(dy*scale, vy-b, vy+vh-d)
+        rect[:] = [a+dx, b+dy, c+dx, d+dy]
         paint()
         return 'break'
 
     def finish(accept):
-        a,b,c,d = normalize(rect)
+        if state['closed']:
+            return
+        state['closed'] = True
+        cancel_poll()
+        a, b, c, d = normalize(rect)
         try:
-            picker.destroy()
+            for _screen, win, _canvas in pickers:
+                try:
+                    win.destroy()
+                except tk.TclError:
+                    pass
         finally:
             root.deiconify()
             if editor.winfo_exists():
@@ -4097,35 +4371,578 @@ def sequent_draw_placement_guide(root, editor, start_box, caption, ink, on_done)
                 editor.lift()
                 editor.focus_force()
         if accept:
-            on_done([a+vx,b+vy,c-a,d-b])
+            on_done([a, b, c-a, d-b])
 
-    controls = tk.Frame(picker,bg='#1B2634',padx=12,pady=8)
-    canvas.create_window(vw//2,12,window=controls,anchor='n')
-    tk.Label(controls, text='Drag empty space to draw  •  Drag inside to move  •  Drag handles to resize',
-             bg='#1B2634',fg='#FFFFFF',font=('Segoe UI',10,'bold')).pack(side=tk.LEFT,padx=8)
-    tk.Button(controls,text='  Cancel  ',command=lambda:finish(False),
-              bg='#334155',fg='white',relief='flat').pack(side=tk.LEFT,padx=6)
-    tk.Button(controls,text='  Use This Box  ',command=lambda:finish(True),
-              bg='#247FBA',fg='white',relief='flat').pack(side=tk.LEFT,padx=6)
-    canvas.bind('<ButtonPress-1>',mouse_down)
-    canvas.bind('<B1-Motion>',mouse_drag)
-    canvas.bind('<ButtonRelease-1>',mouse_up)
-    picker.bind('<Escape>',lambda e:finish(False))
-    picker.bind('<Return>',lambda e:finish(True))
-    for key in ('Left','Right','Up','Down'):
-        picker.bind('<'+key+'>',nudge)
     try:
         editor.withdraw()
         root.withdraw()
-        position_toplevel_on_screen(picker,vx,vy,vw,vh,activate=True)
-        picker.focus_force()
+        for bounds in screens:
+            mx, my, mw, mh = bounds
+            picker = tk.Toplevel(root)
+            picker.withdraw()
+            picker.overrideredirect(True)
+            picker.configure(bg='#10151F')
+            picker.attributes('-topmost', True)
+            picker.attributes('-alpha', 0.48)
+            canvas = tk.Canvas(picker, bg='#10151F', highlightthickness=0,
+                               bd=0, cursor='crosshair', width=mw, height=mh)
+            canvas.pack(fill=tk.BOTH, expand=True)
+            pickers.append((bounds, picker, canvas))
+            canvas.bind('<ButtonPress-1>', mouse_down)
+            canvas.bind('<B1-Motion>', mouse_drag)
+            canvas.bind('<ButtonRelease-1>', mouse_up)
+            picker.bind('<Escape>', lambda _e: finish(False))
+            picker.bind('<Return>', lambda _e: finish(True))
+            for key in ('Left', 'Right', 'Up', 'Down'):
+                picker.bind('<'+key+'>', nudge)
+            position_toplevel_on_screen(picker, *bounds, activate=True)
+        # Controls live on the primary screen; other monitors remain free for
+        # drawing. Keyboard shortcuts work on *every* picker window.
+        _, primary, primary_canvas = pickers[0]
+        pw = screens[0][2]
+        controls = tk.Frame(primary_canvas, bg='#1B2634', padx=12, pady=8)
+        primary_canvas.create_window(pw//2, 12, window=controls, anchor='n')
+        tk.Label(controls, text='Draw on ANY monitor  •  Drag to move  •  Resize at edges',
+                 bg='#1B2634', fg='#FFFFFF',
+                 font=('Segoe UI',10,'bold')).pack(side=tk.LEFT,padx=8)
+        tk.Button(controls, text='  Cancel  ', command=lambda:finish(False),
+                  bg='#334155', fg='white', relief='flat').pack(side=tk.LEFT,padx=6)
+        tk.Button(controls, text='  Use This Box  ', command=lambda:finish(True),
+                  bg='#247FBA', fg='white', relief='flat').pack(side=tk.LEFT,padx=6)
+        primary.focus_force()
         paint()
     except Exception:
-        picker.destroy()
+        cancel_poll()
+        for _bounds, picker, _canvas in pickers:
+            try:
+                picker.destroy()
+            except tk.TclError:
+                pass
+        root.deiconify()
+        if editor.winfo_exists():
+            editor.deiconify()
+        raise
+
+
+def sequent_annotate_placement_guide(root, editor, original, on_done):
+    """Zoom-style interactive editor. Coordinates are absolute Win32 desktop pixels.
+
+    A separate picker window per monitor captures drawing (including transitions
+    between monitors); a normal opaque toolbar stays legible and movable.
+    All annotation data remains JSON inside the original placement_guide action.
+    """
+    screens = sequent_guide_monitor_rectangles()
+    vx, vy, vw, vh = get_virtual_desktop_bounds()
+    if not screens or vw <= 0 or vh <= 0:
+        raise MacroExecutionError('No usable desktop for screen annotation')
+    data = copy.deepcopy(sequent_validate_placement_guide(
+        dict(original, operation='Show / Update Box')))
+    pickers = []
+    toolbar = None
+    state = {'tool':'Select', 'selected':'base', 'drag':None, 'origin':None,
+             'snapshot':None, 'draft':None, 'closed':False, 'poll':None,
+             'undo':[], 'dirty':False}
+    palette = ('#58BDE9', '#FF5252', '#FFB020', '#48D597',
+               '#FFFFFF', '#B68CFF', '#151515')
+
+    def remember():
+        state['undo'].append(copy.deepcopy(data))
+        del state['undo'][:-35]
+        state['dirty'] = True
+
+    def undo():
+        if not state['undo']:
+            return
+        before = state['undo'].pop()
+        data.clear()
+        data.update(before)
+        state['selected'] = None
+        paint()
+
+    def point(event=None):
+        if os.name == 'nt':
+            return get_mouse_pos()
+        if event is not None:
+            return int(event.x_root), int(event.y_root)
+        return None
+
+    def contained(x, y):
+        return (max(vx, min(vx+vw, int(x))), max(vy, min(vy+vh, int(y))))
+
+    def normalized(x0, y0, x1, y1, minimum=8):
+        x0,y0 = contained(x0,y0)
+        x1,y1 = contained(x1,y1)
+        a,b = min(x0,x1), min(y0,y1)
+        c,d = max(x0,x1), max(y0,y1)
+        return [a, b, max(minimum, c-a), max(minimum, d-b)]
+
+    def bbox(target):
+        if target == 'base':
+            return list(data['box'])
+        if target == 'label':
+            x,y = data['label_position']
+            label = data.get('label') or data['guide_id']
+            return [x-7, y-5, max(55, 9*len(label)+14), 28]
+        if isinstance(target, int) and 0 <= target < len(data['annotations']):
+            item = data['annotations'][target]
+            if 'box' in item:
+                return list(item['box'])
+            xs = [p[0] for p in item['points']]
+            ys = [p[1] for p in item['points']]
+            return [min(xs), min(ys), max(8, max(xs)-min(xs)),
+                    max(8, max(ys)-min(ys))]
+        return None
+
+    def hit_test(px, py):
+        def matches(target):
+            box = bbox(target)
+            if not box:
+                return None
+            x,y,w,h = box
+            if not (x-12 <= px <= x+w+12 and y-12 <= py <= y+h+12):
+                return None
+            # Resize at the four corners for boxes (not handwriting / labels).
+            can_resize = target == 'base' or (isinstance(target, int) and
+                           data['annotations'][target]['kind'] in ('rectangle','ellipse','text'))
+            if can_resize:
+                for xx, horiz in ((x,'w'), (x+w,'e')):
+                    for yy, vert in ((y,'n'), (y+h,'s')):
+                        if abs(px-xx) < 14 and abs(py-yy) < 14:
+                            return ('resize', horiz+vert)
+            if x <= px <= x+w and y <= py <= y+h:
+                return ('move', None)
+            return None
+        # Labels have priority over the outline; last drawn annotation wins.
+        for candidate in list(reversed(range(len(data['annotations'])))) + ['label','base']:
+            if candidate == 'label' and not (data.get('label') or data.get('show_box')):
+                continue
+            if candidate == 'base' and not data.get('show_box'):
+                continue
+            result = matches(candidate)
+            if result:
+                return candidate, *result
+        return None, None, None
+
+    def move_target(target, dx, dy, snapshot):
+        if target == 'label':
+            ax,ay = snapshot['label_position']
+            data['label_position'] = list(contained(ax+dx, ay+dy))
+            return
+        if target == 'base':
+            item = data
+        else:
+            item = data['annotations'][target]
+            snapshot = snapshot if target == 'base' else snapshot['annotations'][target]
+        if 'box' in item:
+            x,y,w,h = snapshot['box']
+            data_x = max(vx, min(vx+vw-w, x+dx))
+            data_y = max(vy, min(vy+vh-h, y+dy))
+            item['box'] = [data_x, data_y, w, h]
+            if target == 'base':
+                lx,ly = snapshot['label_position']
+                data['label_position'] = list(contained(
+                    lx+(data_x-x), ly+(data_y-y)))
+        elif 'points' in item:
+            points = snapshot['points']
+            xx = [p[0] for p in points]
+            yy = [p[1] for p in points]
+            dx = max(vx-min(xx), min(vx+vw-max(xx), dx))
+            dy = max(vy-min(yy), min(vy+vh-max(yy), dy))
+            item['points'] = [[px+dx,py+dy] for px,py in points]
+
+    def resize_target(target, handle, dx, dy, snapshot):
+        source = snapshot if target == 'base' else snapshot['annotations'][target]
+        x,y,w,h = source['box']
+        l,t,r,b = x,y,x+w,y+h
+        minimum = 40 if target == 'base' else 8
+        if 'w' in handle: l = max(vx, min(r-minimum, l+dx))
+        if 'e' in handle: r = min(vx+vw, max(l+minimum, r+dx))
+        if 'n' in handle: t = max(vy, min(b-minimum, t+dy))
+        if 's' in handle: b = min(vy+vh, max(t+minimum, b+dy))
+        destination = data if target == 'base' else data['annotations'][target]
+        destination['box'] = [l,t,r-l,b-t]
+
+    def paint():
+        for screen, _picker, canvas in pickers:
+            canvas.delete('all')
+            mx,my,mw,mh = screen
+            sequent_guide_render(canvas, screen, data)
+            draft = state['draft']
+            if draft is not None:
+                sequent_guide_draw_annotation(canvas, screen, draft)
+            selected_box = bbox(state['selected'])
+            if selected_box:
+                x,y,w,h = selected_box
+                x,y = x-mx, y-my
+                canvas.create_rectangle(x-3,y-3,x+w+3,y+h+3,
+                                        outline='#FFFFFF', dash=(4,4), width=2)
+                if state['selected'] == 'base' or (isinstance(state['selected'],int) and
+                       data['annotations'][state['selected']]['kind'] in ('rectangle','ellipse','text')):
+                    for hx in (x,x+w):
+                        for hy in (y,y+h):
+                            if -8 <= hx <= mw+8 and -8 <= hy <= mh+8:
+                                canvas.create_rectangle(hx-6,hy-6,hx+6,hy+6,
+                                                        outline='#FFFFFF',fill='#287FB5',width=2)
+            canvas.create_text(mw//2,mh-25,
+                               text='SELECT to move / resize  •  ESC cancel  •  Ctrl+Z undo  •  Delete selected',
+                               fill='#FFFFFF', font=('Segoe UI',10,'bold'))
+
+    def apply_selected_properties(ink=None, style=None, thickness=None):
+        target = state['selected']
+        if target is None:
+            return
+        remember()
+        if target == 'base':
+            if ink is not None: data['color'] = ink
+            if style is not None: data['border_style'] = style
+            if thickness is not None: data['border_width'] = thickness
+        elif target == 'label':
+            if ink is not None: data['label_color'] = ink
+        elif isinstance(target, int):
+            item = data['annotations'][target]
+            if ink is not None: item['color'] = ink
+            if style is not None: item['style'] = style
+            if thickness is not None: item['width'] = thickness
+        paint()
+
+    def cancel_poll():
+        job, state['poll'] = state['poll'], None
+        if job is not None:
+            try: root.after_cancel(job)
+            except tk.TclError: pass
+
+    def update_drag(where):
+        if where is None or state['drag'] is None:
+            return
+        px,py = contained(*where)
+        sx,sy = state['origin']
+        kind, target, handle = state['drag']
+        if kind == 'move':
+            move_target(target,px-sx,py-sy,state['snapshot'])
+        elif kind == 'resize':
+            resize_target(target,handle,px-sx,py-sy,state['snapshot'])
+        elif kind == 'pen':
+            points = data['annotations'][target]['points']
+            if len(points) < 4000 and math.hypot(px-points[-1][0],py-points[-1][1]) >= 3:
+                points.append([px,py])
+        elif kind == 'draw':
+            shape = target
+            if shape in ('line','arrow'):
+                points = [[sx,sy],[px,py]]
+                state['draft'] = dict(kind=shape, points=points, color=ink_var.get(),
+                                      style=style_var.get(), width=int(width_var.get()))
+            else:
+                min_size = 45 if shape == 'text' else 8
+                state['draft'] = dict(kind=shape,
+                                      box=normalized(sx,sy,px,py,min_size),
+                                      color=ink_var.get(), style=style_var.get(),
+                                      width=int(width_var.get()))
+                if shape == 'text':
+                    state['draft']['text'] = get_text_content()
+        paint()
+
+    def poll_drag():
+        state['poll'] = None
+        if state['closed'] or state['drag'] is None:
+            return
+        if os.name == 'nt':
+            try:
+                key = ctypes.windll.user32.GetAsyncKeyState
+                key.argtypes = [ctypes.c_int]
+                key.restype = ctypes.c_short
+                if not key(VK_LBUTTON) & 0x8000:
+                    finish_drag(point())
+                    return
+                update_drag(point())
+            except (OSError, AttributeError):
+                pass
+        state['poll'] = root.after(16, poll_drag)
+
+    def mouse_down(event):
+        where = point(event)
+        if where is None or state['drag'] is not None:
+            return
+        where = contained(*where)
+        state['origin'] = where
+        tool = state['tool']
+        if tool == 'Select':
+            target, action, handle = hit_test(*where)
+            state['selected'] = target
+            if target == 'label':
+                set_text_content(data.get('label',''))
+            elif isinstance(target,int) and data['annotations'][target]['kind'] == 'text':
+                set_text_content(data['annotations'][target].get('text',''))
+            if action:
+                remember()
+                state['snapshot'] = copy.deepcopy(data)
+                state['drag'] = (action, target, handle)
+            else:
+                state['drag'] = None
+        elif tool == 'Pen':
+            if len(data['annotations']) >= 200:
+                return
+            remember()
+            item = dict(kind='pen',points=[list(where)],color=ink_var.get(),
+                        width=int(width_var.get()),style='Solid')
+            data['annotations'].append(item)
+            target = len(data['annotations'])-1
+            state['selected'] = target
+            state['drag'] = ('pen', target, None)
+        else:
+            if len(data['annotations']) >= 200:
+                return
+            state['selected'] = None
+            state['drag'] = ('draw',tool.lower(),None)
+            state['draft'] = None
+        paint()
+        cancel_poll()
+        if state['drag']:
+            state['poll'] = root.after(16,poll_drag)
+
+    def finish_drag(where):
+        if state['drag'] is None:
+            return
+        update_drag(where)
+        kind,target,_handle = state['drag']
+        if kind == 'draw':
+            draft = state['draft']
+            if draft:
+                remember()
+                try:
+                    checked = sequent_validate_annotation(draft)
+                    data['annotations'].append(checked)
+                    state['selected'] = len(data['annotations'])-1
+                except (ValueError,MacroExecutionError):
+                    pass
+                state['draft'] = None
+        state['drag'] = None
+        state['snapshot'] = None
+        cancel_poll()
+        paint()
+
+    def mouse_up(event):
+        finish_drag(point(event))
+
+    def delete_selected():
+        target = state['selected']
+        if not isinstance(target,int):
+            return
+        remember()
+        data['annotations'].pop(target)
+        state['selected'] = None
+        paint()
+
+    def nudge(event):
+        if event.widget in (text_area, style_choice, width_box):
+            return
+        dx = (-1 if event.keysym == 'Left' else 1 if event.keysym == 'Right' else 0)
+        dy = (-1 if event.keysym == 'Up' else 1 if event.keysym == 'Down' else 0)
+        factor = 10 if event.state & 0x0001 else 1
+        target = state['selected']
+        if target is not None:
+            remember()
+            snapshot = copy.deepcopy(data)
+            move_target(target,dx*factor,dy*factor,snapshot)
+            paint()
+        return 'break'
+
+    def choose_tool(name):
+        state['tool'] = name
+        for key, button in buttons.items():
+            button.config(relief=tk.SUNKEN if key == name else tk.RAISED,
+                          bg='#2679AD' if key == name else '#2D3C50')
+        for screen,picker,canvas in pickers:
+            canvas.configure(cursor='fleur' if name=='Select' else 'crosshair')
+
+    def set_color(color):
+        try: color = normalize_accent_color(color)
+        except ValueError: return
+        ink_var.set(color)
+        color_indicator.config(bg=color)
+        apply_selected_properties(ink=color)
+
+    def choose_custom_color():
+        chosen = colorchooser.askcolor(color=ink_var.get(),parent=toolbar,
+                                       title='Annotation color')[1]
+        if chosen:
+            set_color(chosen)
+            toolbar.lift()
+
+    def set_style_selected():
+        try:
+            width = int(width_var.get())
+        except (ValueError,TypeError):
+            return
+        width = max(1,min(18,width))
+        width_var.set(str(width))
+        apply_selected_properties(style=style_var.get(),thickness=width)
+
+    def get_text_content():
+        return text_area.get('1.0','end-1c')[:1000]
+
+    def set_text_content(content):
+        text_area.delete('1.0',tk.END)
+        text_area.insert('1.0',content)
+
+    def apply_text():
+        target = state['selected']
+        if target == 'label':
+            label = get_text_content().replace('\n',' ')[:120]
+            remember()
+            data['label'] = label
+            paint()
+        elif isinstance(target,int) and data['annotations'][target]['kind'] == 'text':
+            remember()
+            data['annotations'][target]['text'] = get_text_content()[:1000]
+            paint()
+
+    def toggle_base():
+        remember()
+        data['show_box'] = bool(show_base.get())
+        paint()
+
+    def finish(accept):
+        if state['closed']:
+            return
+        if state['drag']:
+            finish_drag(point())
+        if accept:
+            try:
+                checked = sequent_validate_placement_guide(data)
+            except (ValueError,MacroExecutionError) as exc:
+                messagebox.showerror('Invalid annotation',str(exc),parent=toolbar)
+                return
+        state['closed'] = True
+        cancel_poll()
+        for _bounds, picker, _canvas in pickers:
+            try: picker.destroy()
+            except tk.TclError: pass
+        if toolbar is not None:
+            try: toolbar.destroy()
+            except tk.TclError: pass
+        root.deiconify()
+        if editor.winfo_exists():
+            editor.deiconify()
+            editor.lift()
+            editor.focus_force()
+        if accept:
+            on_done(checked)
+
+    try:
+        editor.withdraw()
+        root.withdraw()
+        # Each picker covers only its physical monitor, not a huge virtual HWND.
+        for bounds in screens:
+            mx,my,mw,mh = bounds
+            win = tk.Toplevel(root)
+            win.withdraw()
+            win.overrideredirect(True)
+            win.configure(bg='#0D1422')
+            win.attributes('-topmost',True)
+            win.attributes('-alpha',0.40)
+            canvas = tk.Canvas(win, bg='#0D1422',bd=0,highlightthickness=0,
+                               width=mw,height=mh,cursor='fleur')
+            canvas.pack(fill=tk.BOTH,expand=True)
+            canvas.bind('<ButtonPress-1>',mouse_down)
+            canvas.bind('<B1-Motion>',lambda e:update_drag(point(e)))
+            canvas.bind('<ButtonRelease-1>',mouse_up)
+            pickers.append((bounds,win,canvas))
+            position_toplevel_on_screen(win,*bounds,activate=True)
+            win.bind('<Escape>',lambda e:finish(False))
+            win.bind('<Control-z>',lambda e:undo())
+            win.bind('<Delete>',lambda e:delete_selected())
+            for key in ('Left','Right','Up','Down'):
+                win.bind('<'+key+'>',nudge)
+        # Independent opaque floating toolbar; picker transparency does not dim it.
+        toolbar = tk.Toplevel(root)
+        toolbar.title('Sequent • Screen Annotation')
+        toolbar.configure(bg='#1B2634')
+        toolbar.attributes('-topmost',True)
+        toolbar.resizable(False,False)
+        toolbar.protocol('WM_DELETE_WINDOW',lambda:finish(False))
+        header = tk.Frame(toolbar,bg='#1B2634',padx=9,pady=7)
+        header.pack(fill=tk.X)
+        tk.Label(header,text='SCREEN ANNOTATION',font=('Segoe UI',10,'bold'),
+                 bg='#1B2634',fg='#FFFFFF').pack(side=tk.LEFT,padx=(0,12))
+        tk.Button(header,text='Undo',command=undo,bg='#35465A',fg='white').pack(side=tk.LEFT,padx=2)
+        tk.Button(header,text='Delete Selected',command=delete_selected,
+                  bg='#35465A',fg='white').pack(side=tk.LEFT,padx=2)
+        tk.Button(header,text='Cancel',command=lambda:finish(False),
+                  bg='#334155',fg='white').pack(side=tk.RIGHT,padx=3)
+        tk.Button(header,text='Save Annotations',command=lambda:finish(True),
+                  bg='#237FB4',fg='white').pack(side=tk.RIGHT,padx=3)
+        toolrow = tk.Frame(toolbar,bg='#1B2634',padx=9,pady=4)
+        toolrow.pack(fill=tk.X)
+        buttons = {}
+        for name in ('Select','Rectangle','Ellipse','Line','Arrow','Pen','Text'):
+            b = tk.Button(toolrow,text=name,font=('Segoe UI',9),fg='white',
+                          bg='#2D3C50',width=max(6,len(name)),
+                          command=lambda n=name:choose_tool(n))
+            b.pack(side=tk.LEFT,padx=2)
+            buttons[name] = b
+        props = tk.Frame(toolbar,bg='#1B2634',padx=9,pady=4)
+        props.pack(fill=tk.X)
+        ink_var = tk.StringVar(value=data['color'])
+        style_var = tk.StringVar(value=data.get('border_style','Dashed'))
+        width_var = tk.StringVar(value=str(data.get('border_width',3)))
+        tk.Label(props,text='Color:',fg='white',bg='#1B2634').pack(side=tk.LEFT)
+        for color in palette:
+            tk.Button(props,width=2,bg=color,relief=tk.RAISED,
+                      command=lambda c=color:set_color(c)).pack(side=tk.LEFT,padx=1)
+        color_indicator = tk.Label(props,width=2,bg=ink_var.get(),relief=tk.SUNKEN)
+        color_indicator.pack(side=tk.LEFT,padx=(5,2))
+        tk.Button(props,text='More…',bg='#35465A',fg='white',
+                  command=choose_custom_color).pack(side=tk.LEFT,padx=2)
+        tk.Label(props,text='  Stroke:',fg='white',bg='#1B2634').pack(side=tk.LEFT)
+        style_choice = tk.OptionMenu(props,style_var,*SEQUENT_ANNOTATION_STYLES)
+        style_choice.config(bg='#35465A',fg='white',width=7)
+        style_choice['menu'].config(bg='#35465A',fg='white')
+        style_choice.pack(side=tk.LEFT)
+        width_box = tk.Spinbox(props,from_=1,to=18,textvariable=width_var,width=3,
+                               bg='#35465A',fg='white',insertbackground='white')
+        width_box.pack(side=tk.LEFT,padx=4)
+        tk.Button(props,text='Apply style',bg='#35465A',fg='white',
+                  command=set_style_selected).pack(side=tk.LEFT)
+        textrow = tk.Frame(toolbar,bg='#1B2634',padx=9,pady=6)
+        textrow.pack(fill=tk.X)
+        tk.Label(textrow,text='Text:',fg='white',bg='#1B2634').pack(side=tk.LEFT)
+        text_area = tk.Text(textrow,width=46,height=2,wrap=tk.WORD,
+                            bg='#35465A',fg='white',insertbackground='white',
+                            font=('Segoe UI',9),bd=0)
+        text_area.insert('1.0','Your note here')
+        text_area.pack(side=tk.LEFT,padx=5,fill=tk.X,expand=True)
+        tk.Button(textrow,text='Update selected label / text box',bg='#35465A',fg='white',
+                  command=apply_text).pack(side=tk.LEFT)
+        show_base = tk.BooleanVar(value=data.get('show_box',True))
+        tk.Checkbutton(textrow,text='Show guide outline',variable=show_base,
+                       command=toggle_base,bg='#1B2634',fg='white',
+                       selectcolor='#35465A',activebackground='#1B2634').pack(side=tk.LEFT,padx=7)
+        tk.Label(toolbar,text='Select: drag to move; drag corner handles to resize • Pen: drag to draw • Text: enter text, then drag a box',
+                 bg='#1B2634',fg='#B8C9DA',font=('Segoe UI',9)).pack(pady=(0,8))
+        choose_tool('Select')
+        toolbar.update_idletasks()
+        px,py,pw,ph = screens[0]
+        toolbar_width = min(pw-16,toolbar.winfo_reqwidth())
+        # On narrow displays the toolbar may extend to a neighboring monitor.
+        toolbar.geometry(f'+{px+max(8,(pw-toolbar_width)//2)}+{py+12}')
+        toolbar.lift()
+        toolbar.focus_force()
+        toolbar.bind('<Escape>',lambda e:finish(False))
+        toolbar.bind('<Control-z>',lambda e:undo())
+        for key in ('Left','Right','Up','Down'):
+            toolbar.bind('<'+key+'>',nudge)
+        paint()
+    except Exception:
+        cancel_poll()
+        for _bounds,win,_canvas in pickers:
+            try: win.destroy()
+            except tk.TclError: pass
+        if toolbar is not None:
+            try: toolbar.destroy()
+            except tk.TclError: pass
         root.deiconify()
         if editor.winfo_exists(): editor.deiconify()
         raise
-
 
 DYNAMIC_ACTION_SPECS = {
  'Smart UI Element & Click':('ui_element',[
@@ -7152,7 +7969,7 @@ class VSCodeQueueViewer(tk.Frame):
             ("Search selected area", "Read an area and branch to a preset.", "OCR"),
             ("Find Color & Click", "Find a color in an area and click it.", "FC"),
             ("Find Text & Click", "Find text in an area and click it.", "FT"),
-            ("Window Placement Guide", "Draw, label and display clickable-through window-position guides.", "DG"),
+            ("Window Placement Guide", "Annotate any monitor with guides, shapes, text and colored pen strokes.", "DG"),
         )),
         ("Variables & Inputs", (
             ("Set Variable", "Create or update a local/global variable.", "SV"),
@@ -11075,12 +11892,14 @@ class VSCodeQueueViewer(tk.Frame):
                      command=submit).pack(fill=tk.X, pady=(6, 12))
 
     def _render_placement_guide_view(self, line_num, edit_idx=None):
-        """Screen-based drawing editor for dashed, labeled window location guides."""
+        """Editable, JSON-backed multi-monitor annotation sub-action."""
         body = self.action_content_frame
         old = (self.app.recorded_actions[edit_idx] if edit_idx is not None
                and 0 <= edit_idx < len(self.app.recorded_actions) else {})
         if old.get('type') != 'placement_guide':
             old = {}
+        draft = copy.deepcopy(old)
+        annotations = copy.deepcopy(old.get('annotations', []))
 
         def caption(value):
             tk.Label(body,text=value,bg=BG_PANEL,fg=TEXT_MUTED,
@@ -11094,87 +11913,119 @@ class VSCodeQueueViewer(tk.Frame):
             entry.pack(fill=tk.X,ipady=6)
             return entry
 
-        caption('Guide sub-action')
+        caption('Visual annotation sub-action')
         operation = tk.StringVar(value=old.get('operation','Show / Update Box'))
         choose = tk.OptionMenu(body,operation,*SEQUENT_GUIDE_OPERATIONS)
         choose.config(bg=BG_INPUT,fg=TEXT_PRIMARY,bd=0,highlightbackground=BG_BORDER,
                       highlightthickness=1,cursor='hand2')
         choose['menu'].config(bg=BG_INPUT,fg=TEXT_PRIMARY,activebackground=COLOR_ACCENT)
         choose.pack(fill=tk.X)
-
-        caption('Guide ID  •  matching IDs update or hide the same box')
+        caption('Guide ID • matching IDs update / hide all annotations in this guide')
         identity = input_field(old.get('guide_id','main-window'))
-
-        caption('Label shown on the screen')
+        caption('Guide label (drag it anywhere in the drawing editor)')
         label_entry = input_field(old.get('label','Place application window here'))
-        caption('Position and size (absolute screen pixels)')
-        initial = old.get('box',[160,120,850,570])
-        coordinates = input_field(', '.join(str(v) for v in initial))
-        help_label = tk.Label(body,text='Supports multiple monitors, including negative X coordinates.',
-                              bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',8),anchor='w')
-        help_label.pack(fill=tk.X,pady=(3,4))
-
-        caption('Border / label color (#RRGGBB)')
+        caption('Guide box (absolute screen X, Y, width, height)')
+        coords_entry = input_field(', '.join(str(v) for v in old.get('box',[160,120,850,570])))
+        old_box = sequent_guide_rectangle(old.get('box',[160,120,850,570]))
+        caption('Label position (absolute screen X, Y)')
+        label_position = input_field(', '.join(str(v) for v in old.get(
+            'label_position',[old_box[0]+12,old_box[1]+14])))
+        caption('Guide box border color (#RRGGBB)')
         color_entry = input_field(old.get('color','#58BDE9'))
-        caption('Automatically hide after (seconds; 0 = keep visible)')
+        caption('Label color (#RRGGBB)')
+        label_color_entry = input_field(old.get('label_color',old.get('color','#58BDE9')))
+        caption('Guide outline style')
+        border_style = tk.StringVar(value=old.get('border_style','Dashed'))
+        style_menu = tk.OptionMenu(body,border_style,*SEQUENT_ANNOTATION_STYLES)
+        style_menu.config(bg=BG_INPUT,fg=TEXT_PRIMARY,bd=0)
+        style_menu['menu'].config(bg=BG_INPUT,fg=TEXT_PRIMARY)
+        style_menu.pack(fill=tk.X)
+        show_box = tk.BooleanVar(value=old.get('show_box',True))
+        show_checkbox = tk.Checkbutton(body,text='Show main placement box (disable for freeform annotations)',
+                       variable=show_box,bg=BG_PANEL,fg=TEXT_PRIMARY,
+                       selectcolor=BG_INPUT,activebackground=BG_PANEL)
+        show_checkbox.pack(anchor='w',pady=(8,0))
+        caption('Automatically hide after (seconds; 0 = stay visible)')
         duration_entry = input_field(old.get('duration',0))
-
+        count_label = tk.Label(body,text=f'{len(annotations)} additional annotation objects saved',
+                               bg=BG_PANEL,fg=SYNTAX_BLUE,font=('Segoe UI',9))
+        count_label.pack(anchor='w',pady=(9,0))
         error = tk.Label(body,text='',bg=BG_PANEL,fg=COLOR_DANGER,
                          font=('Segoe UI',8),wraplength=430,justify='left')
         error.pack(fill=tk.X,pady=(8,2))
 
         def current():
-            data={'type':'placement_guide', 'operation':operation.get(),
+            data={'type':'placement_guide','operation':operation.get(),
                   'guide_id':identity.get(), 'label':label_entry.get(),
-                  'box':coordinates.get(), 'color':color_entry.get(),
+                  'box':coords_entry.get(), 'label_position':label_position.get().split(','),
+                  'color':color_entry.get(), 'label_color':label_color_entry.get(),
+                  'border_style':border_style.get(), 'show_box':show_box.get(),
+                  'border_width':draft.get('border_width',3),
+                  'annotations':copy.deepcopy(annotations),
                   'duration':duration_entry.get()}
-            return {'type':'placement_guide',**sequent_validate_placement_guide(data)}
+            return {'type':'placement_guide', **sequent_validate_placement_guide(data)}
 
-        def choose_box():
+        def set_entry(entry, value):
+            entry.configure(state='normal')
+            entry.delete(0,tk.END)
+            entry.insert(0,str(value))
+
+        def open_annotator():
             try:
                 if operation.get() != 'Show / Update Box':
-                    raise MacroExecutionError('Choose Show / Update Box to draw a rectangle')
-                box = dynamic_area(coordinates.get())
-                ink = normalize_accent_color(color_entry.get())
-                def selected(value):
-                    coordinates.delete(0,tk.END)
-                    coordinates.insert(0,', '.join(str(p) for p in value))
-                    error.config(text='Rectangle updated. Save the action to keep it.',fg=COLOR_SUCCESS)
-                sequent_draw_placement_guide(self.app.root,self.sub_menu,box,
-                                             label_entry.get(),ink,selected)
-            except (tk.TclError, ValueError, MacroExecutionError) as exc:
+                    raise MacroExecutionError('Choose Show / Update Box to edit annotations')
+                values = current()
+                def saved(value):
+                    nonlocal annotations
+                    annotations = copy.deepcopy(value['annotations'])
+                    draft['border_width'] = value.get('border_width',3)
+                    set_entry(coords_entry, ', '.join(map(str,value['box'])))
+                    set_entry(label_entry,value['label'])
+                    set_entry(label_position,', '.join(map(str,value['label_position'])))
+                    set_entry(color_entry,value['color'])
+                    set_entry(label_color_entry,value['label_color'])
+                    border_style.set(value['border_style'])
+                    show_box.set(value['show_box'])
+                    count_label.config(text=f'{len(annotations)} additional annotation objects saved')
+                    error.config(text='Annotations updated. Save the action to keep your changes.',
+                                 fg=COLOR_SUCCESS)
+                sequent_annotate_placement_guide(self.app.root,self.sub_menu,values,saved)
+            except (tk.TclError,ValueError,MacroExecutionError) as exc:
                 error.config(text=str(exc),fg=COLOR_DANGER)
 
         def preview():
             try:
-                data = current()
-                if data['operation'] != 'Show / Update Box':
+                values = current()
+                if values['operation'] != 'Show / Update Box':
                     raise MacroExecutionError('Choose Show / Update Box to preview')
-                data['guide_id'] = '__sequent_guide_preview__'
-                data['duration'] = 4
-                sequent_execute_placement_guide(self.app,data)
-                error.config(text='Preview appears for four seconds (not saved).',fg=COLOR_SUCCESS)
+                values['guide_id'] = '__sequent_guide_preview__'
+                values['duration'] = 5
+                sequent_execute_placement_guide(self.app,values)
+                error.config(text='Five-second, click-through preview (not saved).',fg=COLOR_SUCCESS)
             except (ValueError,MacroExecutionError) as exc:
                 error.config(text=str(exc),fg=COLOR_DANGER)
 
         def visibility(*_):
             show = operation.get()=='Show / Update Box'
-            for widget in (label_entry,coordinates,color_entry,duration_entry):
+            for widget in (label_entry,coords_entry,label_position,color_entry,
+                           label_color_entry,style_menu,duration_entry,show_checkbox):
                 widget.configure(state='normal' if show else 'disabled')
             identity.configure(state='disabled' if operation.get()=='Clear All Boxes' else 'normal')
 
         operation.trace_add('write',visibility)
         visibility()
-        ModernButton(body,text='Draw / Move / Resize on Screen',bg_color=COLOR_ACCENT,
-                     hover_color=COLOR_ACCENT_HOV,command=choose_box).pack(fill=tk.X,pady=(10,4))
-        ModernButton(body,text='Preview Box for 4 Seconds',bg_color=BG_BORDER,
+        ModernButton(body,text='Open Multi-Monitor Annotation Toolbar',bg_color=COLOR_ACCENT,
+                     hover_color=COLOR_ACCENT_HOV,command=open_annotator).pack(fill=tk.X,pady=(10,4))
+        ModernButton(body,text='Preview Annotations for 5 Seconds',bg_color=BG_BORDER,
                      hover_color=BG_HOVER,command=preview).pack(fill=tk.X,pady=(0,4))
         ModernButton(body,text='Clear Visible Guides Now',bg_color=BG_BORDER,
                      hover_color=BG_HOVER,command=self.app.clear_placement_guides).pack(fill=tk.X,pady=(0,8))
-        tk.Label(body,text='Guides are click-through during playback. Use a later Hide Box or '
-                 'Clear All Boxes action to remove them. Ctrl+Shift+G clears visible guides '
-                 'when Sequent has focus.',bg=BG_PANEL,fg=TEXT_MUTED,
-                 font=('Segoe UI',8),wraplength=420,justify='left').pack(fill=tk.X,pady=(2,8))
+        tk.Label(body,text='Select to move/resize existing shapes or drag the guide label. '
+                 'Use Rectangle, Ellipse, Line, Arrow, Pen, and Text tools to annotate '
+                 'any monitor. Give each object its own color and stroke style. '
+                 'Playback overlays stay click-through. Ctrl+Shift+G clears visible guides.',
+                 bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',8),
+                 wraplength=420,justify='left').pack(fill=tk.X,pady=(2,8))
 
         if edit_idx is None:
             position = tk.StringVar(value=f'Before Line {line_num}')
@@ -11194,12 +12045,12 @@ class VSCodeQueueViewer(tk.Frame):
                 self.close_sub_menu()
                 self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.app.set_active_action_index(idx)
-                self.app.update_status('Saved Window Placement Guide: ' +
-                                       action['operation'],COLOR_SUCCESS)
+                self.app.update_status('Saved Screen Annotation: ' + action['operation'],
+                                       COLOR_SUCCESS)
             except (ValueError,MacroExecutionError,tk.TclError) as exc:
                 error.config(text=str(exc),fg=COLOR_DANGER)
 
-        ModernButton(body,text='Save Changes' if edit_idx is not None else 'Add Guide Action',
+        ModernButton(body,text='Save Changes' if edit_idx is not None else 'Add Annotation Action',
                      bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT,
                      hover_color=COLOR_ACCENT_HOV,command=save).pack(fill=tk.X,pady=(4,10))
 
@@ -19025,7 +19876,8 @@ class BuiltInMacroApp:
             return f"text.compare({left} vs {right}, {action.get('mode','Exact Match')})"
         if act_type == 'placement_guide':
             op = action.get('operation', 'Show / Update Box')
-            return f"guide.{op}({action.get('guide_id', 'main-window')!r}, {action.get('label', '')!r})"
+            return (f"annotation.{op}({action.get('guide_id', 'main-window')!r}, "
+                    f"objects={len(action.get('annotations', []))})")
         if act_type == 'run_macro':
             target = str(action.get('preset', '')).strip()
             mode = action.get('mode', 'Run & Return')
