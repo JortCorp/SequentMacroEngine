@@ -4777,6 +4777,42 @@ SCREEN_RECOGNITION_TYPES = frozenset(('search_area', 'find_color', 'find_text', 
 SCREEN_OUTCOME_OPTIONS = (
     'Continue', 'Run Saved Macro', 'Jump to Label', 'Stop Macro', 'Stop with Error'
 )
+# A screen match may assign values just like the IF Variable Condition action.
+# Find Image retains its existing options; the three requested search actions
+# support a distinct assignment for their Found and Not Found branches.
+SCREEN_VARIABLE_OUTCOME_TYPES = frozenset(('search_area', 'find_color', 'find_text'))
+SCREEN_SET_VARIABLE_BEHAVIOR = 'Set Variable'
+SCREEN_ASSIGNMENT_VALUE_MODES = (
+    'One space', 'Empty text', 'Custom text', 'Another Variable'
+)
+
+
+def sequent_screen_assignment_payload(action, found):
+    """Adapt a screen outcome's scoped assignment to IF Variable's data shape.
+
+    Both branches have independent keys, so a Found assignment never overwrites
+    the Not Found settings. The existing assignment executor remains the single
+    source of truth for local/global storage and variable-to-variable copying.
+    """
+    key = 'if_found' if found else 'if_not_found'
+    return {
+        'target': action.get(key + '_set_target', ''),
+        'target_scope': action.get(key + '_set_target_scope', 'local'),
+        'set_value_source': action.get(key + '_set_value_source', 'text'),
+        'set_value': action.get(key + '_set_value', ''),
+        'set_source_name': action.get(key + '_set_source_name', ''),
+        'set_source_scope': action.get(key + '_set_source_scope', 'local'),
+    }
+
+
+def sequent_screen_assign_variable(app, action, found):
+    """Apply one matched search branch through the IF Variable assignment path."""
+    if action.get('type') not in SCREEN_VARIABLE_OUTCOME_TYPES:
+        raise MacroExecutionError('Set Variable is not supported by this search action')
+    key = 'if_found' if found else 'if_not_found'
+    if action.get(key) != SCREEN_SET_VARIABLE_BEHAVIOR:
+        raise MacroExecutionError(f'{key}: Set Variable is not selected')
+    sequent_if_set_value(app, sequent_screen_assignment_payload(action, found))
 
 
 def sequent_screen_outcome_config(action, found):
@@ -4800,21 +4836,25 @@ def sequent_screen_outcome_config(action, found):
         target = ''
         behavior = ('Continue' if found or typ == 'search_area'
                     else 'Stop with Error')
-    if behavior not in SCREEN_OUTCOME_OPTIONS and not (behavior == 'Save Coordinates to Variables' and ((typ == 'find_text' and found) or typ in ('find_color', 'search_area'))):
+    if (behavior not in SCREEN_OUTCOME_OPTIONS
+            and not (behavior == SCREEN_SET_VARIABLE_BEHAVIOR and typ in SCREEN_VARIABLE_OUTCOME_TYPES)
+            and not (behavior == 'Save Coordinates to Variables' and
+                     ((typ == 'find_text' and found) or typ in ('find_color', 'search_area')))):
         raise MacroExecutionError(f'Invalid {key} option: {behavior!r}')
     return behavior, str(target or '').strip()
 
 
 def sequent_add_screen_outcome_editor(parent, app, action):
-    """Reusable IF FOUND / IF NOT FOUND controls for all four editors.
+    """Edit both screen outcomes, including independent IF-style assignments.
 
-    The returned reader validates selected targets and serializes stable JSON
-    fields; no code uses hidden prefix or action-specific preset widgets.
+    The same controls are used by Playback and Studio. All values remain
+    JSON-serializable and pass through IF Variable's scoped assignment engine.
     """
     tk.Label(parent, text='AFTER SCREEN RECOGNITION', bg=BG_PANEL, fg=SYNTAX_BLUE,
              font=('Segoe UI', 8, 'bold'), anchor='w').pack(fill=tk.X, pady=(8, 5))
     tk.Label(parent, text='If found, the configured mouse action happens first. '
              'Run Saved Macro switches to that macro (it does not return). '
+             'Set Variable updates a Local or Global variable, then continues. '
              'Missing matches only follow If Not Found; capture errors still stop playback.',
              bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
              anchor='w', justify='left', wraplength=445).pack(fill=tk.X, pady=(0, 8))
@@ -4823,23 +4863,57 @@ def sequent_add_screen_outcome_editor(parent, app, action):
     labels = [str(a.get('name', '')).strip() for a in getattr(app, 'recorded_actions', [])
               if isinstance(a, dict) and a.get('type') == 'label' and a.get('name')]
     settings = {}
+
+    def styled_menu(parent_widget, variable, values, *, command=None):
+        options = tk.OptionMenu(parent_widget, variable, *values, command=command)
+        options.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
+                       highlightthickness=1, highlightbackground=BG_BORDER)
+        options['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                               activebackground=COLOR_ACCENT)
+        options.pack(fill=tk.X)
+        return options
+
+    def variable_entry(parent_widget, variable):
+        entry = tk.Entry(parent_widget, textvariable=variable, bg=BG_INPUT,
+                         fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                         highlightthickness=1, highlightbackground=BG_BORDER)
+        entry.pack(fill=tk.X, expand=True)
+        return entry
+
     for found, caption in ((True, 'IF FOUND'), (False, 'IF NOT FOUND')):
+        key = 'if_found' if found else 'if_not_found'
         mode, target = sequent_screen_outcome_config(action, found)
         frame = tk.Frame(parent, bg=BG_PANEL)
         frame.pack(fill=tk.X, pady=(0, 8))
         tk.Label(frame, text=caption, bg=BG_PANEL, fg=TEXT_MUTED,
                  font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(0, 3))
         choice = tk.StringVar(value=mode)
-        choices = SCREEN_OUTCOME_OPTIONS + (('Save Coordinates to Variables',) if (found and action.get('type') == 'find_text') or action.get('type') in ('find_color', 'search_area') else ())
-        menu = tk.OptionMenu(frame, choice, *choices)
-        menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
-                    highlightthickness=1, highlightbackground=BG_BORDER)
-        menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
-                            activebackground=COLOR_ACCENT)
-        menu.pack(fill=tk.X)
+        choices = SCREEN_OUTCOME_OPTIONS
+        if action.get('type') in SCREEN_VARIABLE_OUTCOME_TYPES:
+            choices += (SCREEN_SET_VARIABLE_BEHAVIOR,)
+        if (found and action.get('type') == 'find_text') or action.get('type') in ('find_color', 'search_area'):
+            choices += ('Save Coordinates to Variables',)
+        styled_menu(frame, choice, choices)
         target_box = tk.Frame(frame, bg=BG_PANEL)
         target_box.pack(fill=tk.X, pady=(4, 0))
-        selected = {'variable':None, 'kind':None}
+        selected = {'variable': None, 'kind': None}
+
+        # Keep the variables outside render_target. A user can change the
+        # outcome dropdown and change back without losing anything typed.
+        stored_value = str(action.get(key + '_set_value', ' '))
+        stored_source = action.get(key + '_set_value_source', 'text')
+        initial_value_mode = ('Another Variable' if stored_source == 'variable' else
+                              'One space' if stored_value == ' ' else
+                              'Empty text' if stored_value == '' else 'Custom text')
+        assignment = {
+            'destination': tk.StringVar(value=str(action.get(key + '_set_target', ''))),
+            'scope': tk.StringVar(value=str(action.get(key + '_set_target_scope', 'local')).title()),
+            'value_mode': tk.StringVar(value=initial_value_mode),
+            'literal': tk.StringVar(value=stored_value if stored_value not in (' ', '') else ''),
+            'source': tk.StringVar(value=str(action.get(key + '_set_source_name', ''))),
+            'source_scope': tk.StringVar(value=str(action.get(key + '_set_source_scope', 'local')).title()),
+        }
+        selected['assignment'] = assignment
 
         def render_target(*_args, choice=choice, target_box=target_box,
                           selected=selected, original=target):
@@ -4849,9 +4923,52 @@ def sequent_add_screen_outcome_editor(parent, app, action):
             selected['variable'] = None
             selected['kind'] = None
             mode = choice.get()
-            if mode == 'Save Coordinates to Variables':
-                tk.Label(target_box, text=('Save detected coordinates as:' if action.get('type') == 'find_text' else 'Save current mouse coordinates as:'), bg=BG_PANEL,
+            if mode == SCREEN_SET_VARIABLE_BEHAVIOR:
+                values = selected['assignment']
+                tk.Label(target_box, text='Variable to update:', bg=BG_PANEL,
                          fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+                variable_row = tk.Frame(target_box, bg=BG_PANEL)
+                variable_row.pack(fill=tk.X, pady=(2, 5))
+                dest_box = tk.Frame(variable_row, bg=BG_PANEL)
+                dest_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                variable_entry(dest_box, values['destination'])
+                scope_box = tk.Frame(variable_row, bg=BG_PANEL)
+                scope_box.pack(side=tk.RIGHT, padx=(6, 0))
+                styled_menu(scope_box, values['scope'], ('Local', 'Global'))
+
+                tk.Label(target_box, text='Set value to:', bg=BG_PANEL,
+                         fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+                value_box = tk.Frame(target_box, bg=BG_PANEL)
+
+                def render_value(*_args):
+                    for widget in value_box.winfo_children():
+                        widget.destroy()
+                    value_mode = values['value_mode'].get()
+                    if value_mode == 'Custom text':
+                        tk.Label(value_box, text='New text (exact value):', bg=BG_PANEL,
+                                 fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w', pady=(3, 1))
+                        variable_entry(value_box, values['literal'])
+                    elif value_mode == 'Another Variable':
+                        tk.Label(value_box, text='Read value from:', bg=BG_PANEL,
+                                 fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w', pady=(3, 1))
+                        src_row = tk.Frame(value_box, bg=BG_PANEL)
+                        src_row.pack(fill=tk.X)
+                        src_box = tk.Frame(src_row, bg=BG_PANEL)
+                        src_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                        variable_entry(src_box, values['source'])
+                        scope_box = tk.Frame(src_row, bg=BG_PANEL)
+                        scope_box.pack(side=tk.RIGHT, padx=(6, 0))
+                        styled_menu(scope_box, values['source_scope'], ('Local', 'Global'))
+
+                styled_menu(target_box, values['value_mode'], SCREEN_ASSIGNMENT_VALUE_MODES,
+                            command=render_value)
+                value_box.pack(fill=tk.X, pady=(2, 0))
+                render_value()
+                return
+            if mode == 'Save Coordinates to Variables':
+                tk.Label(target_box, text=('Save detected coordinates as:' if action.get('type') == 'find_text'
+                                           else 'Save current mouse coordinates as:'),
+                         bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
                 entries = {}
                 for field, label in (('save_x_variable', 'Found X'), ('save_y_variable', 'Found Y'),
                                      ('save_click_x_variable', 'Click X'), ('save_click_y_variable', 'Click Y')):
@@ -4864,7 +4981,7 @@ def sequent_add_screen_outcome_editor(parent, app, action):
                              insertbackground=TEXT_PRIMARY).pack(side=tk.LEFT, fill=tk.X, expand=True)
                     entries[field] = variable
                 scope = tk.StringVar(value=action.get('coordinate_scope', 'Local'))
-                tk.OptionMenu(target_box, scope, 'Local', 'Global').pack(fill=tk.X, pady=3)
+                styled_menu(target_box, scope, ('Local', 'Global'))
                 selected['entries'] = entries
                 selected['scope'] = scope
                 return
@@ -4882,24 +4999,25 @@ def sequent_add_screen_outcome_editor(parent, app, action):
             if prior not in candidates:
                 prior = candidates[0]
             var = tk.StringVar(value=prior or candidates[0])
-            options = tk.OptionMenu(target_box, var, *candidates)
-            options.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
-                           highlightthickness=1, highlightbackground=BG_BORDER)
-            options['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
-                                   activebackground=COLOR_ACCENT)
-            options.pack(fill=tk.X)
+            styled_menu(target_box, var, candidates)
             selected['variable'] = var
             selected['kind'] = mode
 
         choice.trace_add('write', render_target)
         render_target()
-        settings['if_found' if found else 'if_not_found'] = (choice, selected)
+        settings[key] = (choice, selected)
 
     def read_settings():
         result = {}
         for key, (choice, selected) in settings.items():
             mode = choice.get()
-            if mode not in SCREEN_OUTCOME_OPTIONS and not (mode == 'Save Coordinates to Variables' and ((key == 'if_found' and action.get('type') == 'find_text') or action.get('type') in ('find_color', 'search_area'))):
+            found = key == 'if_found'
+            if (mode not in SCREEN_OUTCOME_OPTIONS
+                    and not (mode == SCREEN_SET_VARIABLE_BEHAVIOR and
+                             action.get('type') in SCREEN_VARIABLE_OUTCOME_TYPES)
+                    and not (mode == 'Save Coordinates to Variables' and
+                             ((found and action.get('type') == 'find_text') or
+                              action.get('type') in ('find_color', 'search_area')))):
                 raise MacroExecutionError(f'Invalid {key}: {mode}')
             target = ''
             if mode in ('Run Saved Macro', 'Jump to Label'):
@@ -4908,6 +5026,28 @@ def sequent_add_screen_outcome_editor(parent, app, action):
                 if target not in available:
                     item = 'saved macro' if mode == 'Run Saved Macro' else 'label'
                     raise MacroExecutionError(f'Select an existing {item} for {key.replace("_", " ")}.')
+            if mode == SCREEN_SET_VARIABLE_BEHAVIOR:
+                values = selected['assignment']
+                destination = values['destination'].get().strip()
+                scope = values['scope'].get().lower()
+                variable_identity(destination, scope)
+                value_mode = values['value_mode'].get()
+                if value_mode not in SCREEN_ASSIGNMENT_VALUE_MODES:
+                    raise MacroExecutionError(f'Invalid {key} assignment value: {value_mode!r}')
+                result[key + '_set_target'] = destination
+                result[key + '_set_target_scope'] = scope
+                if value_mode == 'Another Variable':
+                    source_name = values['source'].get().strip()
+                    source_scope = values['source_scope'].get().lower()
+                    variable_identity(source_name, source_scope)
+                    result[key + '_set_value_source'] = 'variable'
+                    result[key + '_set_source_name'] = source_name
+                    result[key + '_set_source_scope'] = source_scope
+                else:
+                    result[key + '_set_value_source'] = 'text'
+                    result[key + '_set_value'] = (
+                        ' ' if value_mode == 'One space' else
+                        '' if value_mode == 'Empty text' else values['literal'].get())
             if mode == 'Save Coordinates to Variables':
                 entries = selected.get('entries', {})
                 names = {field: var.get().strip() for field, var in entries.items()}
@@ -6443,6 +6583,12 @@ class SequentDynamicEngine:
                 if behavior == 'Save Coordinates to Variables' and ((typ == 'find_text' and match['found']) or typ in ('find_color','search_area')):
                     # Coordinates were saved by _recognize_screen_action at the selected outcome.
                     # Treat this branch as a normal continuation.
+                    behavior = 'Continue'
+                if behavior == SCREEN_SET_VARIABLE_BEHAVIOR:
+                    # Recognition (and its optional click) already completed.
+                    # Only the matching Found/Not Found branch writes a value.
+                    # Use IF Variable's exact local/global assignment semantics.
+                    sequent_screen_assign_variable(self.app, action, match['found'])
                     behavior = 'Continue'
                 if behavior == 'Continue':
                     index += 1
@@ -15735,65 +15881,44 @@ class SequentPlaybackGraph(SequentStudioGraph):
             return
         win=tk.Toplevel(self)
         win.title('Conditional outcomes — '+str(action['type']).replace('_',' ').title())
-        win.geometry('520x670')
-        win.configure(bg='#202633')
+        win.geometry('550x700')
+        win.configure(bg=BG_PANEL)
         win.transient(self.winfo_toplevel())
         win.grab_set()
-        tk.Label(win,text='Edit conditional subactions',bg='#202633',fg='white',
-                 font=('Segoe UI',13,'bold')).pack(anchor='w',padx=16,pady=(14,6))
-        fields={}
-        for found,caption in ((True,'IF FOUND'),(False,'IF NOT FOUND')):
-            behavior,target=sequent_screen_outcome_config(action,found)
-            frame=tk.LabelFrame(win,text=caption,bg='#202633',fg='#A9BBD1',padx=10,pady=8)
-            frame.pack(fill='x',padx=16,pady=7)
-            options=list(SCREEN_OUTCOME_OPTIONS)
-            if (found and action['type']=='find_text') or action['type'] in ('find_color','search_area'):
-                options.append('Save Coordinates to Variables')
-            var=tk.StringVar(value=behavior)
-            opt=tk.OptionMenu(frame,var,*options)
-            opt.configure(bg='#303D52',fg='white',highlightthickness=0)
-            opt.pack(fill='x')
-            target_var=tk.StringVar(value=target)
-            tk.Entry(frame,textvariable=target_var,bg='#151B27',fg='white',
-                     insertbackground='white').pack(fill='x',pady=(8,0))
-            tk.Label(frame,text='Target macro or label (when applicable)',
-                     bg='#202633',fg='#A9BBD1').pack(anchor='w')
-            fields[found]=(var,target_var)
-        coord_frame=tk.LabelFrame(win,text='Coordinate variable names (Save Coordinates mode)',
-                                  bg='#202633',fg='white',padx=8,pady=6)
-        coord_frame.pack(fill='x',padx=16)
-        coord_fields={}
-        for key,caption in (('save_x_variable','X'),('save_y_variable','Y'),
-                            ('save_click_x_variable','Click X'),('save_click_y_variable','Click Y')):
-            r=tk.Frame(coord_frame,bg='#202633');r.pack(fill='x')
-            tk.Label(r,text=caption,width=9,anchor='w',bg='#202633',fg='white').pack(side='left')
-            var=tk.StringVar(value=str(action.get(key,'')))
-            tk.Entry(r,textvariable=var,bg='#151B27',fg='white',
-                     insertbackground='white').pack(side='left',fill='x',expand=True)
-            coord_fields[key]=var
-        scope_var=tk.StringVar(value=action.get('coordinate_scope','Local'))
-        tk.OptionMenu(coord_frame,scope_var,'Local','Global').pack(fill='x')
+        tk.Label(win, text='Edit conditional subactions', bg=BG_PANEL,
+                 fg=TEXT_PRIMARY, font=('Segoe UI',13,'bold')).pack(
+                     anchor='w', padx=16, pady=(14,6))
+
+        # Shared Playback/Studio editor keeps new variable assignments and
+        # existing coordinate fields in sync. Scroll for two expanded branches.
+        scroll_outer = tk.Frame(win, bg=BG_PANEL)
+        scroll_outer.pack(fill=tk.BOTH, expand=True, padx=16)
+        canvas = tk.Canvas(scroll_outer, bg=BG_PANEL, highlightthickness=0)
+        scrollbar = tk.Scrollbar(scroll_outer, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        inner_id = canvas.create_window((0,0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfigure(inner_id, width=e.width))
+        get_outcomes = sequent_add_screen_outcome_editor(inner, self.app, action)
+
         def save():
-            updated=copy.deepcopy(action)
-            for found,(var,target_var) in fields.items():
-                key='if_found' if found else 'if_not_found'
-                updated[key]=var.get()
-                updated[key+'_target']=target_var.get().strip()
-                if updated[key] in ('Jump to Label','Run Saved Macro') and not updated[key+'_target']:
-                    messagebox.showerror('Missing target',f'{key}: specify a target.',parent=win)
-                    return
-            if any(v.get()=='Save Coordinates to Variables' for v,_ in fields.values()):
-                if not any(v.get().strip() for v in coord_fields.values()):
-                    messagebox.showerror('Missing variable','Enter at least one coordinate variable name.',parent=win)
-                    return
-                updated.update({k:v.get().strip() for k,v in coord_fields.items()})
-                updated['coordinate_scope']=scope_var.get()
-            actions=copy.deepcopy(self.actions)
-            actions[i]=updated
+            try:
+                outcome_settings = get_outcomes()
+            except MacroExecutionError as exc:
+                messagebox.showerror('Conditional outcomes', str(exc), parent=win)
+                return
+            updated = copy.deepcopy(action)
+            updated.update(outcome_settings)
+            actions = copy.deepcopy(self.actions)
+            actions[i] = updated
             if self._write(actions):
                 win.destroy()
-        tk.Button(win,text='Save conditional outcomes',command=save,
-                  bg='#377F83',fg='white').pack(fill='x',padx=16,pady=10)
+
+        tk.Button(win, text='Save conditional outcomes', command=save,
+                  bg=COLOR_ACCENT, fg='white').pack(fill='x', padx=16, pady=10)
 
     def _conditional_node_summary(self, action):
         try:
@@ -18374,10 +18499,15 @@ class BuiltInMacroApp:
                 name = 'Find Image'
             found, found_target = sequent_screen_outcome_config(action, True)
             missing, missing_target = sequent_screen_outcome_config(action, False)
-            def describe(mode, target):
+            def describe(mode, target, found):
+                if mode == SCREEN_SET_VARIABLE_BEHAVIOR:
+                    key = 'if_found' if found else 'if_not_found'
+                    dest = action.get(key + '_set_target', '')
+                    return f'Set Variable: {dest}' if dest else 'Set Variable'
                 return (f'{mode}: {target}' if target and mode in
                         ('Run Saved Macro', 'Jump to Label') else mode)
-            return f'{name} | Found: {describe(found, found_target)} | Not found: {describe(missing, missing_target)}'
+            return (f'{name} | Found: {describe(found, found_target, True)} | '
+                    f'Not found: {describe(missing, missing_target, False)}')
         if act_type in ('compare_text', 'compare_variables'):
             if act_type == 'compare_variables':
                 return (f"variables.compare({action.get('left_value','')!r}, "
