@@ -6358,6 +6358,51 @@ class SequentDynamicEngine:
             raise MacroExecutionError(f"Run Macro: {preset_name!r} is not a valid nonempty macro")
         return actions
 
+    def _run_saved_macro_and_return(self, preset, *, idle, macro_stack,
+                                    inputs=None, return_var='', return_scope='local'):
+        """Run a saved child macro and return to the caller's next action.
+
+        Shared by Run Macro (Run & Return) and IF Variable's conditional call.
+        Child actions run inside this executor; the current queue, loop frames,
+        and next caller index remain unchanged. Input bindings are restored even
+        when playback fails, stops, or switches to another macro.
+        """
+        preset = str(preset or '').strip()
+        nested_actions = self._load_called_macro(preset)
+        if preset in macro_stack:
+            raise MacroExecutionError('Run Macro: recursive macro call: ' +
+                                      ' -> '.join(macro_stack + (preset,)))
+        if len(macro_stack) >= 12:
+            raise MacroExecutionError('Run Macro: maximum nested call depth (12) reached')
+        if return_var:
+            variable_identity(return_var, return_scope)
+        parameters = sequent_parameter_inputs(inputs or [], self.interpolate)
+        missing = object()
+        prior = {name: self.app.variables.get(name, missing) for name in parameters}
+        try:
+            self.app.variables.update(parameters)
+            child = self.run_program(nested_actions, idle=idle,
+                                     macro_stack=macro_stack + (preset,))
+        finally:
+            for name, old_value in prior.items():
+                if old_value is missing:
+                    self.app.variables.pop(name, None)
+                else:
+                    self.app.variables[name] = old_value
+        # A user stop, an explicit switch, or a failure is not a normal return.
+        if child.get('cancelled') or child.get('switch'):
+            return child
+        if not child.get('completed'):
+            raise MacroExecutionError(f'Run Macro: {preset!r} did not finish')
+        if return_var and 'return_value' not in child:
+            raise MacroExecutionError(f'Run Macro: {preset!r} did not return a value')
+        if 'return_value' in child:
+            value = child['return_value']
+            self.app.variables['_last_macro_return'] = value
+            if return_var:
+                set_variable(self.app, return_var, value, return_scope)
+        return child
+
     def run_program(self, actions, start=0, *, on_step=None, idle=False,
                     max_actions=None, frames=None, macro_stack=None):
         """Execute a complete workflow or exactly one debugger step with saved loop frames."""
@@ -6511,45 +6556,19 @@ class SequentDynamicEngine:
                 mode = action.get('mode', 'Run & Return')
                 if mode not in ('Run & Return', 'Switch to Macro'):
                     raise MacroExecutionError(f'Run Macro: unrecognized mode {mode!r}')
-                # Validate before switching or invoking, so failures are reported
-                # by the current macro rather than silently switching to nothing.
-                nested_actions = self._load_called_macro(preset)
                 if mode == 'Switch to Macro':
+                    # Validate before switching; a switch does not return.
+                    self._load_called_macro(preset)
                     if action.get('inputs') or action.get('return_var'):
                         raise MacroExecutionError('Run Macro inputs/outputs require Run & Return')
                     return {'switch':'preset', 'target':preset}
-                if preset in macro_stack:
-                    raise MacroExecutionError('Run Macro: recursive macro call: ' +
-                                              ' -> '.join(macro_stack + (preset,)))
-                if len(macro_stack) >= 12:
-                    raise MacroExecutionError('Run Macro: maximum nested call depth (12) reached')
-                # Inputs are child-local variables, temporarily shadowing matching
-                # caller variables. Restore them even when a nested macro errors.
-                if action.get('return_var'):
-                    variable_identity(action['return_var'],action.get('return_scope','local'))
-                parameters = sequent_parameter_inputs(action.get('inputs', []), self.interpolate)
-                missing = object()
-                prior = {name:self.app.variables.get(name, missing) for name in parameters}
-                try:
-                    self.app.variables.update(parameters)
-                    child = self.run_program(nested_actions, idle=idle,
-                                             macro_stack=macro_stack + (preset,))
-                finally:
-                    for name, old_value in prior.items():
-                        if old_value is missing: self.app.variables.pop(name, None)
-                        else: self.app.variables[name] = old_value
+                child = self._run_saved_macro_and_return(
+                    preset, idle=idle, macro_stack=macro_stack,
+                    inputs=action.get('inputs', []),
+                    return_var=action.get('return_var', ''),
+                    return_scope=action.get('return_scope', 'local'))
                 if child.get('cancelled') or child.get('switch'):
                     return child
-                if not child.get('completed'):
-                    raise MacroExecutionError(f'Run Macro: {preset!r} did not finish')
-                if action.get('return_var') and 'return_value' not in child:
-                    raise MacroExecutionError(f'Run Macro: {preset!r} did not return a value')
-                if 'return_value' in child:
-                    value = child['return_value']
-                    self.app.variables['_last_macro_return'] = value
-                    dest = str(action.get('return_var', '')).strip()
-                    if dest:
-                        set_variable(self.app, dest, value, action.get('return_scope','local'))
                 index += 1
                 continue
             if typ == 'macro_return':
@@ -6564,6 +6583,15 @@ class SequentDynamicEngine:
                         index+=1;continue
                     if target_type=='set_variable':
                         sequent_if_set_value(self.app, action)
+                        index+=1;continue
+                    if target_type=='call_preset':
+                        # Conditional submacro: run the saved preset in this call
+                        # frame, then resume at the action after this IF.
+                        child = self._run_saved_macro_and_return(
+                            action.get('target', ''), idle=idle,
+                            macro_stack=macro_stack)
+                        if child.get('cancelled') or child.get('switch'):
+                            return child
                         index+=1;continue
                     if target_type=='stop':
                         return {'cancelled':True}
@@ -10173,7 +10201,8 @@ class VSCodeQueueViewer(tk.Frame):
                  fg=TEXT_PRIMARY, font=('Segoe UI', 10, 'bold'),
                  anchor='w').pack(fill=tk.X, pady=(10, 4))
         target_names = {
-            'preset':'Switch to Preset', 'file':'Browse & Run File',
+            'preset':'Switch to Preset', 'call_preset':'Run Saved Macro & Return',
+            'file':'Browse & Run File',
             'label':'Jump to Label', 'set_variable':'Set Variable',
             'continue':'Continue', 'stop':'Stop Macro', 'error':'Stop with Error'}
         reverse_names = {v:k for k,v in target_names.items()}
@@ -10221,14 +10250,21 @@ class VSCodeQueueViewer(tk.Frame):
             elif kind == 'label':
                 label(target_container, 'Label name')
                 controls['target'] = entry(target_container, current_target)
-            elif kind == 'preset':
+            elif kind in ('preset', 'call_preset'):
                 label(target_container, 'Saved macro')
                 names = list(self.app.get_preset_names())
                 state = tk.StringVar(master=body, value=current_target or
                                      (names[0] if names else ''))
-                if names: pick(target_container, state, tuple(names))
-                else: controls['target_entry'] = entry(target_container, state.get())
+                if names:
+                    pick(target_container, state, tuple(names))
+                else:
+                    controls['target_entry'] = entry(target_container, state.get())
                 controls['target_state'] = state
+                if kind == 'call_preset':
+                    note(target_container,
+                         'Runs the selected saved macro, then resumes at the next '
+                         'action in this macro. A Return From Macro action can end '
+                         'the called macro early. Both macros share variables.')
             elif kind == 'file':
                 label(target_container, 'Macro JSON file')
                 path = entry(target_container, current_target)
@@ -10290,10 +10326,19 @@ class VSCodeQueueViewer(tk.Frame):
                 else:
                     result['set_value'] = (' ' if vmode == 'One space' else '' if vmode == 'Empty text'
                         else controls['set_text'].get())
-            elif mode in ('preset', 'file', 'label'):
-                tgt = controls['target_state'].get() if mode == 'preset' and 'target_state' in controls else controls['target'].get()
+            elif mode in ('preset', 'call_preset', 'file', 'label'):
+                if mode in ('preset', 'call_preset'):
+                    tgt = (controls['target_entry'].get() if 'target_entry' in controls
+                           else controls['target_state'].get())
+                else:
+                    tgt = controls['target'].get()
                 if not tgt.strip():
                     messagebox.showerror('IF Variable', 'Select a target for this action.', parent=self.sub_menu)
+                    return
+                if mode == 'call_preset' and tgt.strip() not in self.app.get_preset_names():
+                    messagebox.showerror('IF Variable',
+                                         'Select an existing saved macro from your Presets folder.',
+                                         parent=self.sub_menu)
                     return
                 result['target'] = tgt.strip()
             if edit_idx is not None:
@@ -18555,6 +18600,7 @@ class BuiltInMacroApp:
             if t_type == 'error': return f'flow.if({v_name} {op} {rhs} ➔ error)'
             if t_type == 'label': return f'flow.if({v_name} {op} {rhs} ➔ goto {tgt})'
             if t_type == 'preset': return f'flow.if({v_name} {op} {rhs} ➔ preset {tgt})'
+            if t_type == 'call_preset': return f'flow.if({v_name} {op} {rhs} ➔ call {tgt}; return)'
             if t_type == 'file': return f'flow.if({v_name} {op} {rhs} ➔ run {os.path.basename(tgt)})'
         elif act_type == "drag": 
             return f"mouse.drag(({action.get('start_x')},{action.get('start_y')}) ➔ ({action.get('end_x')},{action.get('end_y')}))"
