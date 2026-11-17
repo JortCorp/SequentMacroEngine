@@ -4992,6 +4992,31 @@ DYNAMIC_ACTION_SPECS = {
    ('var_scope','Destination Variable Scope','choice','Local',['Local','Global'])]),
  'Return From Macro':('macro_return',[
    ('value','Return text or ${variable}','text','${_last_value}')]),
+ 'Read File':('file_read',[
+   ('path','File path (supports ${variables})','path','data.txt'),
+   ('var_name','Save contents to variable','text','file_contents'),
+   ('var_scope','Variable Scope','choice','Local',['Local','Global']),
+   ('missing','If file is missing','choice','Error',['Error','Skip','Empty']),
+   ('encoding','Text encoding','choice','utf-8',['utf-8','utf-8-sig','utf-16'])]),
+ 'Write File':('file_write',[
+   ('path','File path (supports ${variables})','path','data.txt'),
+   ('value','Text to write (supports ${variables})','text','${file_contents}'),
+   ('mode','Write mode','choice','Overwrite',['Overwrite','Append']),
+   ('create_dirs','Create missing folders','bool',True),
+   ('encoding','Text encoding','choice','utf-8',['utf-8','utf-8-sig','utf-16'])]),
+ 'Read JSON':('json_read',[
+   ('path','JSON file path (supports ${variables})','path','data.json'),
+   ('key','Key path (dot-separated, blank = entire JSON)','text','settings.status'),
+   ('var_name','Save JSON value to variable','text','json_result'),
+   ('var_scope','Variable Scope','choice','Local',['Local','Global']),
+   ('missing','If file or key is missing','choice','Error',['Error','Skip','Empty'])]),
+ 'Write JSON':('json_write',[
+   ('path','JSON file path (supports ${variables})','path','data.json'),
+   ('key','Key path (dot-separated)','text','settings.status'),
+   ('value','Value (supports ${variables})','text','${status}'),
+   ('value_type','Value type','choice','String',['String','JSON','Number','Boolean','Null']),
+   ('mode','Operation','choice','Set Key',['Set Key','Delete Key','Append to Array','Replace Document']),
+   ('create_dirs','Create missing folders','bool',True)]),
  'Load Text File → Variable':('load_text_variable',[
    ('path','Text file to read (.txt; relative paths use presets/text_files)','path','defect_description.txt'),
    ('var_name','Destination variable name','text','defect_description'),
@@ -5913,7 +5938,7 @@ DYNAMIC_ACTION_TYPES = frozenset({
     'end_if', 'loop_start', 'loop_end', 'loop_break', 'find_image', 'recovery',
     'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action', 'set_variable',
     'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro', 'text_process', 'macro_return',
-    'load_text_variable', 'compare_text', 'compare_variables', 'placement_guide'
+    'load_text_variable', 'file_read', 'file_write', 'json_read', 'json_write', 'compare_text', 'compare_variables', 'placement_guide'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end','loop_break'})
 
@@ -7015,6 +7040,136 @@ def sequent_parameter_inputs(items, interpolate):
     return values
 
 
+# Text and JSON file actions. Relative paths live under presets/files.
+def sequent_file_action(engine, action):
+    typ = action['type']
+    raw_path = engine.interpolate(str(action.get('path', '')).strip())
+    if not raw_path:
+        raise MacroExecutionError('File action requires a path')
+    path = Path(os.path.expandvars(os.path.expanduser(raw_path)))
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / 'presets' / 'files' / path
+    missing = action.get('missing', 'Error')
+    encoding = action.get('encoding', 'utf-8')
+    def store(value):
+        name = action.get('var_name', '')
+        engine._assign_variable(name, value, action.get('var_scope', 'Local'))
+        return {'variable': name, 'value': value, 'path': str(path)}
+    def absent(message):
+        if missing == 'Skip':
+            return {'skipped': True, 'path': str(path)}
+        if missing == 'Empty':
+            return store('')
+        raise MacroExecutionError(message)
+    try:
+        if typ == 'file_read':
+            if not path.is_file():
+                return absent(f'File not found: {path}')
+            return store(path.read_text(encoding=encoding))
+        if typ == 'file_write':
+            if action.get('create_dirs', True):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            value = engine.interpolate(str(action.get('value', '')))
+            if action.get('mode') == 'Append':
+                with path.open('a', encoding=encoding) as handle:
+                    handle.write(value)
+            else:
+                # Replace atomically to avoid leaving half-written files.
+                sequent_atomic_text_write(path, value, encoding)
+            return {'path': str(path), 'characters': len(value)}
+        if typ == 'json_read':
+            if not path.is_file():
+                return absent(f'JSON file not found: {path}')
+            document = json.loads(path.read_text(encoding='utf-8-sig'))
+            key = engine.interpolate(str(action.get('key', '')).strip())
+            try:
+                value = sequent_json_get(document, key) if key else document
+            except (KeyError, IndexError, TypeError, ValueError):
+                return absent(f'JSON key not found: {key}')
+            return store(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))
+        if typ == 'json_write':
+            mode = action.get('mode', 'Set Key')
+            key = engine.interpolate(str(action.get('key', '')).strip())
+            if path.is_file():
+                document = json.loads(path.read_text(encoding='utf-8-sig'))
+            else:
+                document = {}
+            raw = engine.interpolate(str(action.get('value', '')))
+            kind = action.get('value_type', 'String')
+            if kind == 'String': value = raw
+            elif kind == 'JSON': value = json.loads(raw)
+            elif kind == 'Number':
+                value = json.loads(raw)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError('Number value must be numeric')
+            elif kind == 'Boolean':
+                if raw.strip().lower() not in ('true', 'false'):
+                    raise ValueError('Boolean must be true or false')
+                value = raw.strip().lower() == 'true'
+            elif kind == 'Null': value = None
+            else: raise ValueError(f'Unknown JSON value type: {kind}')
+            if mode == 'Replace Document':
+                document = value
+            else:
+                if not key: raise ValueError('JSON key path is required for this operation')
+                parts = key.split('.')
+                if any(not part for part in parts): raise ValueError('Invalid JSON key path')
+                parent = document
+                for part in parts[:-1]:
+                    if isinstance(parent, dict):
+                        if part not in parent:
+                            if mode != 'Set Key' and mode != 'Append to Array':
+                                raise KeyError(part)
+                            parent[part] = {}
+                        parent = parent[part]
+                    elif isinstance(parent, list): parent = parent[int(part)]
+                    else: raise TypeError('JSON path crosses a scalar value')
+                last = parts[-1]
+                if isinstance(parent, dict):
+                    if mode == 'Set Key': parent[last] = value
+                    elif mode == 'Delete Key': del parent[last]
+                    elif mode == 'Append to Array':
+                        if last not in parent: parent[last] = []
+                        if not isinstance(parent[last], list): raise TypeError('Target is not an array')
+                        parent[last].append(value)
+                    else: raise ValueError(f'Unknown JSON operation: {mode}')
+                elif isinstance(parent, list):
+                    index = int(last)
+                    if mode == 'Set Key': parent[index] = value
+                    elif mode == 'Delete Key': parent.pop(index)
+                    elif mode == 'Append to Array':
+                        if not isinstance(parent[index], list): raise TypeError('Target is not an array')
+                        parent[index].append(value)
+                    else: raise ValueError(f'Unknown JSON operation: {mode}')
+                else: raise TypeError('JSON key parent must be object or array')
+            if action.get('create_dirs', True):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            sequent_atomic_text_write(path, json.dumps(document, ensure_ascii=False, indent=2) + '\n', 'utf-8')
+            return {'path': str(path), 'operation': mode, 'key': key}
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError) as exc:
+        raise MacroExecutionError(f'{typ}: {exc}') from exc
+
+def sequent_json_get(document, key):
+    current = document
+    for part in key.split('.'):
+        if isinstance(current, dict): current = current[part]
+        elif isinstance(current, list): current = current[int(part)]
+        else: raise TypeError('JSON path crosses a scalar value')
+    return current
+
+def sequent_atomic_text_write(path, value, encoding):
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding=encoding, dir=str(path.parent),
+                                         prefix='.sequent-', suffix='.tmp', delete=False) as handle:
+            temp_name = handle.name
+            handle.write(value)
+        os.replace(temp_name, path)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
 class SequentDynamicEngine:
     """Structured action execution and conditions; no independent Tk GUI state."""
     def __init__(self, app):
@@ -7363,6 +7518,8 @@ class SequentDynamicEngine:
             destination = action.get('var_name', '')
             self._assign_variable(destination, transformed, action.get('var_scope'))
             result = {'variable':destination, 'value':transformed}
+        elif typ in ('file_read', 'file_write', 'json_read', 'json_write'):
+            result = sequent_file_action(self, action)
         elif typ == 'load_text_variable':
             result = sequent_text_file_to_variable(self.app, action)
         elif typ == 'placement_guide':
@@ -7698,6 +7855,25 @@ class SequentDynamicEngine:
                 target=next((i for i,a in enumerate(actions) if a.get('type')=='label' and a.get('name')==label),None)
                 if target is None:raise MacroExecutionError(f'Unknown label: {label}')
                 frames.clear();index=target+1;continue
+            if typ == 'prompt_choice':
+                selected = self.app.prompt_user_choice(action)
+                if selected is None:
+                    raise MacroCancelled('Request Choice cancelled')
+                set_variable(self.app, action.get('var_name', 'selected_option'),
+                             self.interpolate(str(selected.get('value', selected.get('label', '')))),
+                             action.get('var_scope', 'local'))
+                behavior = selected.get('behavior', 'Continue')
+                if behavior == 'Stop Macro': return {'cancelled':True}
+                if behavior == 'Switch to Macro':
+                    preset = selected.get('preset', '')
+                    self._load_called_macro(preset)
+                    return {'switch':'preset', 'target':preset}
+                if behavior == 'Run & Return':
+                    child = self._run_saved_macro_and_return(
+                        selected.get('preset', ''), idle=idle, macro_stack=macro_stack)
+                    if child.get('cancelled') or child.get('switch'): return child
+                index += 1
+                continue
             if typ == 'run_macro':
                 preset = str(action.get('preset', '')).strip()
                 mode = action.get('mode', 'Run & Return')
@@ -7975,8 +8151,14 @@ class VSCodeQueueViewer(tk.Frame):
             ("Set Variable", "Create or update a local/global variable.", "SV"),
             ("Read Clipboard", "Capture text, save to a text file, or route clipboard keywords.", "RC"),
             ("Load Text File → Variable", "Read a UTF-8 text file into a Local or Global variable.", "LF"),
+            ("Read File", "Read a text file into a Local/Global variable.", "RF"),
+            ("Write File", "Create, overwrite or append a text file.", "WF"),
+            ("Read JSON", "Read a JSON key or document into a variable.", "RJ"),
+            ("Write JSON", "Set/delete JSON keys, append arrays, or replace a document.", "WJ"),
+
             ("Clipboard Branch / Fallback", "On a keyword miss, set a Local/Global variable and/or run a macro.", "CB"),
             ("Request Input", "Ask the user for a value at runtime.", "IN"),
+            ("Request Choice", "Display custom buttons that save a choice or run saved macros.", "CH"),
             ("Type Variable", "Type the value of a saved variable.", "VR"),
             ("Text Processing", "Regex extract, replace, split, or format text variables.", "TX"),
             ("Advanced Key", "Press, hold, or release a specific key.", "AK"),
@@ -9148,6 +9330,7 @@ class VSCodeQueueViewer(tk.Frame):
             "clip_fallback": "Clipboard Branch / Fallback",
             "gate_check": "Gate Check",
             "prompt_input": "Request Input",
+            "prompt_choice": "Request Choice",
             "type_variable": "Type Variable",
             "search_area": "Search selected area",
             "wait_pixel": "Wait Pixel",
@@ -9631,6 +9814,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Read Clipboard": self._render_read_clipboard_view,
             "Clipboard Branch / Fallback": self._render_clipboard_fallback_view,
             "Request Input": self._render_request_input_view,
+            "Request Choice": self._render_request_choice_view,
             "Type Variable": self._render_type_variable_view,
             "Search selected area": self._render_search_area_view,
             "Find Color & Click": self._render_find_color_view,
@@ -11508,6 +11692,106 @@ class VSCodeQueueViewer(tk.Frame):
                      bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT,
                      hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X, pady=(8, 0))
 
+
+    def _render_request_choice_view(self, line_num, edit_idx=None):
+        """Configure a runtime dialog with user-defined macro/variable buttons."""
+        body = self.action_content_frame
+        old = (self.app.recorded_actions[edit_idx] if edit_idx is not None
+               and 0 <= edit_idx < len(self.app.recorded_actions) else {})
+        if old.get('type') != 'prompt_choice': old = {}
+        def field(label, initial=''):
+            tk.Label(body, text=label, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(5, 2))
+            entry = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                             insertbackground=TEXT_PRIMARY, highlightthickness=1,
+                             highlightbackground=BG_BORDER)
+            entry.insert(0, initial)
+            entry.pack(fill=tk.X, ipady=3)
+            return entry
+        title = field('WINDOW TITLE', old.get('title', 'Choose an option'))
+        message = field('MESSAGE', old.get('message', 'Select how to continue:'))
+        variable = field('SAVE CHOSEN VALUE TO VARIABLE', old.get('var_name', 'selected_option'))
+        tk.Label(body, text='VARIABLE SCOPE', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w', pady=(6, 0))
+        scope = tk.StringVar(value=old.get('var_scope', 'local').title())
+        tk.OptionMenu(body, scope, 'Local', 'Global').pack(fill=tk.X)
+        tk.Label(body, text='BUTTONS (in display order)', bg=BG_PANEL,
+                 fg=SYNTAX_BLUE, font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(12, 5))
+        holder = tk.Frame(body, bg=BG_PANEL)
+        holder.pack(fill=tk.X)
+        rows = []
+        names = self.app.get_preset_names()
+        def add_choice(data=None):
+            data = data or {}
+            panel = tk.Frame(holder, bg=BG_PANEL, highlightbackground=BG_BORDER,
+                             highlightthickness=1, padx=7, pady=6)
+            panel.pack(fill=tk.X, pady=3)
+            row = {'panel':panel}
+            for label, key, default in (('Button label', 'label', 'Option'),
+                                        ('Saved value', 'value', ''),):
+                tk.Label(panel, text=label, bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+                e = tk.Entry(panel, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                             insertbackground=TEXT_PRIMARY)
+                e.insert(0, data.get(key, default))
+                e.pack(fill=tk.X, pady=(1, 4))
+                row[key] = e
+            tk.Label(panel, text='On click', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+            row['behavior'] = tk.StringVar(value=data.get('behavior', 'Continue'))
+            tk.OptionMenu(panel, row['behavior'], 'Continue', 'Run & Return',
+                          'Switch to Macro', 'Stop Macro').pack(fill=tk.X)
+            tk.Label(panel, text='Saved macro (for Run / Switch)', bg=BG_PANEL,
+                     fg=TEXT_MUTED).pack(anchor='w')
+            row['preset'] = tk.StringVar(value=data.get('preset', ''))
+            tk.OptionMenu(panel, row['preset'], '', *(names or [])).pack(fill=tk.X)
+            def remove():
+                rows.remove(row)
+                panel.destroy()
+            tk.Button(panel, text='Remove button', command=remove, bg=BG_INPUT,
+                      fg=COLOR_DANGER, bd=0).pack(anchor='e', pady=(3, 0))
+            rows.append(row)
+        for choice in old.get('choices', [{'label':'Yes','value':'yes'},
+                                         {'label':'No','value':'no'}]):
+            if isinstance(choice, dict): add_choice(choice)
+        tk.Button(body, text='+ Add Button', command=add_choice, bg=BG_INPUT,
+                  fg=TEXT_PRIMARY, bd=0).pack(fill=tk.X, pady=(6, 10))
+        if edit_idx is None:
+            position = tk.StringVar(value=f'Before Line {line_num}')
+            tk.OptionMenu(body, position, f'Before Line {line_num}',
+                          f'After Line {line_num}').pack(fill=tk.X, pady=(3, 7))
+        error = tk.Label(body, text='', bg=BG_PANEL, fg=COLOR_DANGER,
+                         wraplength=420, justify='left')
+        error.pack(fill=tk.X)
+        def save():
+            try:
+                if not rows or len(rows) > 12:
+                    raise ValueError('Provide between 1 and 12 buttons')
+                var_name, var_scope = variable_identity(variable.get().strip(), scope.get())
+                choices = []
+                for row in rows:
+                    label = row['label'].get().strip()
+                    behavior = row['behavior'].get()
+                    preset = row['preset'].get().strip()
+                    if not label: raise ValueError('Every button needs a label')
+                    if behavior in ('Run & Return', 'Switch to Macro') and preset not in names:
+                        raise ValueError(f'{label}: select a saved macro')
+                    choices.append({'label':label, 'value':row['value'].get() or label,
+                                    'behavior':behavior, 'preset':preset})
+                action = {'type':'prompt_choice', 'title':title.get(),
+                          'message':message.get(), 'var_name':var_name,
+                          'var_scope':var_scope, 'choices':choices}
+                idx = edit_idx if edit_idx is not None else max(0, min(
+                    line_num - 1 if 'After' in position.get() else line_num - 2,
+                    len(self.app.recorded_actions)))
+                if edit_idx is not None: self.app.recorded_actions[idx] = action
+                else: self.app.recorded_actions.insert(idx, action)
+                self.close_sub_menu()
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(idx)
+                self.app.update_status('Request Choice saved', COLOR_SUCCESS)
+            except (ValueError, MacroExecutionError) as exc:
+                error.config(text=str(exc))
+        ModernButton(body, text='Save Changes' if edit_idx is not None else 'Add Request Choice',
+                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                     command=save).pack(fill=tk.X, pady=(5, 12))
 
     def _render_request_input_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
@@ -19947,6 +20231,8 @@ class BuiltInMacroApp:
             kws = action.get('keywords', [])
             preview = kws[0] if len(kws) == 1 else f"{len(kws)} keywords"
             return f"clipboard.find({preview!r} -> ${action.get('var_name')} [legacy])"
+        elif act_type == "prompt_choice":
+            return f"user.choice({action.get('title', 'Choose an option')!r}, {len(action.get('choices', []))} buttons)"
         elif act_type == "prompt_input": 
             return f"user.prompt('{action.get('prompt', '')}' ➔ ${action.get('var_name', '')})"
         elif act_type == "type_variable": 
@@ -24455,6 +24741,57 @@ try {{
         self.queue_viewer.gutter.yview_moveto(old_scroll[0])
 
 
+    def prompt_user_choice(self, action):
+        """Show a choice dialog on Tk's main thread; wait on playback worker."""
+        import threading
+        event = threading.Event()
+        result = [None]
+        def show():
+            try:
+                dlg = tk.Toplevel(self.root)
+                dlg.title(str(action.get('title', 'Choose an option')))
+                dlg.configure(bg=BG_PANEL)
+                dlg.attributes('-topmost', True)
+                dlg.resizable(False, False)
+                dlg.transient(self.root)
+                choices = action.get('choices', [])
+                width = 440
+                height = min(650, 130 + len(choices) * 46)
+                dlg.update_idletasks()
+                x = dlg.winfo_screenwidth() // 2 - width // 2
+                y = dlg.winfo_screenheight() // 2 - height // 2
+                dlg.geometry(f'{width}x{height}+{x}+{y}')
+                card = tk.Frame(dlg, bg=BG_PANEL, padx=18, pady=16)
+                card.pack(fill=tk.BOTH, expand=True)
+                tk.Label(card, text=str(action.get('title', 'Choose an option')),
+                         bg=BG_PANEL, fg=SYNTAX_BLUE, font=('Segoe UI', 13, 'bold'),
+                         wraplength=395).pack(anchor='w', pady=(0, 8))
+                tk.Label(card, text=str(action.get('message', 'Select an option:')),
+                         bg=BG_PANEL, fg=TEXT_PRIMARY, font=('Segoe UI', 10),
+                         wraplength=395, justify='left').pack(anchor='w', pady=(0, 12))
+                def finish(choice=None):
+                    if event.is_set(): return
+                    result[0] = choice
+                    event.set()
+                    try: dlg.destroy()
+                    except tk.TclError: pass
+                for choice in choices:
+                    ModernButton(card, text=str(choice.get('label', 'Option')),
+                                 bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                                 command=lambda c=choice:finish(c)).pack(fill=tk.X, pady=3)
+                dlg.protocol('WM_DELETE_WINDOW', lambda:finish())
+                dlg.bind('<Escape>', lambda _e:finish())
+                dlg.lift()
+                dlg.focus_force()
+            except Exception:
+                event.set()
+                raise
+        self.root.after(0, show)
+        while not event.wait(0.05):
+            if not self.playing and not self.recording:
+                break
+        return result[0] if event.is_set() else None
+
     def prompt_user_input(self, prompt_text, default_val=""):
         import threading
         evt = threading.Event()
@@ -24464,8 +24801,9 @@ try {{
         def _show():
             dlg = tk.Toplevel(self.root)
             dlg.resizable(False, False)
-            if os.name != 'nt':
-                dlg.overrideredirect(True)
+            # This fixed-size popup uses Tk-managed dragging rather than
+            # Win32 non-client drag/resize hit testing.
+            dlg.overrideredirect(True)
             dlg.attributes('-topmost', True)
             dlg.configure(bg=BG_BORDER)
 
@@ -24508,9 +24846,10 @@ try {{
             # Center prompt window on the active monitor
             rx = mon_x + (mon_w - w) // 2
             ry = mon_y + (mon_h - h) // 2
-            dlg.geometry(f"{w}x{h}+{rx}+{ry}")
             if os.name == 'nt':
-                dlg._seq_native_chrome = install_sequent_chrome(dlg, resizable=False)
+                position_toplevel_on_screen(dlg, rx, ry, w, h)
+            else:
+                dlg.geometry(f"{w}x{h}+{rx}+{ry}")
 
             card = tk.Frame(dlg, bg=BG_PANEL)
             card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
@@ -24529,20 +24868,22 @@ try {{
             drag_data = {"x": 0, "y": 0, "win_x": 0, "win_y": 0}
 
             def _start_drag(e):
-                if os.name == 'nt' and getattr(dlg, '_seq_native_chrome', None):
-                    begin_native_window_motion(dlg, 2)
-                    return
                 drag_data["x"] = e.x_root
                 drag_data["y"] = e.y_root
                 drag_data["win_x"] = dlg.winfo_x()
                 drag_data["win_y"] = dlg.winfo_y()
 
             def _do_drag(e):
-                if os.name == 'nt' and getattr(dlg, '_seq_native_chrome', None):
-                    return
                 dx = e.x_root - drag_data["x"]
                 dy = e.y_root - drag_data["y"]
-                dlg.geometry(f"+{drag_data['win_x'] + dx}+{drag_data['win_y'] + dy}")
+                # Win32 absolute placement avoids Tk's negative-coordinate
+                # geometry syntax (which measures from the right/bottom edge).
+                nx = drag_data['win_x'] + dx
+                ny = drag_data['win_y'] + dy
+                if os.name == 'nt':
+                    position_toplevel_on_screen(dlg, nx, ny, w, h)
+                else:
+                    dlg.geometry(f"{w}x{h}+{max(0, nx)}+{max(0, ny)}")
 
             for widget in (head, drag_icon, lbl_title):
                 widget.bind("<Button-1>", _start_drag)
