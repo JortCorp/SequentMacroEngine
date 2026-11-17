@@ -9192,21 +9192,21 @@ class VSCodeQueueViewer(tk.Frame):
             self.close_sub_menu()
         self._cancel_queue_drag()
         if not self.interactive_enabled:
-            return
+            return "break"
         try:
             clicked_pos = self.code_text.index(f"@{event.x},{event.y}")
             line_num = int(clicked_pos.split(".")[0])
             act_idx = line_num - 2
             if not 0 <= act_idx < len(self.app.recorded_actions):
-                return
+                return "break"
             # A click still selects immediately; reorder is never implicit.
             self.app.set_active_action_index(act_idx)
             if self.app.recording or self.app.playing or self.app.chain_running:
-                return
+                return "break"
             # Ctrl must already be down on mouse press, and Shift+click still
             # performs its normal text/range selection behavior.
             if not (event.state & 0x0004) or (event.state & 0x0001):
-                return
+                return "break"
             self._dnd_start_idx = act_idx
             self._dnd_press_screen_xy = (event.x_root, event.y_root)
             self._dnd_action_identity = self.app.recorded_actions[act_idx]
@@ -9217,10 +9217,11 @@ class VSCodeQueueViewer(tk.Frame):
             return "break"
         except (tk.TclError, ValueError, IndexError):
             self._cancel_queue_drag()
+        return "break"
 
     def _on_dnd_motion(self, event):
         if not self._dnd_pressed:
-            return  # Ordinary mouse drags still select text; never reorder.
+            return "break"  # Queue rows are actions, not selectable text.
         start = self._dnd_start_idx
         if (not self.interactive_enabled or not (event.state & 0x0004) or
                 self.app.recording or self.app.playing or self.app.chain_running or
@@ -9279,10 +9280,8 @@ class VSCodeQueueViewer(tk.Frame):
             self.app.current_action_idx = shifted(self.app.current_action_idx)
             self.app._finish_queue_deletion(before, "Reordered Action")
             self.app.set_active_action_index(self.app.current_action_idx)
-        self._on_text_selection_changed()
         # Suppress Text's default mouse-up selection handling after Ctrl+drag.
-        if had_gesture:
-            return "break"
+        return "break"  # Prevent Tk Text from extending a selection on release.
 
     def _on_double_click(self, event):
         # A double-click is always edit, never the start of a long-press drag.
