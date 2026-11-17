@@ -10689,6 +10689,27 @@ class VSCodeQueueViewer(tk.Frame):
                                  activebackground=COLOR_ACCENT)
         mode_menu.pack(fill=tk.X, pady=(0, 10))
 
+        # Dynamic JSON-backed input mode (legacy text prompts remain unchanged).
+        input_mode = tk.StringVar(value=(curr_act or {}).get('input_mode', 'text'))
+        tk.Label(body, text='INPUT TYPE', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+        tk.OptionMenu(body, input_mode, 'text', 'json_dropdown').pack(fill=tk.X)
+        json_panel = tk.Frame(body, bg=BG_PANEL)
+        def json_field(label, key, default=''):
+            tk.Label(json_panel, text=label, bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w', pady=(5, 1))
+            e = tk.Entry(json_panel, bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY)
+            e.insert(0, (curr_act or {}).get(key, default))
+            e.pack(fill=tk.X, ipady=3)
+            return e
+        json_file_entry = json_field('JSON FILE PATH (supports ${variable})', 'json_file')
+        json_array_entry = json_field('ARRAY PATH (blank = root; e.g. data.items)', 'json_array_path')
+        json_label_entry = json_field('DISPLAY FIELD (blank = item itself)', 'json_label_field', 'label')
+        json_value_entry = json_field('VALUE FIELD (blank = item itself)', 'json_value_field', 'value')
+        def refresh_input_mode(*_):
+            if input_mode.get() == 'json_dropdown': json_panel.pack(fill=tk.X, pady=(4, 8))
+            else: json_panel.pack_forget()
+        input_mode.trace_add('write', refresh_input_mode)
+        refresh_input_mode()
+
         # Optional guard sits in its own packed container immediately below the operation.
         condition_enabled = tk.BooleanVar(value=bool(current.get('condition_enabled', False)) if current else False)
         condition_section = tk.Frame(body, bg=BG_PANEL)
@@ -11957,6 +11978,15 @@ class VSCodeQueueViewer(tk.Frame):
             p_text = prompt_entry.get().strip() or "Enter value:"
             v_name = var_entry.get().strip() or "user_data"
             d_val = def_entry.get()
+            mode = input_mode.get()
+            if mode == 'json_dropdown' and not json_file_entry.get().strip():
+                self.app.update_status('Select a JSON file for the dropdown', COLOR_DANGER)
+                return
+            source = {'input_mode': mode, 'json_file': json_file_entry.get().strip(),
+                      'json_array_path': json_array_entry.get().strip(),
+                      'json_label_field': json_label_entry.get().strip(),
+                      'json_value_field': json_value_entry.get().strip()}
+
             try:
                 guard = collect_input_conditions()
             except MacroExecutionError as exc:
@@ -11970,6 +12000,7 @@ class VSCodeQueueViewer(tk.Frame):
                     "var_name": v_name,
                     "var_scope": scope_var.get().lower(),
                     "default": d_val,
+                    **source,
                     **guard
                 }
                 self.app.display_actions_in_queue(self.app.recorded_actions)
@@ -11986,6 +12017,7 @@ class VSCodeQueueViewer(tk.Frame):
                     "var_name": v_name,
                     "var_scope": scope_var.get().lower(),
                     "default": d_val,
+                    **source,
                     **guard
                 })
                 self.app.display_actions_in_queue(self.app.recorded_actions)
@@ -20600,7 +20632,10 @@ class BuiltInMacroApp:
             prompt_txt = action.get("prompt", "Enter input:")
             default_val = action.get("default", "")
             var_name = action.get("var_name", "user_data")
-            entered_val = self.prompt_user_input(prompt_txt, default_val)
+            if action.get('input_mode') == 'json_dropdown':
+                entered_val = self.prompt_user_json_dropdown(action, prompt_txt)
+            else:
+                entered_val = self.prompt_user_input(prompt_txt, default_val)
             if entered_val is None:
                 # Cancellation is not an assignment, even when a default exists.
                 raise MacroCancelled('Request Input cancelled; variable was not changed')
@@ -24790,6 +24825,76 @@ try {{
         while not event.wait(0.05):
             if not self.playing and not self.recording:
                 break
+        return result[0] if event.is_set() else None
+
+    def prompt_user_json_dropdown(self, action, prompt_text):
+        """Read JSON at execution time and show label/value choices on Tk's UI thread."""
+        import threading
+        source = SequentDynamicEngine(self).interpolate(action.get('json_file', ''))
+        try:
+            with open(source, 'r', encoding='utf-8-sig') as handle:
+                document = json.load(handle)
+            def navigate(item, path):
+                for part in path.split('.') if path else ():
+                    if isinstance(item, dict): item = item[part]
+                    elif isinstance(item, list): item = item[int(part)]
+                    else: raise ValueError('Cannot navigate JSON path through a scalar')
+                return item
+            items = navigate(document, action.get('json_array_path', '').strip())
+            if isinstance(items, dict):
+                items = [{'key': k, 'value': v} for k, v in items.items()]
+            if not isinstance(items, list): raise ValueError('JSON dropdown source must be an array or object')
+            if not items: raise ValueError('JSON dropdown contains no options')
+            def field(item, name):
+                if not name: return item
+                return navigate(item, name)
+            options = []
+            for item in items:
+                label = field(item, action.get('json_label_field', '').strip()) if isinstance(item, (dict, list)) else item
+                value = field(item, action.get('json_value_field', '').strip()) if isinstance(item, (dict, list)) else item
+                if isinstance(value, (dict, list)): value = json.dumps(value, ensure_ascii=False)
+                options.append((str(label), str(value)))
+        except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+            raise MacroExecutionError(f'Request Input JSON dropdown: {exc}') from exc
+        event = threading.Event()
+        result = [None]
+        def show():
+            try:
+                dlg = tk.Toplevel(self.root)
+                dlg.title('INPUT REQUESTED')
+                dlg.configure(bg=BG_PANEL)
+                dlg.attributes('-topmost', True)
+                dlg.resizable(False, False)
+                dlg.geometry('420x180')
+                frame = tk.Frame(dlg, bg=BG_PANEL, padx=16, pady=14)
+                frame.pack(fill=tk.BOTH, expand=True)
+                tk.Label(frame, text=prompt_text, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                         wraplength=380, justify='left').pack(anchor='w', pady=(0, 12))
+                selected = tk.StringVar(value=options[0][0])
+                # Index-based selection retains distinct values even for duplicate labels.
+                labels = [f'{i + 1}. {label}' for i, (label, _) in enumerate(options)]
+                selected.set(labels[0])
+                menu = ttk.Combobox(frame, textvariable=selected, values=labels, state='readonly')
+                menu.pack(fill=tk.X, pady=(0, 12))
+                def finish(accepted=False):
+                    if not event.is_set():
+                        if accepted:
+                            idx = menu.current()
+                            if idx >= 0: result[0] = options[idx][1]
+                        event.set()
+                    dlg.destroy()
+                tk.Button(frame, text='Submit', command=lambda: finish(True)).pack(side=tk.RIGHT)
+                tk.Button(frame, text='Cancel', command=finish).pack(side=tk.RIGHT, padx=8)
+                dlg.protocol('WM_DELETE_WINDOW', finish)
+                dlg.bind('<Escape>', lambda e: finish())
+                dlg.bind('<Return>', lambda e: finish(True))
+                menu.focus_set()
+            except Exception:
+                event.set()
+                raise
+        self.root.after(0, show)
+        while not event.wait(0.05):
+            if not self.playing and not self.recording: break
         return result[0] if event.is_set() else None
 
     def prompt_user_input(self, prompt_text, default_val=""):
