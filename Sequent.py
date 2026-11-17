@@ -5028,14 +5028,16 @@ DYNAMIC_ACTION_SPECS = {
    ('title','Alert title (supports ${variables})','text','Sequent update'),
    ('message','Message (supports ${variables})','multiline','Macro finished.'),
    ('priority','Priority','choice','Normal',['Low','Normal','High']),
-   ('ntfy_server','ntfy HTTPS server','text','https://ntfy.sh'),
-   ('ntfy_topic','ntfy topic (subscribe on your phone)','text',''),
-   ('ntfy_token_env','Optional ntfy access-token ENV VARIABLE name','text',''),
+   # Place screenshot settings immediately below the alert message/priority.
+   # This avoids burying the scope control under the ntfy/Pushover credentials.
    ('attach_screenshot','Attach desktop screenshot to ntfy alert','bool',False),
-   ('screenshot_scope','Screenshot area','choice','All Monitors',['All Monitors','Monitor at Cursor']),
+   ('screenshot_scope','Screenshot scope','choice','All Monitors',['All Monitors','Monitor at Cursor']),
    ('screenshot_max_width','Max screenshot width (pixels, 800–7680)','int',3840),
    ('screenshot_cursor_marker','Mark cursor position on screenshot','bool',True),
    ('screenshot_cursor_coords','Include cursor coordinates in message','bool',True),
+   ('ntfy_server','ntfy HTTPS server','text','https://ntfy.sh'),
+   ('ntfy_topic','ntfy topic (subscribe on your phone)','text',''),
+   ('ntfy_token_env','Optional ntfy access-token ENV VARIABLE name','text',''),
    ('pushover_token_env','Pushover app-token ENV VARIABLE name','text','SEQUENT_PUSHOVER_TOKEN'),
    ('pushover_user_env','Pushover user-key ENV VARIABLE name','text','SEQUENT_PUSHOVER_USER')]),
  'Send Email':('notify_email',[
@@ -13026,8 +13028,39 @@ class VSCodeQueueViewer(tk.Frame):
                and 0 <= edit_idx < len(self.app.recorded_actions) else {})
         if old.get('type') != type_name: old = {}  # Clicking a recorded click opens conversion to UI Element.
         vars_ = {}
+        screenshot_scope_radios = []
 
         def entry_field(key, label, kind, default, options=None):
+            if type_name == 'notify_phone' and key == 'screenshot_scope':
+                # Use visible Windows-style radio choices instead of a dropdown
+                # hidden below several credential fields. Existing macro values
+                # remain unchanged: 'All Monitors' / 'Monitor at Cursor'.
+                tk.Label(body, text='SCREENSHOT CAPTURE AREA', font=('Segoe UI',8,'bold'),
+                         bg=BG_PANEL, fg=TEXT_MUTED, anchor='w').pack(fill=tk.X,pady=(9,3))
+                area = tk.Frame(body, bg=BG_INPUT, highlightthickness=1,
+                                highlightbackground=BG_BORDER, padx=10, pady=7)
+                area.pack(fill=tk.X, pady=(0,3))
+                selected = str(old.get(key, default))
+                if selected not in ('All Monitors', 'Monitor at Cursor'):
+                    selected = default
+                val = tk.StringVar(value=selected)
+                for option, caption in (
+                    ('All Monitors', 'All screens — capture the entire desktop'),
+                    ('Monitor at Cursor', 'Mouse screen — capture only the monitor containing the cursor'),
+                ):
+                    radio = tk.Radiobutton(area, text=caption, variable=val, value=option,
+                                           bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                           activebackground=BG_INPUT, activeforeground=TEXT_PRIMARY,
+                                           selectcolor=BG_INPUT, anchor='w', justify='left',
+                                           font=('Segoe UI',9), wraplength=405,
+                                           highlightthickness=0, bd=0, cursor='hand2')
+                    radio.pack(fill=tk.X, anchor='w', pady=3)
+                    screenshot_scope_radios.append(radio)
+                tk.Label(body, text='Sequent checks the mouse position when this action runs.',
+                         bg=BG_PANEL, fg=TEXT_MUTED, anchor='w',
+                         font=('Segoe UI',8)).pack(fill=tk.X, pady=(0,3))
+                vars_[key] = (kind,val)
+                return
             tk.Label(body, text=label, font=('Segoe UI',8,'bold'),
                      bg=BG_PANEL,fg=TEXT_MUTED,anchor='w').pack(fill=tk.X,pady=(7,2))
             if kind=='choice':
@@ -13176,7 +13209,7 @@ class VSCodeQueueViewer(tk.Frame):
                      bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',9),wraplength=450,
                      justify='left').pack(fill=tk.X,pady=(4,8))
         if type_name == 'notify_phone':
-            tk.Label(body, text='Optional ntfy screenshot: captures all monitors (or the monitor containing the mouse), marks the current cursor position, and uploads the image with the alert. WARNING: Anything visible on screen is transmitted to the configured ntfy server.',
+            tk.Label(body, text='Enable screenshot attachments for ntfy, then choose All screens or Mouse screen. The marker shows the cursor location at capture time. WARNING: Visible screen content is sent to the configured ntfy server.',
                      bg=BG_PANEL, fg=TEXT_MUTED, wraplength=460, justify='left',
                      font=('Segoe UI', 8)).pack(fill=tk.X, pady=(5, 5))
         if type_name in ('notify_phone', 'notify_email'):
@@ -13215,6 +13248,15 @@ class VSCodeQueueViewer(tk.Frame):
                      font=('Segoe UI',8)).pack(fill=tk.X,pady=4)
         for field in fields:
             entry_field(*field)
+        if type_name == 'notify_phone':
+            def update_scope_enabled(*_):
+                enabled = (vars_['attach_screenshot'][1].get() and
+                           vars_['provider'][1].get() == 'ntfy')
+                for radio in screenshot_scope_radios:
+                    radio.configure(state='normal' if enabled else 'disabled')
+            vars_['attach_screenshot'][1].trace_add('write', update_scope_enabled)
+            vars_['provider'][1].trace_add('write', update_scope_enabled)
+            update_scope_enabled()
         if type_name=='ui_element':
             ModernButton(body,text='Capture Selector from Recorded Click',
                          bg_color=COLOR_ACCENT,hover_color=COLOR_ACCENT_HOV,
