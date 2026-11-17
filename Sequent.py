@@ -25905,146 +25905,384 @@ try {{
             except (RuntimeError,tk.TclError):pass
 
     def open_remote_console(self):
-        if self._remote_console and self._remote_console.winfo_exists():
-            self._remote_console.lift()
-            return
-        win=tk.Toplevel(self.root)
-        self._remote_console=win
+        """Open a scrollable, keyboard-accessible remote settings console.
+
+        The connection/save controls live outside the scrollable body so a
+        smaller desktop or Windows display scaling cannot hide them.
+        """
+        previous = getattr(self, '_remote_console', None)
+        if previous is not None:
+            try:
+                if previous.winfo_exists():
+                    previous.lift()
+                    previous.focus_force()
+                    return
+            except tk.TclError:
+                pass
+
+        win = tk.Toplevel(self.root)
+        self._remote_console = win
         win.title('Sequent Remote • Command Center')
-        win.geometry('720x760')
-        win.minsize(600,650)
         win.configure(bg=BG_APP)
+        win.resizable(True, True)
+        win.minsize(555, 425)
+        # Fit even when Windows desktop scaling makes 760px too tall.
+        screen_h = max(480, int(win.winfo_screenheight()))
+        screen_w = max(580, int(win.winfo_screenwidth()))
+        win.geometry(f'{min(780, screen_w - 45)}x{min(750, screen_h - 95)}')
         win.transient(self.root)
-        canvas=tk.Canvas(win,bg=BG_APP,highlightthickness=0)
-        scrollbar=tk.Scrollbar(win,orient='vertical',command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side=tk.RIGHT,fill=tk.Y)
-        canvas.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
-        body=tk.Frame(canvas,bg=BG_APP,padx=20,pady=16)
-        embedded=canvas.create_window((0,0),window=body,anchor='nw')
-        body.bind('<Configure>',lambda event:canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>',lambda event:canvas.itemconfigure(embedded,width=event.width))
-        tk.Label(body,text='SEQUENT REMOTE',bg=BG_APP,fg=TEXT_PRIMARY,
-                 font=('Segoe UI',17,'bold')).pack(anchor='w')
-        tk.Label(body,text='Outbound-only phone controls • Ctrl+Shift+R',bg=BG_APP,
-                 fg=TEXT_MUTED,font=('Segoe UI',9)).pack(anchor='w',pady=(0,14))
-        cfg=self._remote_config
-        enabled=tk.BooleanVar(value=bool(cfg.get('enabled',False)))
-        allow_screens=tk.BooleanVar(value=bool(cfg.get('allow_screenshots',False)))
-        allow_launch=tk.BooleanVar(value=bool(cfg.get('allow_launch',False)))
-        errors=tk.BooleanVar(value=bool(cfg.get('auto_error_alert',False)))
-        error_shot=tk.BooleanVar(value=bool(cfg.get('error_screenshot',False)))
-        scope=tk.StringVar(value=cfg.get('screen_scope','Monitor at Cursor'))
-        def field(label,value):
-            tk.Label(body,text=label,bg=BG_APP,fg=TEXT_PRIMARY,font=('Segoe UI',9,'bold')).pack(anchor='w',pady=(8,3))
-            entry=tk.Entry(body,bg=BG_INPUT,fg=TEXT_PRIMARY,insertbackground=TEXT_PRIMARY,
-                           highlightthickness=1,highlightbackground=BG_BORDER,relief='flat',font=('Consolas',10))
-            entry.insert(0,str(value));entry.pack(fill=tk.X,ipady=6)
+
+        # Slim accent line and a fixed header. No custom Win32 dragging.
+        tk.Frame(win, bg=COLOR_ACCENT, height=3).pack(side=tk.TOP, fill=tk.X)
+        header = tk.Frame(win, bg=BG_HEADER, padx=22, pady=14)
+        header.pack(side=tk.TOP, fill=tk.X)
+        heading_row = tk.Frame(header, bg=BG_HEADER)
+        heading_row.pack(fill=tk.X)
+        tk.Label(heading_row, text='SEQUENT  /  REMOTE', bg=BG_HEADER,
+                 fg=TEXT_PRIMARY, font=('Segoe UI', 16, 'bold')).pack(side=tk.LEFT)
+        connection_badge = tk.Label(heading_row, text='  OFFLINE  ', bg=BG_BORDER,
+                                    fg=TEXT_PRIMARY, font=('Segoe UI', 9, 'bold'),
+                                    padx=10, pady=5)
+        connection_badge.pack(side=tk.RIGHT)
+        tk.Label(header, text='Phone controls and macro notifications  •  Ctrl+Shift+R',
+                 bg=BG_HEADER, fg=TEXT_MUTED, font=('Segoe UI', 9)).pack(anchor='w', pady=(5, 0))
+
+        cfg = self._remote_config
+        enabled = tk.BooleanVar(value=bool(cfg.get('enabled', False)))
+        allow_screens = tk.BooleanVar(value=bool(cfg.get('allow_screenshots', False)))
+        allow_launch = tk.BooleanVar(value=bool(cfg.get('allow_launch', False)))
+        errors = tk.BooleanVar(value=bool(cfg.get('auto_error_alert', False)))
+        error_shot = tk.BooleanVar(value=bool(cfg.get('error_screenshot', False)))
+        scope = tk.StringVar(value=cfg.get('screen_scope', 'Monitor at Cursor'))
+        feedback = tk.StringVar(value='Changes are not saved until you click Save & Connect.')
+
+        # Sticky footer: Save & Connect is always visible, including at 125%
+        # or 150% Windows scaling and on a short monitor.
+        footer = tk.Frame(win, bg=BG_HEADER)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Frame(footer, bg=BG_BORDER, height=1).pack(fill=tk.X)
+        footer_inner = tk.Frame(footer, bg=BG_HEADER, padx=20, pady=13)
+        footer_inner.pack(fill=tk.X)
+        footer_message = tk.Label(footer_inner, textvariable=feedback,
+                                  bg=BG_HEADER, fg=TEXT_MUTED,
+                                  font=('Segoe UI', 9), justify='left',
+                                  anchor='w', wraplength=340)
+        footer_message.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12))
+
+        scroll_host = tk.Frame(win, bg=BG_APP)
+        scroll_host.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        scrollbar = tk.Scrollbar(scroll_host, orient='vertical', width=15,
+                                 bd=0, relief='flat', troughcolor=BG_GUTTER,
+                                 bg=BG_BORDER, activebackground=COLOR_ACCENT,
+                                 highlightthickness=0)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas = tk.Canvas(scroll_host, bg=BG_APP, bd=0, highlightthickness=0,
+                           yscrollcommand=scrollbar.set, takefocus=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.configure(command=canvas.yview)
+        body = tk.Frame(canvas, bg=BG_APP, padx=19, pady=16)
+        embedded = canvas.create_window((0, 0), window=body, anchor='nw')
+
+        def update_scrollregion(event=None):
+            if canvas.winfo_exists():
+                canvas.configure(scrollregion=canvas.bbox('all'))
+
+        def resize_body(event):
+            canvas.itemconfigure(embedded, width=max(1, event.width))
+            update_scrollregion()
+
+        body.bind('<Configure>', update_scrollregion, add='+')
+        canvas.bind('<Configure>', resize_body, add='+')
+
+        def card(title, subtitle=''):
+            frame = tk.Frame(body, bg=BG_PANEL, highlightthickness=1,
+                             highlightbackground=BG_BORDER, bd=0)
+            frame.pack(fill=tk.X, pady=(0, 13))
+            inner = tk.Frame(frame, bg=BG_PANEL, padx=17, pady=15)
+            inner.pack(fill=tk.X)
+            tk.Label(inner, text=title, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                     font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+            if subtitle:
+                tk.Label(inner, text=subtitle, bg=BG_PANEL, fg=TEXT_MUTED,
+                         font=('Segoe UI', 9), anchor='w', justify='left',
+                         wraplength=600).pack(anchor='w', fill=tk.X, pady=(3, 10))
+            else:
+                tk.Frame(inner, bg=BG_PANEL, height=10).pack()
+            return inner
+
+        def field(parent, label, value, hint=None):
+            tk.Label(parent, text=label, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                     font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(7, 4))
+            border = tk.Frame(parent, bg=BG_BORDER, padx=1, pady=1)
+            border.pack(fill=tk.X)
+            entry = tk.Entry(border, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                             insertbackground=TEXT_PRIMARY, relief='flat', bd=0,
+                             font=('Segoe UI', 10), highlightthickness=0)
+            entry.pack(fill=tk.X, ipady=7, padx=10)
+            entry.insert(0, str(value))
+            entry.bind('<FocusIn>', lambda e: border.configure(bg=COLOR_ACCENT), add='+')
+            entry.bind('<FocusOut>', lambda e: border.configure(bg=BG_BORDER), add='+')
+            if hint:
+                tk.Label(parent, text=hint, bg=BG_PANEL, fg=TEXT_MUTED,
+                         font=('Segoe UI', 8), justify='left',
+                         wraplength=605).pack(anchor='w', pady=(4, 2))
             return entry
-        def toggle(label,variable):
-            tk.Checkbutton(body,text=label,variable=variable,anchor='w',bg=BG_APP,
-                           fg=TEXT_PRIMARY,selectcolor=BG_INPUT,activebackground=BG_APP,
-                           activeforeground=TEXT_PRIMARY,font=('Segoe UI',9)).pack(anchor='w',pady=(4,2))
-        toggle('Enable remote receiver (off by default)',enabled)
-        server=field('Approved ntfy server (HTTPS)',cfg.get('server','https://ntfy.sh'))
-        phone=field('Phone topic (subscribe to this in the ntfy app)',cfg.get('phone_topic',''))
-        token=field('Optional ntfy access-token environment variable name',cfg.get('token_env',''))
-        tk.Label(body,text='Remote command topic is randomly generated and separate from your phone topic.',
-                 bg=BG_APP,fg=TEXT_MUTED,font=('Segoe UI',8),wraplength=600,
-                 justify='left').pack(anchor='w',pady=(4,6))
-        toggle('Allow screenshot requests from phone',allow_screens)
-        toggle('Allow launch of specifically approved saved presets',allow_launch)
-        toggle('Automatically notify phone when a macro fails',errors)
-        toggle('Attach desktop screenshot to failure alerts',error_shot)
-        tk.Label(body,text='Screen used for remote screenshots',bg=BG_APP,fg=TEXT_PRIMARY,
-                 font=('Segoe UI',9,'bold')).pack(anchor='w',pady=(8,2))
-        ttk.Combobox(body,textvariable=scope,values=('Monitor at Cursor','All Monitors'),
-                     state='readonly').pack(anchor='w',fill=tk.X)
-        heartbeat=field('Heartbeat interval in minutes (0=off; minimum 5)',cfg.get('heartbeat_minutes',0))
-        tk.Label(body,text='APPROVED PRESETS (select multiple with Ctrl)',
-                 bg=BG_APP,fg=TEXT_PRIMARY,font=('Segoe UI',9,'bold')).pack(anchor='w',pady=(12,3))
-        presets=tk.Listbox(body,height=5,selectmode=tk.EXTENDED,bg=BG_INPUT,
-                           fg=TEXT_PRIMARY,selectbackground=COLOR_ACCENT,exportselection=False)
-        available=self.get_preset_names()
-        for i,name in enumerate(available):
-            presets.insert(tk.END,name)
-            if name in cfg.get('allowed_macros',[]):presets.selection_set(i)
-        presets.pack(fill=tk.X)
-        status=tk.Label(body,text='',bg=BG_APP,fg=TEXT_MUTED,font=('Segoe UI',9),wraplength=630)
-        status.pack(anchor='w',pady=(10,3))
+
+        def toggle(parent, label, variable):
+            line = tk.Frame(parent, bg=BG_PANEL)
+            line.pack(fill=tk.X, pady=(3, 4))
+            box = tk.Checkbutton(line, text=label, variable=variable, anchor='w',
+                                 bg=BG_PANEL, fg=TEXT_PRIMARY,
+                                 selectcolor=BG_INPUT, activebackground=BG_PANEL,
+                                 activeforeground=TEXT_PRIMARY,
+                                 highlightthickness=0, bd=0,
+                                 font=('Segoe UI', 9), cursor='hand2')
+            box.pack(anchor='w')
+            return box
+
+        connection = card('Connection', 'Configure the outbound-only ntfy connection used by remote actions.')
+        toggle(connection, 'Enable remote receiver', enabled)
+        server = field(connection, 'ntfy server (HTTPS)', cfg.get('server', 'https://ntfy.sh'))
+        phone = field(connection, 'Phone notification topic', cfg.get('phone_topic', ''),
+                      'Subscribe to this same topic in the ntfy app. Use a private, unpredictable topic.')
+        token = field(connection, 'Access token environment variable (optional)',
+                      cfg.get('token_env', ''),
+                      'Enter the environment variable name, not the token itself.')
+        tk.Label(connection, text='Command delivery uses a separate, generated topic.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w', pady=(9, 2))
+
+        permissions = card('Permissions', 'Allow only the remote operations you actually need.')
+        toggle(permissions, 'Allow screenshot requests from phone', allow_screens)
+        toggle(permissions, 'Allow launching approved presets', allow_launch)
+        toggle(permissions, 'Notify phone automatically when a macro fails', errors)
+        toggle(permissions, 'Attach a desktop screenshot to failure alerts', error_shot)
+        tk.Label(permissions, text='Remote screenshot source', bg=BG_PANEL,
+                 fg=TEXT_PRIMARY, font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(10, 5))
+        # Keep ttk styling local to this combobox, without changing Sequent's
+        # other Action Library dropdowns.
+        combo_style = ttk.Style(win)
+        try:
+            combo_style.configure('SequentRemote.TCombobox', padding=7,
+                                  fieldbackground=BG_INPUT, background=BG_INPUT,
+                                  foreground=TEXT_PRIMARY, bordercolor=BG_BORDER)
+            combo_style.map('SequentRemote.TCombobox',
+                            fieldbackground=[('readonly', BG_INPUT)],
+                            foreground=[('readonly', TEXT_PRIMARY)])
+        except tk.TclError:
+            pass
+        scope_select = ttk.Combobox(permissions, textvariable=scope,
+                                    values=('Monitor at Cursor', 'All Monitors'),
+                                    state='readonly', style='SequentRemote.TCombobox')
+        scope_select.pack(fill=tk.X, ipady=2)
+
+        automation = card('Scheduling & Heartbeat',
+                          'Optional periodic heartbeat and a strict allowlist for preset launches.')
+        heartbeat = field(automation, 'Heartbeat interval (minutes)',
+                          cfg.get('heartbeat_minutes', 0),
+                          '0 disables heartbeat notifications. Other values must be at least 5.')
+        tk.Label(automation, text='APPROVED PRESETS  •  Ctrl / Shift to select multiple',
+                 bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(13, 5))
+        preset_box = tk.Frame(automation, bg=BG_INPUT, highlightthickness=1,
+                              highlightbackground=BG_BORDER)
+        preset_box.pack(fill=tk.X)
+        preset_scroll = tk.Scrollbar(preset_box, orient=tk.VERTICAL, width=12,
+                                    troughcolor=BG_GUTTER, bg=BG_BORDER,
+                                    activebackground=COLOR_ACCENT)
+        preset_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        presets = tk.Listbox(preset_box, height=6, selectmode=tk.EXTENDED,
+                             bg=BG_INPUT, fg=TEXT_PRIMARY,
+                             selectforeground=TEXT_ON_ACCENT,
+                             selectbackground=COLOR_ACCENT, relief='flat', bd=0,
+                             highlightthickness=0, exportselection=False,
+                             font=('Segoe UI', 9), activestyle='none',
+                             yscrollcommand=preset_scroll.set)
+        presets.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=7, pady=5)
+        preset_scroll.configure(command=presets.yview)
+        available = list(self.get_preset_names())
+        for i, name in enumerate(available):
+            presets.insert(tk.END, name)
+            if name in cfg.get('allowed_macros', []):
+                presets.selection_set(i)
+        if not available:
+            tk.Label(automation, text='No saved presets found. You can enable this later.',
+                     bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8)).pack(anchor='w', pady=(7, 0))
+
         def save():
             try:
-                secs=int(heartbeat.get())
-                if secs not in (0,) and secs<5:raise ValueError('Heartbeat must be 0 or at least 5 minutes')
-                selected=[available[int(index)] for index in presets.curselection()]
-                new_cfg=dict(self._remote_config,enabled=enabled.get(),server=server.get().strip(),
-                             phone_topic=phone.get().strip(),token_env=token.get().strip(),
-                             allow_screenshots=allow_screens.get(),allow_launch=allow_launch.get(),
-                             auto_error_alert=errors.get(),error_screenshot=error_shot.get(),
-                             screen_scope=scope.get(),heartbeat_minutes=secs,allowed_macros=selected)
+                minutes = int(heartbeat.get().strip())
+                if minutes != 0 and minutes < 5:
+                    raise ValueError('Heartbeat must be 0 or at least 5 minutes')
+                selected = [available[int(index)] for index in presets.curselection()]
+                new_cfg = dict(self._remote_config,
+                               enabled=enabled.get(), server=server.get().strip(),
+                               phone_topic=phone.get().strip(), token_env=token.get().strip(),
+                               allow_screenshots=allow_screens.get(), allow_launch=allow_launch.get(),
+                               auto_error_alert=errors.get(), error_screenshot=error_shot.get(),
+                               screen_scope=scope.get(), heartbeat_minutes=minutes,
+                               allowed_macros=selected)
+                # Validate before changing the running connection; failed
+                # saves leave the previous configuration untouched.
                 sequent_remote_save_config(new_cfg)
-                self._remote_config=new_cfg
+                self._remote_config = new_cfg
                 self._remote_connect()
-                self._remote_last_heartbeat=time.monotonic()
-                status.configure(text='Settings saved. Remote will connect if enabled.',fg=COLOR_SUCCESS)
+                self._remote_last_heartbeat = time.monotonic()
+                feedback.set('Settings saved. ' + ('Connecting to ntfy…' if enabled.get()
+                                                    else 'Remote receiver disabled.'))
+                footer_message.configure(fg=COLOR_SUCCESS)
+                # Status refresh updates the connection badge independently.
             except Exception as exc:
-                messagebox.showerror('Sequent Remote',str(exc),parent=win)
+                feedback.set('Unable to save settings: ' + str(exc))
+                footer_message.configure(fg=COLOR_DANGER)
+                messagebox.showerror('Sequent Remote', str(exc), parent=win)
+
+        save_button = tk.Button(footer_inner, text='Save & Connect', command=save,
+                                bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT,
+                                activebackground=COLOR_ACCENT_HOV,
+                                activeforeground=TEXT_ON_ACCENT,
+                                font=('Segoe UI', 10, 'bold'),
+                                cursor='hand2', relief='flat', bd=0,
+                                padx=18, pady=10)
+        save_button.pack(side=tk.RIGHT)
+        win.bind('<Control-s>', lambda event: (save(), 'break')[1], add='+')
+        win.bind('<Control-S>', lambda event: (save(), 'break')[1], add='+')
+
         def panel():
             if not self._remote_ready():
-                status.configure(text='Remote is disabled or still connecting. Check status below.',fg=COLOR_DANGER)
+                feedback.set('Remote is offline. Save & Connect, then check the status above.')
+                footer_message.configure(fg=COLOR_DANGER)
                 return
-            relay=self.sequent_remote
-            selected=self.get_preset_names() if self._remote_config.get('allow_launch') else ()
-            self._remote_thread(lambda:relay.control_panels(selected),'Send phone controls')
+            relay = self.sequent_remote
+            selected = self.get_preset_names() if self._remote_config.get('allow_launch') else ()
+            self._remote_thread(lambda: relay.control_panels(selected), 'Send phone controls')
+
         def test():
             if not self._remote_ready():
-                status.configure(text='Enable and connect Remote first.',fg=COLOR_DANGER)
+                feedback.set('Remote is offline. Enable it and click Save & Connect first.')
+                footer_message.configure(fg=COLOR_DANGER)
                 return
-            self._remote_thread(lambda:self.sequent_remote.publish('Sequent Remote Test',
-                                  self._remote_status_text()),'Test phone alert')
+            self._remote_thread(lambda: self.sequent_remote.publish('Sequent Remote Test',
+                                self._remote_status_text()), 'Test phone alert')
+
         def schedule():
-            approved=self._remote_config.get('allowed_macros',[])
+            approved = self._remote_config.get('allowed_macros', [])
             if not self._remote_config.get('allow_launch') or not approved:
-                messagebox.showinfo('Schedule','Enable preset launches and select approved presets first.',parent=win)
+                messagebox.showinfo('Schedule', 'Enable preset launches and select approved presets first.',
+                                    parent=win)
                 return
-            name=simpledialog.askstring('Schedule preset','Preset name (approved: '+', '.join(approved)+')',parent=win)
-            if not name:return
+            name = simpledialog.askstring('Schedule preset',
+                     'Preset name (approved: ' + ', '.join(approved) + ')', parent=win)
+            if not name:
+                return
             if name not in approved:
-                messagebox.showerror('Schedule','That preset has not been approved.',parent=win);return
-            mins=simpledialog.askinteger('Schedule preset','Run after how many minutes? (1–1440)',
-                                          parent=win,minvalue=1,maxvalue=1440)
-            if mins is None:return
-            self._remote_schedule.append({'name':name,'at':time.time()+mins*60})
+                messagebox.showerror('Schedule', 'That preset has not been approved.', parent=win)
+                return
+            mins = simpledialog.askinteger('Schedule preset',
+                                           'Run after how many minutes? (1–1440)',
+                                           parent=win, minvalue=1, maxvalue=1440)
+            if mins is None:
+                return
+            self._remote_schedule.append({'name': name, 'at': time.time() + mins * 60})
             self._remote_save_jobs()
             self._remote_log_event(f'Scheduled {name} for +{mins} min')
-            status.configure(text=f'{name} scheduled in {mins} minutes (only while app is open).',fg=COLOR_SUCCESS)
-        controls=tk.Frame(body,bg=BG_APP)
-        controls.pack(anchor='w',fill=tk.X,pady=(12,5))
-        for label,fn in (('Save & Connect',save),('Send Phone Controls',panel),
-                          ('Test Notification',test),('Schedule Preset',schedule)):
-            tk.Button(controls,text=label,command=fn,bg=BG_PANEL,fg=TEXT_PRIMARY,
-                      activebackground=BG_HOVER,activeforeground=TEXT_PRIMARY,
-                      relief='flat',padx=9,pady=7).pack(side=tk.LEFT,padx=(0,5))
-        tk.Label(body,text='REMOTE ACTIVITY (no secret or macro data stored)',
-                 bg=BG_APP,fg=TEXT_PRIMARY,font=('Segoe UI',9,'bold')).pack(anchor='w',pady=(12,4))
-        log=tk.Text(body,height=8,bg=BG_INPUT,fg=TEXT_MUTED,font=('Consolas',9),state='disabled')
-        log.pack(fill=tk.X)
-        info=tk.Label(body,text='',bg=BG_APP,fg=TEXT_MUTED,font=('Segoe UI',8),
-                      wraplength=640,justify=tk.LEFT)
-        info.pack(anchor='w',pady=(10,7))
+            feedback.set(f'{name} scheduled in {mins} minutes (only while app is open).')
+            footer_message.configure(fg=COLOR_SUCCESS)
+
+        quick = card('Quick Actions', 'Available after saving and connecting Remote.')
+        quick_row = tk.Frame(quick, bg=BG_PANEL)
+        quick_row.pack(fill=tk.X, pady=(2, 0))
+        for column, (label, command) in enumerate((('Send Phone Controls', panel),
+                                                    ('Test Notification', test),
+                                                    ('Schedule Preset', schedule))):
+            button = tk.Button(quick_row, text=label, command=command,
+                               bg=BG_HOVER, fg=TEXT_PRIMARY,
+                               activebackground=BG_BORDER,
+                               activeforeground=TEXT_PRIMARY,
+                               font=('Segoe UI', 9), bd=0, relief='flat',
+                               cursor='hand2', padx=8, pady=9)
+            button.grid(row=0, column=column, sticky='ew', padx=(0, 7) if column < 2 else 0)
+            quick_row.columnconfigure(column, weight=1)
+
+        activity = card('Remote Activity', 'Recent local events. No credentials are stored in the activity log.')
+        log_frame = tk.Frame(activity, bg=BG_INPUT, highlightthickness=1,
+                             highlightbackground=BG_BORDER)
+        log_frame.pack(fill=tk.X)
+        log_scroll = tk.Scrollbar(log_frame, orient=tk.VERTICAL, width=12)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        log = tk.Text(log_frame, height=6, bg=BG_INPUT, fg=TEXT_MUTED,
+                      font=('Consolas', 9), state='disabled', relief='flat',
+                      highlightthickness=0, wrap='word', yscrollcommand=log_scroll.set)
+        log.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=9, pady=8)
+        log_scroll.configure(command=log.yview)
+
+        tk.Label(body,
+                 text='Remote requests are signed and time-limited. Only enable this feature for '
+                      'approved workflows; public ntfy servers are not suitable for confidential data.',
+                 bg=BG_APP, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 justify='left', wraplength=610).pack(anchor='w', fill=tk.X, pady=(2, 15))
+
+        # Local widget bindings (not bind_all): scrolling this dialog must not
+        # hijack the main Action Queue or inputs in other Sequent windows.
+        def wheel(event):
+            if not canvas.winfo_exists():
+                return None
+            first, last = canvas.yview()
+            if first <= 0.00001 and last >= 0.99999:
+                return None
+            if getattr(event, 'num', None) == 4:
+                steps = -3
+            elif getattr(event, 'num', None) == 5:
+                steps = 3
+            else:
+                delta = getattr(event, 'delta', 0)
+                if not delta:
+                    return None
+                steps = -max(1, abs(delta)//120) if delta > 0 else max(1, abs(delta)//120)
+            canvas.yview_scroll(steps, 'units')
+            return 'break'
+
+        def bind_wheel_tree(widget):
+            if isinstance(widget, (tk.Listbox, tk.Text, tk.Scrollbar, ttk.Combobox)):
+                return
+            widget.bind('<MouseWheel>', wheel, add='+')
+            widget.bind('<Button-4>', wheel, add='+')
+            widget.bind('<Button-5>', wheel, add='+')
+            for child in widget.winfo_children():
+                bind_wheel_tree(child)
+
+        bind_wheel_tree(canvas)
+        update_scrollregion()
+
         def refresh():
-            if not win.winfo_exists():return
-            relay=self.sequent_remote
-            connected=self._remote_ready()
-            message=('Connected • polling commands' if connected else
-                     'Disabled' if not self._remote_config.get('enabled') else 'Connecting / offline')
-            if relay and relay.last_error:message += ' • '+relay.last_error[:110]
-            status.configure(text=message)
-            rows='\n'.join(self._remote_log[-30:])
-            log.config(state='normal');log.delete('1.0','end');log.insert('end',rows);log.config(state='disabled')
-            info.configure(text='Remote controls expire after 30 minutes and require a signed one-use command. '
-                           'Do not use ntfy.sh for confidential work data. Locking Windows may prevent mouse and screenshot actions.')
-            win.after(1900,refresh)
+            try:
+                if not win.winfo_exists():
+                    return
+                relay = self.sequent_remote
+                connected = self._remote_ready()
+                if connected:
+                    state, ink, caption = 'CONNECTED', COLOR_SUCCESS, 'Connected • polling commands'
+                elif self._remote_config.get('enabled'):
+                    state, ink, caption = 'CONNECTING', SYNTAX_ORANGE, 'Connecting / offline'
+                else:
+                    state, ink, caption = 'DISABLED', BG_BORDER, 'Remote receiver disabled'
+                connection_badge.configure(text='  ' + state + '  ', bg=ink,
+                                            fg=TEXT_ON_ACCENT if connected else TEXT_PRIMARY)
+                # Preserve a fresh save/error message; status is already visible
+                # in the fixed header and never overwrites the footer feedback.
+                if relay and relay.last_error:
+                    connection_badge.configure(text='  OFFLINE  ', bg=COLOR_DANGER,
+                                                fg=TEXT_ON_ACCENT)
+                rows = '\n'.join(self._remote_log[-30:])
+                if log.get('1.0', 'end-1c') != rows:
+                    log.configure(state='normal')
+                    log.delete('1.0', 'end')
+                    log.insert('end', rows)
+                    log.configure(state='disabled')
+                win.after(2000, refresh)
+            except tk.TclError:
+                return
+
         refresh()
 
     def start_macro(self):
