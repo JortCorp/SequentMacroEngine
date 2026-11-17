@@ -28,6 +28,7 @@ from email.message import EmailMessage
 from urllib import request as urlrequest
 from urllib import parse as urlparse
 from urllib import error as urlerror
+from sequent_remote import RemoteRelay, load_config as sequent_remote_load_config, save_config as sequent_remote_save_config, config_default as sequent_remote_default_config, TOPIC_RE as SEQUENT_REMOTE_TOPIC_RE
 
 ACTIVE_SOUND_THEME = "Classic"
 CUSTOM_SOUND_PATHS = {
@@ -5044,6 +5045,28 @@ DYNAMIC_ACTION_SPECS = {
    ('ntfy_token_env','Optional ntfy access-token ENV VARIABLE name','text',''),
    ('pushover_token_env','Pushover app-token ENV VARIABLE name','text','SEQUENT_PUSHOVER_TOKEN'),
    ('pushover_user_env','Pushover user-key ENV VARIABLE name','text','SEQUENT_PUSHOVER_USER')]),
+ 'Remote Decision':('remote_decision',[
+   ('title','Phone approval title (supports ${variables})','text','Sequent needs a decision'),
+   ('message','Details (supports ${variables})','multiline','Choose how to continue.'),
+   ('button_1','Button 1 label','text','Retry'),
+   ('value_1','Button 1 saved value','text','retry'),
+   ('button_2','Button 2 label','text','Skip'),
+   ('value_2','Button 2 saved value','text','skip'),
+   ('button_3','Button 3 label (blank = omitted)','text','Stop'),
+   ('value_3','Button 3 saved value','text','stop'),
+   ('var_name','Save response to variable','text','remote_choice'),
+   ('var_scope','Variable scope','choice','Local',['Local','Global']),
+   ('timeout','Timeout in seconds (5 to 3600)','int',600),
+   ('on_timeout','On timeout','choice','Stop Macro',['Stop Macro','Continue with Default']),
+   ('default','Default value if timed out','text','skip')]),
+ 'Remote Progress':('remote_progress',[
+   ('title','Progress alert title (supports ${variables})','text','Sequent progress'),
+   ('message','Report details (supports ${variables})','multiline','Processing ${NC_Global}'),
+   ('priority','Priority','choice','Normal',['Low','Normal','High'])]),
+ 'Remote File Report':('remote_report',[
+   ('path','Text/CSV/JSON report file (supports ${variables})','path','reports/results.json'),
+   ('title','Notification title','text','Sequent report ready'),
+   ('message','Notification details (supports ${variables})','multiline','Attached macro results.')]),
  'Send Email':('notify_email',[
    ('email_to','Recipient email address (supports ${variables})','text',''),
    ('email_from','Sender email address','text',''),
@@ -5975,7 +5998,7 @@ DYNAMIC_ACTION_TYPES = frozenset({
     'end_if', 'loop_start', 'loop_end', 'loop_break', 'find_image', 'recovery',
     'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action', 'set_variable',
     'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro', 'text_process', 'macro_return',
-    'load_text_variable', 'file_read', 'file_write', 'json_read', 'json_write', 'notify_phone', 'notify_email', 'prompt_json_form', 'compare_text', 'compare_variables', 'placement_guide'
+    'load_text_variable', 'file_read', 'file_write', 'json_read', 'json_write', 'notify_phone', 'notify_email', 'remote_decision', 'remote_progress', 'remote_report', 'prompt_json_form', 'compare_text', 'compare_variables', 'placement_guide'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end','loop_break'})
 
@@ -8165,6 +8188,47 @@ class SequentDynamicEngine:
             result = sequent_file_action(self, action)
         elif typ in ('notify_phone', 'notify_email'):
             result = sequent_send_notification(self, action)
+        elif typ == 'remote_decision':
+            manager = getattr(self.app, 'sequent_remote', None)
+            if not manager or not manager.ready:
+                raise MacroExecutionError('Remote Decision requires enabled, connected Sequent Remote')
+            options = [(str(action.get('button_'+str(i),'')).strip(),
+                        str(action.get('value_'+str(i),'')).strip())
+                       for i in (1,2,3) if str(action.get('button_'+str(i),'')).strip()]
+            if not all(label and value for label,value in options):
+                raise MacroExecutionError('Each Remote Decision button needs a saved value')
+            timeout = max(5, min(3600, int(action.get('timeout',600))))
+            try:
+                selected = manager.ask(self.interpolate(action.get('title','Sequent decision')),
+                    self.interpolate(action.get('message','Please choose.')), options,
+                    timeout=timeout,
+                    should_cancel=lambda: not self.app.playing and not idle)
+            except Exception as exc:
+                raise MacroExecutionError(f'Remote Decision failed: {exc}') from exc
+            if selected is None:
+                if not self.app.playing and not idle:
+                    raise MacroCancelled('Remote Decision cancelled by Stop')
+                if action.get('on_timeout','Stop Macro') == 'Continue with Default':
+                    selected = str(self.interpolate(action.get('default','')))
+                else:
+                    raise MacroExecutionError('Remote Decision timed out without a response')
+            name = action.get('var_name','remote_choice')
+            self._assign_variable(name,selected,action.get('var_scope','Local'))
+            result = {'value':selected,'variable':name}
+        elif typ == 'remote_progress':
+            manager = getattr(self.app, 'sequent_remote', None)
+            if not manager or not manager.ready:
+                raise MacroExecutionError('Enable Sequent Remote before sending progress')
+            manager.publish(str(self.interpolate(action.get('title','Sequent progress'))),
+                str(self.interpolate(action.get('message','Progress update'))),
+                priority={'Low':2,'Normal':3,'High':4}.get(action.get('priority','Normal'),3))
+            result = {'sent':True}
+        elif typ == 'remote_report':
+            manager = getattr(self.app, 'sequent_remote', None)
+            if not manager or not manager.ready:
+                raise MacroExecutionError('Enable Sequent Remote before sending reports')
+            result = self.app._remote_send_report(action)
+
         elif typ == 'load_text_variable':
             result = sequent_text_file_to_variable(self.app, action)
         elif typ == 'placement_guide':
@@ -8802,6 +8866,9 @@ class VSCodeQueueViewer(tk.Frame):
             ("Write JSON", "Set/delete JSON keys, append arrays, or replace a document.", "WJ"),
             ("Send Phone Alert", "Send a push alert, optionally with an annotated desktop screenshot through ntfy.", "PN"),
             ("Send Email", "Send a variable-filled email through SMTP.", "EM"),
+            ("Remote Decision", "Pause for a decision on your phone; save the selected option.", "RD"),
+            ("Remote Progress", "Push a live progress message to your phone.", "RP"),
+            ("Remote File Report", "Send an explicitly selected text/CSV/JSON report as an attachment.", "RR"),
 
             ("Clipboard Branch / Fallback", "On a keyword miss, set a Local/Global variable and/or run a macro.", "CB"),
             ("Request Input", "Ask the user for a value at runtime.", "IN"),
@@ -18812,6 +18879,17 @@ class BuiltInMacroApp:
         self._trace_lock = RLock()
         self._trace_rows = deque(maxlen=1500)
         self.dynamic_engine = SequentDynamicEngine(self)
+        self.sequent_remote = None
+        try:
+            self._remote_config = sequent_remote_load_config()
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            print(f"[Sequent Remote] Configuration unavailable; remote disabled: {exc}")
+            self._remote_config = sequent_remote_default_config()
+        self._remote_log = []
+        self._remote_progress = {'current':0,'total':0,'action':'Idle'}
+        self._remote_schedule = list(self._remote_config.get('schedule', []))
+        self._remote_last_heartbeat = time.monotonic()
+        self._remote_console = None
         self._auto_trigger_key = None
         self._auto_trigger_state = None
         self._webhook_server = None
@@ -18828,6 +18906,8 @@ class BuiltInMacroApp:
         self._workflow_window = None
         self.root.bind("<Control-Shift-w>", self.open_visual_workflow, add="+")
         self.root.bind("<Control-Shift-W>", self.open_visual_workflow, add="+")
+        self.root.bind('<Control-Shift-r>', lambda event:self.open_remote_console(), add='+')
+        self.root.bind('<Control-Shift-R>', lambda event:self.open_remote_console(), add='+')
         self.ghost_reticle = GhostReticle(self.root)
         self._reticle_edit_index = None
         self.refresh_preset_menu()
@@ -18837,6 +18917,9 @@ class BuiltInMacroApp:
         self.root.after(1200, self._watch_dynamic_trigger)
         self.root.protocol("WM_DELETE_WINDOW", self.request_close)
         self._autosave_job = self.root.after(600, self._autosave_tick)
+        if self._remote_config.get('enabled'):
+            self._remote_connect()
+        self._remote_tick_job = self.root.after(12000, self._remote_tick)
 
     
     def open_visual_workflow(self, event=None):
@@ -22953,6 +23036,21 @@ try {{
                  anchor="w").pack(fill=tk.X, pady=(3, 8))
         sequent_toolbar_button(tour_row, "Start Guided Walkthrough", self.start_walkthrough).pack(anchor="w")
 
+        # --- REMOTE CONTROL (opt-in; no inbound ports) ---
+        tk.Label(scroll_container, text='SEQUENT REMOTE', font=('Segoe UI',8,'bold'),
+                 bg=BG_APP, fg=TEXT_MUTED).pack(anchor='w',padx=22,pady=(0,4))
+        remote_card = ModernCard(scroll_container,bg_card=BG_PANEL)
+        remote_card.pack(fill=tk.X,padx=20,pady=(0,16))
+        remote_row = tk.Frame(remote_card,bg=BG_PANEL,padx=16,pady=14)
+        remote_row.pack(fill=tk.X)
+        tk.Label(remote_row,text='Remote approvals, phone controls, status and screenshots',
+                 font=('Segoe UI',9,'bold'),bg=BG_PANEL,fg=TEXT_PRIMARY).pack(anchor='w')
+        tk.Label(remote_row,text='Disabled by default. Uses an outbound-only HTTPS ntfy relay; no open PC ports.',
+                 font=('Segoe UI',8),bg=BG_PANEL,fg=TEXT_MUTED,wraplength=520,
+                 justify=tk.LEFT).pack(anchor='w',pady=(3,8))
+        sequent_toolbar_button(remote_row,'Open Sequent Remote Console',self.open_remote_console,
+                               icon='settings').pack(anchor='w')
+
         # --- SECTION 2: PLAYBACK & TIMING ---
         tk.Label(scroll_container, text="PLAYBACK & TIMING", font=("Segoe UI", 8, "bold"), bg=BG_APP, fg=TEXT_MUTED).pack(anchor="w", padx=22, pady=(0, 4))
         card_timing = ModernCard(scroll_container, bg_card=BG_PANEL)
@@ -24189,6 +24287,11 @@ try {{
                 self.root.after_cancel(self._autosave_job)
             except tk.TclError:
                 pass
+        if getattr(self, 'sequent_remote', None):
+            self.sequent_remote.stop()
+        if getattr(self, '_remote_tick_job', None):
+            try:self.root.after_cancel(self._remote_tick_job)
+            except tk.TclError:pass
         self.root.destroy()
         return True
 
@@ -25603,6 +25706,347 @@ try {{
             self.root.after(0, self.queue_viewer.append_line, f"keyboard.type('{char}')", SYNTAX_ORANGE)
             self.root.after(0, self.update_action_count_badge)
     
+    # --- Sequent Remote: all desktop UI mutations occur on the Tk thread. ---
+    def _remote_ready(self):
+        return bool(self.sequent_remote and self.sequent_remote.ready.is_set()
+                    and not self.sequent_remote.stop_event.is_set())
+
+    def _remote_connect(self):
+        if self.sequent_remote:
+            self.sequent_remote.stop()
+        self.sequent_remote = None
+        if not self._remote_config.get('enabled'):
+            return
+        try:
+            relay = RemoteRelay(self._remote_config, self._remote_command_async)
+            relay.start()
+            self.sequent_remote = relay
+        except Exception as exc:
+            self._remote_log_event('Connection error: '+str(exc))
+
+    def _remote_log_event(self, message):
+        self._remote_log.append(time.strftime('%H:%M:%S')+'  '+str(message)[:240])
+        if len(self._remote_log)>80:
+            del self._remote_log[:-80]
+        # Do not store macro data or credentials to disk.
+
+    def _remote_thread(self, operation, label):
+        def run():
+            try:
+                operation()
+                self._remote_log_event(label+' succeeded')
+            except Exception as exc:
+                self._remote_log_event(label+' failed: '+str(exc)[:150])
+        Thread(target=run,daemon=True,name='SequentRemote-'+label.replace(' ','')).start()
+
+    def _remote_command_async(self, operation, value):
+        try:
+            self.root.after(0,lambda:self._remote_command(operation,value))
+        except (RuntimeError,tk.TclError):
+            pass
+
+    def _remote_status_text(self):
+        progress = dict(getattr(self,'_remote_progress',{}))
+        state = ('Recording' if self.recording else 'Paused' if self.is_paused else
+                 'Running' if self.playing else 'Chain running' if self.chain_running else 'Idle')
+        return ('Sequent: '+state+'\n'
+                'Step: '+str(progress.get('current',0))+'/'+str(progress.get('total',0))+'\n'
+                'Action: '+str(progress.get('action','Idle'))+'\n'
+                'Updated: '+time.strftime('%Y-%m-%d %H:%M:%S'))
+
+    def _remote_command(self, operation, value):
+        self._remote_log_event('Received '+operation)
+        if operation == 'pause':
+            if (self.playing or self.chain_running) and not self.is_paused:
+                self.toggle_pause()
+        elif operation == 'resume':
+            if (self.playing or self.chain_running) and self.is_paused:
+                self.toggle_pause()
+        elif operation == 'stop':
+            if self.chain_running:
+                self.stop_chain()
+            elif self.playing:
+                self.stop_macro()
+        elif operation == 'status':
+            snapshot = self._remote_status_text()
+            self._remote_thread(lambda:self.sequent_remote.publish('Sequent Status',snapshot),'Status reply')
+        elif operation == 'screenshot':
+            if not self._remote_config.get('allow_screenshots',False):
+                self._remote_log_event('Screenshot rejected: disabled in Remote Console')
+                return
+            if self._remote_ready():
+                settings = dict(self._remote_config)
+                self._remote_thread(lambda:self._remote_send_screenshot(settings), 'Screenshot reply')
+        elif operation == 'launch':
+            if (not self._remote_config.get('allow_launch',False) or
+                    value not in self._remote_config.get('allowed_macros',[]) or
+                    self.playing or self.recording or self.chain_running):
+                self._remote_log_event('Remote launch rejected (busy or not approved)')
+                return
+            if self._active_preset_path:
+                clean = self._queue_content_snapshot() == self._active_saved_snapshot
+            else:
+                clean = self._queue_content_snapshot() == self._unbound_saved_snapshot
+            if not clean:
+                self._remote_log_event('Remote launch rejected: unsaved queue changes')
+                return
+            target = os.path.join(self.presets_dir,value+'.json')
+            if os.path.isfile(target):
+                self.switch_to_preset_and_start(value)
+        elif operation == 'schedule':
+            if not self._remote_config.get('allow_launch',False):
+                return
+            try:
+                preset, minutes = value.rsplit('@',1)
+                minutes=int(minutes)
+            except (ValueError,TypeError):
+                return
+            if preset not in self._remote_config.get('allowed_macros',[]) or minutes not in (5,15,30):
+                return
+            self._remote_schedule.append({'name':preset,'at':time.time()+60*minutes})
+            self._remote_save_jobs()
+            self._remote_log_event(f'Scheduled remotely: {preset} in {minutes} minutes')
+
+    def _remote_send_screenshot(self, settings):
+        engine = self.dynamic_engine
+        sequent_send_notification(engine,{
+            'type':'notify_phone','provider':'ntfy',
+            'ntfy_server':settings['server'],'ntfy_topic':settings['phone_topic'],
+            'ntfy_token_env':settings.get('token_env',''),
+            'title':'Sequent Remote Screenshot','message':'Screenshot requested from phone.',
+            'attach_screenshot':True,
+            'screenshot_scope':settings.get('screen_scope','Monitor at Cursor'),
+            'screenshot_resolution':'Native (100%)',
+            'screenshot_image_format':'Auto (Recommended)',
+            'screenshot_cursor_marker':True,'screenshot_cursor_coords':True})
+
+    def _remote_error_notice(self, reason):
+        cfg = dict(self._remote_config)
+        try:
+            if cfg.get('error_screenshot') and cfg.get('allow_screenshots'):
+                sequent_send_notification(self.dynamic_engine,{
+                    'type':'notify_phone','provider':'ntfy','ntfy_server':cfg['server'],
+                    'ntfy_topic':cfg['phone_topic'],'ntfy_token_env':cfg.get('token_env',''),
+                    'title':'Sequent Macro Failed', 'message':'Execution stopped: '+str(reason)[:1000],
+                    'attach_screenshot':True,
+                    'screenshot_scope':cfg.get('screen_scope','Monitor at Cursor'),
+                    'screenshot_resolution':'Native (100%)',
+                    'screenshot_image_format':'Auto (Recommended)'})
+            else:
+                self.sequent_remote.publish('Sequent Macro Failed',
+                    'Execution stopped: '+str(reason)[:1000], priority=4)
+        except Exception as exc:
+            self._remote_log_event('Error alert failed: '+str(exc))
+
+    def _remote_send_report(self, action):
+        # The selected path is part of a saved macro, never from phone input.
+        raw_path = self.dynamic_engine.interpolate(action.get('path',''))
+        path = os.path.abspath(os.path.expanduser(os.path.expandvars(raw_path)))
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix not in ('.txt','.csv','.json','.log'):
+            raise MacroExecutionError('Remote report: choose a .txt, .csv, .json or .log file')
+        stat = os.stat(path)
+        if stat.st_size > 1_500_000:
+            raise MacroExecutionError('Remote report: file exceeds 1.5 MB')
+        with open(path,'rb') as file:
+            body = file.read(1_500_001)
+        if len(body)>1_500_000:
+            raise MacroExecutionError('Remote report: file exceeds 1.5 MB')
+        relay = self.sequent_remote
+        headers = relay._headers()
+        headers.update({'Filename':os.path.basename(path),
+                        'Content-Type': {'.json':'application/json','.csv':'text/csv',
+                                        '.log':'text/plain','.txt':'text/plain'}[suffix],
+                        'Title':_sequent_ntfy_header(self.dynamic_engine.interpolate(action.get('title','Sequent Report'))),
+                        'Message':_sequent_ntfy_header(self.dynamic_engine.interpolate(action.get('message','File attached.')))})
+        result = json.loads(_sequent_notification_https(
+            relay.server+'/'+relay.cfg['phone_topic'],body,headers,method='PUT'))
+        if result.get('event')!='message':
+            raise MacroExecutionError('Remote report was not accepted by ntfy')
+        return {'file':os.path.basename(path),'sent':True}
+
+    def _remote_save_jobs(self):
+        self._remote_config['schedule'] = list(self._remote_schedule)
+        try:
+            sequent_remote_save_config(self._remote_config)
+        except (OSError, ValueError) as exc:
+            self._remote_log_event('Could not save scheduled jobs: '+str(exc))
+
+    def _remote_tick(self):
+        try:
+            relay = self.sequent_remote
+            cfg = self._remote_config
+            if self._remote_ready():
+                minutes = int(cfg.get('heartbeat_minutes',0) or 0)
+                if minutes>=5 and time.monotonic()-self._remote_last_heartbeat >= minutes*60:
+                    self._remote_last_heartbeat = time.monotonic()
+                    state=self._remote_status_text()
+                    self._remote_thread(lambda:relay.publish('Sequent Heartbeat',state),'Heartbeat')
+            # One-time scheduled macros run only while Sequent is open and idle.
+            due=[]
+            now=time.time()
+            for job in list(self._remote_schedule):
+                if now>=float(job.get('at',0)):
+                    self._remote_schedule.remove(job)
+                    due.append(job)
+            if due:
+                self._remote_save_jobs()
+            for job in due:
+                self._remote_log_event('Scheduled macro due: '+job.get('name',''))
+                # A powered-off PC must not execute a stale job hours later.
+                if now-float(job.get('at',0)) > 120:
+                    self._remote_log_event('Scheduled macro skipped: more than 2 minutes overdue')
+                elif not (self.playing or self.recording or self.chain_running):
+                    self._remote_command('launch',job.get('name',''))
+                else:
+                    self._remote_log_event('Scheduled macro skipped; Sequent was busy')
+        finally:
+            try:self._remote_tick_job=self.root.after(12000,self._remote_tick)
+            except (RuntimeError,tk.TclError):pass
+
+    def open_remote_console(self):
+        if self._remote_console and self._remote_console.winfo_exists():
+            self._remote_console.lift()
+            return
+        win=tk.Toplevel(self.root)
+        self._remote_console=win
+        win.title('Sequent Remote • Command Center')
+        win.geometry('720x760')
+        win.minsize(600,650)
+        win.configure(bg=BG_APP)
+        win.transient(self.root)
+        canvas=tk.Canvas(win,bg=BG_APP,highlightthickness=0)
+        scrollbar=tk.Scrollbar(win,orient='vertical',command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT,fill=tk.Y)
+        canvas.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
+        body=tk.Frame(canvas,bg=BG_APP,padx=20,pady=16)
+        embedded=canvas.create_window((0,0),window=body,anchor='nw')
+        body.bind('<Configure>',lambda event:canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>',lambda event:canvas.itemconfigure(embedded,width=event.width))
+        tk.Label(body,text='SEQUENT REMOTE',bg=BG_APP,fg=TEXT_PRIMARY,
+                 font=('Segoe UI',17,'bold')).pack(anchor='w')
+        tk.Label(body,text='Outbound-only phone controls • Ctrl+Shift+R',bg=BG_APP,
+                 fg=TEXT_MUTED,font=('Segoe UI',9)).pack(anchor='w',pady=(0,14))
+        cfg=self._remote_config
+        enabled=tk.BooleanVar(value=bool(cfg.get('enabled',False)))
+        allow_screens=tk.BooleanVar(value=bool(cfg.get('allow_screenshots',False)))
+        allow_launch=tk.BooleanVar(value=bool(cfg.get('allow_launch',False)))
+        errors=tk.BooleanVar(value=bool(cfg.get('auto_error_alert',False)))
+        error_shot=tk.BooleanVar(value=bool(cfg.get('error_screenshot',False)))
+        scope=tk.StringVar(value=cfg.get('screen_scope','Monitor at Cursor'))
+        def field(label,value):
+            tk.Label(body,text=label,bg=BG_APP,fg=TEXT_PRIMARY,font=('Segoe UI',9,'bold')).pack(anchor='w',pady=(8,3))
+            entry=tk.Entry(body,bg=BG_INPUT,fg=TEXT_PRIMARY,insertbackground=TEXT_PRIMARY,
+                           highlightthickness=1,highlightbackground=BG_BORDER,relief='flat',font=('Consolas',10))
+            entry.insert(0,str(value));entry.pack(fill=tk.X,ipady=6)
+            return entry
+        def toggle(label,variable):
+            tk.Checkbutton(body,text=label,variable=variable,anchor='w',bg=BG_APP,
+                           fg=TEXT_PRIMARY,selectcolor=BG_INPUT,activebackground=BG_APP,
+                           activeforeground=TEXT_PRIMARY,font=('Segoe UI',9)).pack(anchor='w',pady=(4,2))
+        toggle('Enable remote receiver (off by default)',enabled)
+        server=field('Approved ntfy server (HTTPS)',cfg.get('server','https://ntfy.sh'))
+        phone=field('Phone topic (subscribe to this in the ntfy app)',cfg.get('phone_topic',''))
+        token=field('Optional ntfy access-token environment variable name',cfg.get('token_env',''))
+        tk.Label(body,text='Remote command topic is randomly generated and separate from your phone topic.',
+                 bg=BG_APP,fg=TEXT_MUTED,font=('Segoe UI',8),wraplength=600,
+                 justify='left').pack(anchor='w',pady=(4,6))
+        toggle('Allow screenshot requests from phone',allow_screens)
+        toggle('Allow launch of specifically approved saved presets',allow_launch)
+        toggle('Automatically notify phone when a macro fails',errors)
+        toggle('Attach desktop screenshot to failure alerts',error_shot)
+        tk.Label(body,text='Screen used for remote screenshots',bg=BG_APP,fg=TEXT_PRIMARY,
+                 font=('Segoe UI',9,'bold')).pack(anchor='w',pady=(8,2))
+        ttk.Combobox(body,textvariable=scope,values=('Monitor at Cursor','All Monitors'),
+                     state='readonly').pack(anchor='w',fill=tk.X)
+        heartbeat=field('Heartbeat interval in minutes (0=off; minimum 5)',cfg.get('heartbeat_minutes',0))
+        tk.Label(body,text='APPROVED PRESETS (select multiple with Ctrl)',
+                 bg=BG_APP,fg=TEXT_PRIMARY,font=('Segoe UI',9,'bold')).pack(anchor='w',pady=(12,3))
+        presets=tk.Listbox(body,height=5,selectmode=tk.EXTENDED,bg=BG_INPUT,
+                           fg=TEXT_PRIMARY,selectbackground=COLOR_ACCENT,exportselection=False)
+        available=self.get_preset_names()
+        for i,name in enumerate(available):
+            presets.insert(tk.END,name)
+            if name in cfg.get('allowed_macros',[]):presets.selection_set(i)
+        presets.pack(fill=tk.X)
+        status=tk.Label(body,text='',bg=BG_APP,fg=TEXT_MUTED,font=('Segoe UI',9),wraplength=630)
+        status.pack(anchor='w',pady=(10,3))
+        def save():
+            try:
+                secs=int(heartbeat.get())
+                if secs not in (0,) and secs<5:raise ValueError('Heartbeat must be 0 or at least 5 minutes')
+                selected=[available[int(index)] for index in presets.curselection()]
+                new_cfg=dict(self._remote_config,enabled=enabled.get(),server=server.get().strip(),
+                             phone_topic=phone.get().strip(),token_env=token.get().strip(),
+                             allow_screenshots=allow_screens.get(),allow_launch=allow_launch.get(),
+                             auto_error_alert=errors.get(),error_screenshot=error_shot.get(),
+                             screen_scope=scope.get(),heartbeat_minutes=secs,allowed_macros=selected)
+                sequent_remote_save_config(new_cfg)
+                self._remote_config=new_cfg
+                self._remote_connect()
+                self._remote_last_heartbeat=time.monotonic()
+                status.configure(text='Settings saved. Remote will connect if enabled.',fg=COLOR_SUCCESS)
+            except Exception as exc:
+                messagebox.showerror('Sequent Remote',str(exc),parent=win)
+        def panel():
+            if not self._remote_ready():
+                status.configure(text='Remote is disabled or still connecting. Check status below.',fg=COLOR_DANGER)
+                return
+            relay=self.sequent_remote
+            selected=self.get_preset_names() if self._remote_config.get('allow_launch') else ()
+            self._remote_thread(lambda:relay.control_panels(selected),'Send phone controls')
+        def test():
+            if not self._remote_ready():
+                status.configure(text='Enable and connect Remote first.',fg=COLOR_DANGER)
+                return
+            self._remote_thread(lambda:self.sequent_remote.publish('Sequent Remote Test',
+                                  self._remote_status_text()),'Test phone alert')
+        def schedule():
+            approved=self._remote_config.get('allowed_macros',[])
+            if not self._remote_config.get('allow_launch') or not approved:
+                messagebox.showinfo('Schedule','Enable preset launches and select approved presets first.',parent=win)
+                return
+            name=simpledialog.askstring('Schedule preset','Preset name (approved: '+', '.join(approved)+')',parent=win)
+            if not name:return
+            if name not in approved:
+                messagebox.showerror('Schedule','That preset has not been approved.',parent=win);return
+            mins=simpledialog.askinteger('Schedule preset','Run after how many minutes? (1–1440)',
+                                          parent=win,minvalue=1,maxvalue=1440)
+            if mins is None:return
+            self._remote_schedule.append({'name':name,'at':time.time()+mins*60})
+            self._remote_save_jobs()
+            self._remote_log_event(f'Scheduled {name} for +{mins} min')
+            status.configure(text=f'{name} scheduled in {mins} minutes (only while app is open).',fg=COLOR_SUCCESS)
+        controls=tk.Frame(body,bg=BG_APP)
+        controls.pack(anchor='w',fill=tk.X,pady=(12,5))
+        for label,fn in (('Save & Connect',save),('Send Phone Controls',panel),
+                          ('Test Notification',test),('Schedule Preset',schedule)):
+            tk.Button(controls,text=label,command=fn,bg=BG_PANEL,fg=TEXT_PRIMARY,
+                      activebackground=BG_HOVER,activeforeground=TEXT_PRIMARY,
+                      relief='flat',padx=9,pady=7).pack(side=tk.LEFT,padx=(0,5))
+        tk.Label(body,text='REMOTE ACTIVITY (no secret or macro data stored)',
+                 bg=BG_APP,fg=TEXT_PRIMARY,font=('Segoe UI',9,'bold')).pack(anchor='w',pady=(12,4))
+        log=tk.Text(body,height=8,bg=BG_INPUT,fg=TEXT_MUTED,font=('Consolas',9),state='disabled')
+        log.pack(fill=tk.X)
+        info=tk.Label(body,text='',bg=BG_APP,fg=TEXT_MUTED,font=('Segoe UI',8),
+                      wraplength=640,justify=tk.LEFT)
+        info.pack(anchor='w',pady=(10,7))
+        def refresh():
+            if not win.winfo_exists():return
+            relay=self.sequent_remote
+            connected=self._remote_ready()
+            message=('Connected • polling commands' if connected else
+                     'Disabled' if not self._remote_config.get('enabled') else 'Connecting / offline')
+            if relay and relay.last_error:message += ' • '+relay.last_error[:110]
+            status.configure(text=message)
+            rows='\n'.join(self._remote_log[-30:])
+            log.config(state='normal');log.delete('1.0','end');log.insert('end',rows);log.config(state='disabled')
+            info.configure(text='Remote controls expire after 30 minutes and require a signed one-use command. '
+                           'Do not use ntfy.sh for confidential work data. Locking Windows may prevent mouse and screenshot actions.')
+            win.after(1900,refresh)
+        refresh()
+
     def start_macro(self):
         # Fail closed: a disconnected Studio wire is never silently ignored.
         # The legacy structured engine cannot yet execute arbitrary graph edges.
@@ -26197,6 +26641,8 @@ try {{
                         while self.is_paused and self.playing:time.sleep(.04)
                     if not self.playing:
                         raise MacroCancelled('Playback stopped at breakpoint')
+                    self._remote_progress = {'current':index+1, 'total':total,
+                                              'action':action.get('type','?')}
                     self.trace_action(action.get('type','?'), f'STEP {index+1}', 0)
                     if not self._playback_ui_pending or action.get('type') != 'move':
                         self._playback_ui_pending = True
@@ -26365,6 +26811,8 @@ try {{
         self._playback_ui_pending = False
         self.playing = False
         self.is_paused = False
+        if outcome == 'failed' and self._remote_config.get('auto_error_alert') and self._remote_ready():
+            Thread(target=self._remote_error_notice,args=(reason,),daemon=True).start()
         if outcome == "failed":
             self.update_status(f"Failed: {reason}", COLOR_DANGER)
             self.lbl_active_action.config(text="// Execution failed", fg=COLOR_DANGER)
