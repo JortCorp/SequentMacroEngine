@@ -10,7 +10,7 @@ import tempfile
 import hashlib
 import subprocess
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, colorchooser
+from tkinter import filedialog, messagebox, simpledialog, colorchooser, ttk
 from tkinter import font as tkfont
 from threading import Thread, RLock
 from queue import Queue, Empty
@@ -10743,27 +10743,6 @@ class VSCodeQueueViewer(tk.Frame):
                                  activebackground=COLOR_ACCENT)
         mode_menu.pack(fill=tk.X, pady=(0, 10))
 
-        # Dynamic JSON-backed input mode (legacy text prompts remain unchanged).
-        input_mode = tk.StringVar(value=(curr_act or {}).get('input_mode', 'text'))
-        tk.Label(body, text='INPUT TYPE', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
-        tk.OptionMenu(body, input_mode, 'text', 'json_dropdown').pack(fill=tk.X)
-        json_panel = tk.Frame(body, bg=BG_PANEL)
-        def json_field(label, key, default=''):
-            tk.Label(json_panel, text=label, bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w', pady=(5, 1))
-            e = tk.Entry(json_panel, bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY)
-            e.insert(0, (curr_act or {}).get(key, default))
-            e.pack(fill=tk.X, ipady=3)
-            return e
-        json_file_entry = json_field('JSON FILE PATH (supports ${variable})', 'json_file')
-        json_array_entry = json_field('ARRAY PATH (blank = root; e.g. data.items)', 'json_array_path')
-        json_label_entry = json_field('DISPLAY FIELD (blank = item itself)', 'json_label_field', 'label')
-        json_value_entry = json_field('VALUE FIELD (blank = item itself)', 'json_value_field', 'value')
-        def refresh_input_mode(*_):
-            if input_mode.get() == 'json_dropdown': json_panel.pack(fill=tk.X, pady=(4, 8))
-            else: json_panel.pack_forget()
-        input_mode.trace_add('write', refresh_input_mode)
-        refresh_input_mode()
-
         # Optional guard sits in its own packed container immediately below the operation.
         condition_enabled = tk.BooleanVar(value=bool(current.get('condition_enabled', False)) if current else False)
         condition_section = tk.Frame(body, bg=BG_PANEL)
@@ -11877,6 +11856,27 @@ class VSCodeQueueViewer(tk.Frame):
         prompt_entry.pack(fill=tk.X, ipady=2, pady=(0, 6))
         prompt_entry.insert(0, curr_act.get("prompt", "Enter value:") if (curr_act and curr_act.get("type") == "prompt_input") else "Enter value:")
         prompt_entry.focus_set()
+
+        # Dynamic JSON-backed input mode (legacy text prompts remain unchanged).
+        input_mode = tk.StringVar(value=(curr_act or {}).get('input_mode', 'text'))
+        tk.Label(body, text='INPUT TYPE', bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
+        tk.OptionMenu(body, input_mode, 'text', 'json_dropdown').pack(fill=tk.X)
+        json_panel = tk.Frame(body, bg=BG_PANEL)
+        def json_field(label, key, default=''):
+            tk.Label(json_panel, text=label, bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w', pady=(5, 1))
+            e = tk.Entry(json_panel, bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY)
+            e.insert(0, (curr_act or {}).get(key, default))
+            e.pack(fill=tk.X, ipady=3)
+            return e
+        json_file_entry = json_field('JSON FILE PATH (supports ${variable})', 'json_file')
+        json_array_entry = json_field('ARRAY PATH (blank = root; e.g. data.items)', 'json_array_path')
+        json_label_entry = json_field('DISPLAY FIELD (blank = item itself)', 'json_label_field', 'label')
+        json_value_entry = json_field('VALUE FIELD (blank = item itself)', 'json_value_field', 'value')
+        def refresh_input_mode(*_):
+            if input_mode.get() == 'json_dropdown': json_panel.pack(fill=tk.X, pady=(4, 8))
+            else: json_panel.pack_forget()
+        input_mode.trace_add('write', refresh_input_mode)
+        refresh_input_mode()
 
         # Optional guard sits in its own packed container immediately below the operation.
         condition_enabled = tk.BooleanVar(value=bool(curr_act.get('condition_enabled', False)) if curr_act else False)
