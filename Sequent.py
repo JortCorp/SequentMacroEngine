@@ -9190,6 +9190,15 @@ class VSCodeQueueViewer(tk.Frame):
             self._cancel_queue_drag()
             return "break"
 
+    @staticmethod
+    def _queue_alt_down(event):
+        """Recognize Alt across Tk Windows event-state variants."""
+        if event.state & (0x0008 | 0x20000):
+            return True
+        if os.name == 'nt':
+            return bool(ctypes.windll.user32.GetAsyncKeyState(VK_MENU) & 0x8000)
+        return False
+
     def _on_code_click(self, event):
         if self.sub_menu and self.sub_menu.winfo_exists():
             self.close_sub_menu()
@@ -9203,10 +9212,11 @@ class VSCodeQueueViewer(tk.Frame):
             act_idx = line_num - 2
             if not 0 <= act_idx < len(self.app.recorded_actions):
                 return "break"
-            self.app.set_active_action_index(act_idx)
+            # Do not redraw the Text widget while starting a selection.
+            self.app.current_action_idx = act_idx
             if self.app.recording or self.app.playing or self.app.chain_running:
                 return "break"
-            if event.state & 0x0008:  # Alt+drag: reorder.
+            if self._queue_alt_down(event):  # Alt+drag: reorder.
                 self._dnd_start_idx = act_idx
                 self._dnd_press_screen_xy = (event.x_root, event.y_root)
                 self._dnd_action_identity = self.app.recorded_actions[act_idx]
@@ -9242,7 +9252,7 @@ class VSCodeQueueViewer(tk.Frame):
         if not self._dnd_pressed:
             return "break"  # Ordinary drag never selects or reorders.
         start = self._dnd_start_idx
-        if (not self.interactive_enabled or not (event.state & 0x0008) or
+        if (not self.interactive_enabled or not (self._queue_alt_down(event)) or
                 self.app.recording or self.app.playing or self.app.chain_running or
                 start is None or not 0 <= start < len(self.app.recorded_actions) or
                 self.app.recorded_actions[start] is not self._dnd_action_identity):
@@ -9273,7 +9283,7 @@ class VSCodeQueueViewer(tk.Frame):
         end = self._dnd_hover_idx
         original_action = self._dnd_action_identity
         should_reorder = (
-            had_gesture and self._dnd_active and (event.state & 0x0008) and
+            had_gesture and self._dnd_active and (self._queue_alt_down(event)) and
             start is not None and end is not None and start != end and
             self.interactive_enabled and
             not (self.app.playing or self.app.recording or self.app.chain_running) and
