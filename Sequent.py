@@ -9549,6 +9549,9 @@ class VSCodeQueueViewer(tk.Frame):
         self.action_content_frame.bind(
             "<Configure>", lambda e: self._action_editor_canvas.configure(
                 scrollregion=self._action_editor_canvas.bbox("all")))
+        self.action_content_frame.bind('<Configure>',
+            lambda e: self.action_content_frame.after_idle(self._polish_action_controls),
+            add='+')
         self._action_editor_canvas.bind(
             "<Configure>", lambda e: self._action_editor_canvas.itemconfigure(
                 editor_win, width=e.width))
@@ -9830,6 +9833,57 @@ class VSCodeQueueViewer(tk.Frame):
         }
         renderers.get(action_type, self._render_dynamic_action_view)(line_num, edit_idx=edit_idx)
         self._action_editor_canvas.yview_moveto(0)
+        self._polish_action_controls()
+
+    def _polish_action_controls(self):
+        """Unify legacy Action Library controls without changing their values/commands.
+
+        Applied after each editor render and on editor geometry changes so controls
+        created by conditional sub-editors receive the same appearance.
+        """
+        root = getattr(self, 'action_content_frame', None)
+        if root is None:
+            return
+        def visit(parent):
+            for widget in parent.winfo_children():
+                try:
+                    if isinstance(widget, tk.Entry):
+                        widget.configure(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            insertbackground=TEXT_PRIMARY, selectbackground=COLOR_ACCENT,
+                            selectforeground='#FFFFFF', relief='flat', bd=0,
+                            highlightthickness=1, highlightbackground=BG_BORDER,
+                            font=('Segoe UI', 10))
+                        if not getattr(widget, '_sequent_polished', False):
+                            widget.bind('<FocusIn>', lambda e: e.widget.configure(
+                                highlightbackground=COLOR_ACCENT,
+                                highlightcolor=COLOR_ACCENT, highlightthickness=2), add='+')
+                            widget.bind('<FocusOut>', lambda e: e.widget.configure(
+                                highlightbackground=BG_BORDER,
+                                highlightthickness=1), add='+')
+                            widget._sequent_polished = True
+                    elif isinstance(widget, tk.OptionMenu):
+                        widget.configure(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
+                            font=('Segoe UI', 10), relief='flat', bd=0,
+                            highlightthickness=1, highlightbackground=BG_BORDER,
+                            padx=11, pady=7, anchor='w', cursor='hand2',
+                            indicatoron=False)
+                        widget['menu'].configure(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            activebackground=COLOR_ACCENT, activeforeground='#FFFFFF',
+                            font=('Segoe UI', 10), relief='flat', bd=0,
+                            tearoff=False)
+                    elif isinstance(widget, tk.Text):
+                        widget.configure(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            insertbackground=TEXT_PRIMARY, selectbackground=COLOR_ACCENT,
+                            highlightthickness=1, highlightbackground=BG_BORDER,
+                            relief='flat', bd=0, padx=9, pady=7)
+                except tk.TclError:
+                    pass
+                visit(widget)
+        try:
+            visit(root)
+        except tk.TclError:
+            pass
 
     def _add_variable_scope_picker(self, parent, action=None):
         """The same explicit Local/Global setting in variable read/write editors."""
