@@ -5032,7 +5032,11 @@ DYNAMIC_ACTION_SPECS = {
    # This avoids burying the scope control under the ntfy/Pushover credentials.
    ('attach_screenshot','Attach desktop screenshot to ntfy alert','bool',False),
    ('screenshot_scope','Screenshot scope','choice','All Monitors',['All Monitors','Monitor at Cursor']),
-   ('screenshot_max_width','Max screenshot width (pixels, 800–7680)','int',3840),
+   ('screenshot_resolution','Screenshot resolution','choice','Native (100%)',
+    ['Native (100%)','High (80%)','Balanced (60%)','Legacy (Max Width)']),
+   ('screenshot_image_format','Screenshot image format','choice','Auto (Recommended)',
+    ['Auto (Recommended)','PNG (Lossless)','JPEG (High Quality)']),
+   ('screenshot_max_width','Legacy/custom max width (pixels, 800–20000)','int',3840),
    ('screenshot_cursor_marker','Mark cursor position on screenshot','bool',True),
    ('screenshot_cursor_coords','Include cursor coordinates in message','bool',True),
    ('ntfy_server','ntfy HTTPS server','text','https://ntfy.sh'),
@@ -7228,7 +7232,7 @@ def sequent_png_from_bgr(bgr, width, height, stride, marker=None):
     The white outer ring and orange inner ring stay legible on dark/light windows.
     """
     width, height, stride = int(width), int(height), int(stride)
-    if width <= 0 or height <= 0 or width > 10000 or height > 10000:
+    if width <= 0 or height <= 0 or width > 20000 or height > 20000 or width*height > 36_000_000:
         raise MacroExecutionError('Screenshot: invalid image dimensions')
     if stride < width * 3 or len(bgr) < stride * height:
         raise MacroExecutionError('Screenshot: incomplete screen capture')
@@ -7263,7 +7267,107 @@ def sequent_png_from_bgr(bgr, width, height, stride, marker=None):
             _sequent_png_chunk(b'IEND', b''))
 
 
-def sequent_desktop_screenshot(*, scope='All Monitors', max_width=3840, marker=True):
+def _sequent_jpeg_from_bgr(bgr, width, height, stride, marker=None, quality=90):
+    """Encode an in-memory Windows GDI capture to JPEG with native GDI+.
+
+    Uses the Windows-installed codec, no Pillow or external executables.
+    The temporary JPEG is unlinked in a finally block, including on errors.
+    """
+    if os.name != 'nt':
+        raise MacroExecutionError('JPEG desktop screenshots require Windows GDI+')
+    quality = int(quality)
+    if not 35 <= quality <= 100:
+        raise MacroExecutionError('JPEG quality must be 35-100')
+    width, height, stride = int(width), int(height), int(stride)
+    if width <= 0 or height <= 0 or stride < width * 3 or len(bgr) < stride * height:
+        raise MacroExecutionError('JPEG screenshot has invalid dimensions')
+    # Draw the same location marker as the PNG exporter before passing the
+    # top-down 24-bit BGR pixels to GDI+ (JPEG encoding cannot draw it later).
+    pixels = bytearray(bgr)
+    if marker is not None:
+        marker_x, marker_y = marker
+        for y in range(max(0, marker_y - 17), min(height, marker_y + 18)):
+            for x in range(max(0, marker_x - 17), min(width, marker_x + 18)):
+                dx, dy = x - marker_x, y - marker_y
+                sq = dx*dx + dy*dy
+                ink = None
+                if 14*14 <= sq <= 17*17: ink = (0, 0, 0)
+                elif 11*11 <= sq < 14*14: ink = (255, 255, 255)
+                elif 8*8 <= sq < 11*11: ink = (255, 118, 20)
+                elif sq <= 3*3 or (abs(dx) <= 1 and abs(dy) <= 8) or (abs(dy) <= 1 and abs(dx) <= 8):
+                    ink = (255, 118, 20)
+                if ink is not None:
+                    index = y * stride + x * 3
+                    pixels[index:index+3] = bytes((ink[2], ink[1], ink[0]))
+
+    class GdiStartup(ctypes.Structure):
+        _fields_ = [('GdiplusVersion', ctypes.c_uint32),
+                    ('DebugEventCallback', ctypes.c_void_p),
+                    ('SuppressBackgroundThread', ctypes.c_int32),
+                    ('SuppressExternalCodecs', ctypes.c_int32)]
+    class GUID(ctypes.Structure):
+        _fields_ = [('Data1', ctypes.c_uint32), ('Data2', ctypes.c_uint16),
+                    ('Data3', ctypes.c_uint16), ('Data4', ctypes.c_ubyte * 8)]
+    class EncoderParameter(ctypes.Structure):
+        _fields_ = [('Guid', GUID), ('NumberOfValues', ctypes.c_uint32),
+                    ('Type', ctypes.c_uint32), ('Value', ctypes.c_void_p)]
+    class EncoderParameters(ctypes.Structure):
+        _fields_ = [('Count', ctypes.c_uint32), ('Parameter', EncoderParameter * 1)]
+
+    def guid(value):
+        data = uuid.UUID(value).bytes_le
+        return GUID.from_buffer_copy(data)
+
+    gdip = ctypes.windll.gdiplus
+    H = ctypes.c_void_p
+    gdip.GdiplusStartup.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(GdiStartup), H]
+    gdip.GdiplusStartup.restype = ctypes.c_int
+    gdip.GdiplusShutdown.argtypes = [ctypes.c_size_t]
+    gdip.GdipCreateBitmapFromScan0.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                                ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(H)]
+    gdip.GdipCreateBitmapFromScan0.restype = ctypes.c_int
+    gdip.GdipSaveImageToFile.argtypes = [H, ctypes.c_wchar_p, ctypes.POINTER(GUID),
+                                        ctypes.POINTER(EncoderParameters)]
+    gdip.GdipSaveImageToFile.restype = ctypes.c_int
+    gdip.GdipDisposeImage.argtypes = [H]
+    gdip.GdipDisposeImage.restype = ctypes.c_int
+    token = ctypes.c_size_t()
+    startup = GdiStartup(1, None, 0, 0)
+    if gdip.GdiplusStartup(ctypes.byref(token), ctypes.byref(startup), None):
+        raise MacroExecutionError('Screenshot JPEG: GDI+ initialization failed')
+    bitmap = H()
+    filename = None
+    try:
+        buffer = (ctypes.c_ubyte * len(pixels)).from_buffer(pixels)
+        # PixelFormat24bppRGB stores 3 BGR bytes per pixel in Windows memory.
+        if gdip.GdipCreateBitmapFromScan0(width, height, stride, 0x21808,
+                                          ctypes.cast(buffer, H), ctypes.byref(bitmap)):
+            raise MacroExecutionError('Screenshot JPEG: bitmap creation failed')
+        encoder = guid('557cf401-1a04-11d3-9a73-0000f81ef32e')
+        quality_guid = guid('1d5be4b5-fa4a-452d-9cdd-5db35105e7eb')
+        jpeg_quality = ctypes.c_uint32(quality)
+        parameters = EncoderParameters(1, (EncoderParameter * 1)(
+            EncoderParameter(quality_guid, 1, 4, ctypes.cast(ctypes.byref(jpeg_quality), H))))
+        fd, filename = tempfile.mkstemp(prefix='sequent-ntfy-', suffix='.jpg')
+        os.close(fd)
+        if gdip.GdipSaveImageToFile(bitmap, filename, ctypes.byref(encoder),
+                                    ctypes.byref(parameters)):
+            raise MacroExecutionError('Screenshot JPEG: Windows codec failed to save image')
+        return Path(filename).read_bytes()
+    finally:
+        if bitmap:
+            gdip.GdipDisposeImage(bitmap)
+        gdip.GdiplusShutdown(token)
+        if filename:
+            try:
+                os.unlink(filename)
+            except OSError:
+                pass
+
+
+def sequent_desktop_screenshot(*, scope='All Monitors', max_width=3840, marker=True,
+                               resolution='Legacy (Max Width)', image_format='PNG',
+                               jpeg_quality=90, scale_override=1.0):
     """Capture live Windows desktops to PNG via GDI, including negative monitor origins.
 
     Returns (PNG bytes, (absolute mouse X, mouse Y)). All GDI handles are released.
@@ -7276,8 +7380,20 @@ def sequent_desktop_screenshot(*, scope='All Monitors', max_width=3840, marker=T
         max_width = int(max_width)
     except (TypeError, ValueError):
         raise MacroExecutionError('Screenshot: width must be a number') from None
-    if not 800 <= max_width <= 7680:
-        raise MacroExecutionError('Screenshot: max width must be between 800 and 7680 pixels')
+    if not 800 <= max_width <= 20000:
+        raise MacroExecutionError('Screenshot: max width must be between 800 and 20000 pixels')
+    resolution_scales = {'Native (100%)': 1.0, 'High (80%)': 0.8,
+                         'Balanced (60%)': 0.6}
+    if resolution not in resolution_scales and resolution != 'Legacy (Max Width)':
+        raise MacroExecutionError(f'Screenshot: unknown resolution mode {resolution!r}')
+    if image_format not in ('PNG', 'JPEG'):
+        raise MacroExecutionError('Screenshot: image format must be PNG or JPEG')
+    try:
+        scale_override = float(scale_override)
+    except (TypeError, ValueError):
+        raise MacroExecutionError('Screenshot: invalid scale factor') from None
+    if not 0.1 <= scale_override <= 1.0:
+        raise MacroExecutionError('Screenshot: scale factor must be between 0.1 and 1')
     cursor_x, cursor_y = get_mouse_pos()
     if scope == 'All Monitors':
         x, y, width, height = get_virtual_desktop_bounds()
@@ -7296,13 +7412,16 @@ def sequent_desktop_screenshot(*, scope='All Monitors', max_width=3840, marker=T
         raise MacroExecutionError('Screenshot: unrecognized capture area')
     if width <= 0 or height <= 0:
         raise MacroExecutionError('Screenshot: desktop dimensions are invalid')
-    ratio = min(1.0, float(max_width) / width)
+    ratio = (min(1.0, float(max_width) / width) if resolution == 'Legacy (Max Width)'
+             else resolution_scales[resolution]) * scale_override
     output_w = max(1, round(width * ratio))
     output_h = max(1, round(height * ratio))
-    # Cap CPU, memory, and attachment size on large multi-monitor workstations.
-    if output_w * output_h > 12_000_000:
-        factor = (12_000_000 / (output_w * output_h)) ** 0.5
-        output_w, output_h = max(1, int(output_w*factor)), max(1, int(output_h*factor))
+    # Native mode really is pixel-for-pixel; do not silently lower resolution.
+    # Limit allocation to 36MP (~108MB of raw 24-bit pixel data) so huge
+    # virtual desktops cannot exhaust memory on constrained company PCs.
+    if output_w > 20000 or output_h > 20000 or output_w * output_h > 36_000_000:
+        raise MacroExecutionError('Screenshot exceeds the 36-megapixel safety limit; '
+                                  'choose High, Balanced, or Mouse Screen')
     stride = ((output_w*3 + 3) // 4) * 4
 
     handle = ctypes.c_void_p
@@ -7319,6 +7438,9 @@ def sequent_desktop_screenshot(*, scope='All Monitors', max_width=3840, marker=T
                               ctypes.c_int, handle, ctypes.c_int, ctypes.c_int,
                               ctypes.c_int, ctypes.c_int, ctypes.c_uint]
     gdi.StretchBlt.restype = ctypes.c_int
+    gdi.BitBlt.argtypes = [handle, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                           ctypes.c_int, handle, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    gdi.BitBlt.restype = ctypes.c_int
     gdi.GetDIBits.argtypes = [handle, handle, ctypes.c_uint, ctypes.c_uint,
                               handle, handle, ctypes.c_uint]
     gdi.GetDIBits.restype = ctypes.c_int
@@ -7352,9 +7474,16 @@ def sequent_desktop_screenshot(*, scope='All Monitors', max_width=3840, marker=T
         if not previous or previous == ctypes.c_void_p(-1).value:
             previous = None
             raise MacroExecutionError('Screenshot: cannot select bitmap')
-        gdi.SetStretchBltMode(memory_dc, 4)  # HALFTONE scaling
-        if not gdi.StretchBlt(memory_dc, 0, 0, output_w, output_h,
-                              desktop_dc, x, y, width, height, 0x00CC0020 | 0x40000000):
+        flags = 0x00CC0020 | 0x40000000  # SRCCOPY | CAPTUREBLT
+        if output_w == width and output_h == height:
+            # Pixel-perfect BitBlt, no interpolation or scaling artifacts.
+            copied = gdi.BitBlt(memory_dc, 0, 0, width, height,
+                                desktop_dc, x, y, flags)
+        else:
+            gdi.SetStretchBltMode(memory_dc, 4)  # HALFTONE downscaling
+            copied = gdi.StretchBlt(memory_dc, 0, 0, output_w, output_h,
+                                    desktop_dc, x, y, width, height, flags)
+        if not copied:
             raise MacroExecutionError('Screenshot: desktop capture failed')
         gdi.SelectObject(memory_dc, previous)
         previous = None  # deselect bitmap before GetDIBits
@@ -7375,8 +7504,12 @@ def sequent_desktop_screenshot(*, scope='All Monitors', max_width=3840, marker=T
         mx = min(output_w-1, max(0, int((cursor_x - x) * output_w / width)))
         my = min(output_h-1, max(0, int((cursor_y - y) * output_h / height)))
         marker_position = (mx, my)
-    image = sequent_png_from_bgr(bytes(pixels), output_w, output_h, stride,
-                                 marker=marker_position)
+    if image_format == 'JPEG':
+        image = _sequent_jpeg_from_bgr(bytes(pixels), output_w, output_h, stride,
+                                      marker=marker_position, quality=jpeg_quality)
+    else:
+        image = sequent_png_from_bgr(bytes(pixels), output_w, output_h, stride,
+                                     marker=marker_position)
     return image, (cursor_x, cursor_y)
 
 
@@ -7426,19 +7559,59 @@ def sequent_send_notification(engine, action):
                 if env_name:
                     headers['Authorization'] = 'Bearer ' + _sequent_notification_env(env_name)
                 if screenshot:
-                    # One PUT is one notification containing both image and text.
+                    # Public ntfy.sh caps attachments at 2 MB (much smaller than
+                    # a standard self-hosted ntfy server's 15 MB default).
+                    # Reserve space so the request is comfortably under the cap.
+                    max_bytes = (1_900_000 if parsed.hostname.casefold() == 'ntfy.sh'
+                                 else 14_000_000)
+                    resolution = action.get('screenshot_resolution', 'Legacy (Max Width)')
+                    preference = action.get('screenshot_image_format', 'PNG (Lossless)')
+                    if preference not in ('Auto (Recommended)', 'PNG (Lossless)',
+                                          'JPEG (High Quality)'):
+                        raise MacroExecutionError('Screenshot: unknown image format option')
+                    common = dict(scope=action.get('screenshot_scope', 'All Monitors'),
+                                  max_width=action.get('screenshot_max_width', 3840),
+                                  marker=bool(action.get('screenshot_cursor_marker', True)),
+                                  resolution=resolution)
+                    # Preserve lossless PNG if it fits, otherwise JPEG retains
+                    # more pixels within the limited ntfy attachment budget.
+                    first_format = 'JPEG' if preference == 'JPEG (High Quality)' else 'PNG'
                     image, (mouse_x, mouse_y) = sequent_desktop_screenshot(
-                        scope=action.get('screenshot_scope', 'All Monitors'),
-                        max_width=action.get('screenshot_max_width', 3840),
-                        marker=bool(action.get('screenshot_cursor_marker', True)))
-                    if len(image) > 14_000_000:
-                        raise MacroExecutionError('Screenshot PNG is too large for ntfy.sh; '
-                                                  'reduce screenshot width or capture one monitor')
+                        **common, image_format=first_format)
+                    actual_format = first_format
+                    if len(image) > max_bytes and preference == 'Auto (Recommended)':
+                        # At equal resolution prefer higher JPEG quality first;
+                        # reduce dimensions only if compression cannot fit.
+                        for scale, quality in ((1,90),(1,82),(1,74),(1,64),
+                                               (0.85,85),(0.7,85),(0.55,82),(0.4,78)):
+                            image, (mouse_x, mouse_y) = sequent_desktop_screenshot(
+                                **common, image_format='JPEG', jpeg_quality=quality,
+                                scale_override=scale)
+                            actual_format = 'JPEG'
+                            if len(image) <= max_bytes:
+                                break
+                    elif len(image) > max_bytes and preference == 'JPEG (High Quality)':
+                        # JPEG-only follows the same size/quality tradeoff.
+                        for scale, quality in ((1,82),(1,74),(1,64),
+                                               (0.85,85),(0.7,85),(0.55,82),(0.4,78)):
+                            image, (mouse_x, mouse_y) = sequent_desktop_screenshot(
+                                **common, image_format='JPEG', jpeg_quality=quality,
+                                scale_override=scale)
+                            if len(image) <= max_bytes:
+                                break
+                    if len(image) > max_bytes:
+                        raise MacroExecutionError(
+                            f'Screenshot attachment is {len(image)/1_000_000:.2f} MB, '
+                            f'but this ntfy server setting allows up to '
+                            f'{max_bytes/1_000_000:.1f} MB. Choose Mouse Screen, '
+                            'Balanced resolution, or JPEG and try again.')
                     if action.get('screenshot_cursor_coords', True):
                         message += f'\nMouse location at capture: ({mouse_x}, {mouse_y})'
-                    headers.update({'Content-Type': 'image/png',
+                    jpeg = actual_format == 'JPEG'
+                    headers.update({'Content-Type': 'image/jpeg' if jpeg else 'image/png',
                                     'Filename': 'sequent-desktop-' +
-                                        datetime.now().strftime('%Y%m%d-%H%M%S') + '.png',
+                                        datetime.now().strftime('%Y%m%d-%H%M%S') +
+                                        ('.jpg' if jpeg else '.png'),
                                     'Title': _sequent_ntfy_header(title),
                                     'Message': _sequent_ntfy_header(message),
                                     'Priority': str({'Low':2,'Normal':3,'High':4}.get(priority,3))})
@@ -13209,7 +13382,7 @@ class VSCodeQueueViewer(tk.Frame):
                      bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',9),wraplength=450,
                      justify='left').pack(fill=tk.X,pady=(4,8))
         if type_name == 'notify_phone':
-            tk.Label(body, text='Enable screenshot attachments for ntfy, then choose All screens or Mouse screen. The marker shows the cursor location at capture time. WARNING: Visible screen content is sent to the configured ntfy server.',
+            tk.Label(body, text='Screenshot resolution: Native keeps all desktop pixels; High/Balanced reduce file size. Auto format tries lossless PNG then JPEG as needed. Public ntfy.sh allows only 2 MB attachments, so Auto may reduce image quality to fit. The marker shows the cursor location at capture time. WARNING: Visible screen content is uploaded to your ntfy server.',
                      bg=BG_PANEL, fg=TEXT_MUTED, wraplength=460, justify='left',
                      font=('Segoe UI', 8)).pack(fill=tk.X, pady=(5, 5))
         if type_name in ('notify_phone', 'notify_email'):
