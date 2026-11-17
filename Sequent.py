@@ -5031,6 +5031,11 @@ DYNAMIC_ACTION_SPECS = {
    ('ntfy_server','ntfy HTTPS server','text','https://ntfy.sh'),
    ('ntfy_topic','ntfy topic (subscribe on your phone)','text',''),
    ('ntfy_token_env','Optional ntfy access-token ENV VARIABLE name','text',''),
+   ('attach_screenshot','Attach desktop screenshot to ntfy alert','bool',False),
+   ('screenshot_scope','Screenshot area','choice','All Monitors',['All Monitors','Monitor at Cursor']),
+   ('screenshot_max_width','Max screenshot width (pixels, 800–7680)','int',3840),
+   ('screenshot_cursor_marker','Mark cursor position on screenshot','bool',True),
+   ('screenshot_cursor_coords','Include cursor coordinates in message','bool',True),
    ('pushover_token_env','Pushover app-token ENV VARIABLE name','text','SEQUENT_PUSHOVER_TOKEN'),
    ('pushover_user_env','Pushover user-key ENV VARIABLE name','text','SEQUENT_PUSHOVER_USER')]),
  'Send Email':('notify_email',[
@@ -7194,9 +7199,9 @@ def _sequent_notification_env(name, *, required=True):
     return result
 
 
-def _sequent_notification_https(url, payload, headers):
+def _sequent_notification_https(url, payload, headers, method='POST'):
     """Send one HTTPS request; close promptly and never echo credential contents."""
-    req = urlrequest.Request(url, data=payload, method='POST', headers=headers)
+    req = urlrequest.Request(url, data=payload, method=method, headers=headers)
     # urlopen uses certificate validation and the platform default CA bundle.
     # Never follow a redirect that could reveal an Authorization header to a new host.
     class NoRedirect(urlrequest.HTTPRedirectHandler):
@@ -7205,6 +7210,188 @@ def _sequent_notification_https(url, payload, headers):
     opener = urlrequest.build_opener(NoRedirect, urlrequest.HTTPSHandler(context=ssl.create_default_context()))
     with opener.open(req, timeout=15) as response:
         return response.read(8192)
+
+
+
+def _sequent_png_chunk(kind, body):
+    """PNG byte chunk with the PNG-standard CRC. No third-party modules."""
+    data = kind + body
+    return struct.pack('>I', len(body)) + data + struct.pack('>I', zlib.crc32(data) & 0xFFFFFFFF)
+
+
+def sequent_png_from_bgr(bgr, width, height, stride, marker=None):
+    """Encode top-down GDI 24bpp BGR as RGB PNG, optionally drawing a cursor marker.
+
+    `marker` is a pixel location in the *scaled image* (not virtual desktop coords).
+    The white outer ring and orange inner ring stay legible on dark/light windows.
+    """
+    width, height, stride = int(width), int(height), int(stride)
+    if width <= 0 or height <= 0 or width > 10000 or height > 10000:
+        raise MacroExecutionError('Screenshot: invalid image dimensions')
+    if stride < width * 3 or len(bgr) < stride * height:
+        raise MacroExecutionError('Screenshot: incomplete screen capture')
+    output = zlib.compressobj(level=6)
+    compressed = []
+    marker_x, marker_y = marker if marker is not None else (-100, -100)
+    for y in range(height):
+        row = bgr[y*stride : y*stride + width*3]
+        rgb = bytearray(width*3)
+        rgb[0::3] = row[2::3]
+        rgb[1::3] = row[1::3]
+        rgb[2::3] = row[0::3]
+        if abs(y - marker_y) <= 17:
+            for x in range(max(0, marker_x - 17), min(width, marker_x + 18)):
+                dx, dy = x - marker_x, y - marker_y
+                sq = dx*dx + dy*dy
+                ink = None
+                if 14*14 <= sq <= 17*17: ink = (0, 0, 0)
+                elif 11*11 <= sq < 14*14: ink = (255, 255, 255)
+                elif 8*8 <= sq < 11*11: ink = (255, 118, 20)
+                elif (dx*dx + dy*dy <= 3*3 or
+                      (abs(dx) <= 1 and abs(dy) <= 8) or
+                      (abs(dy) <= 1 and abs(dx) <= 8)):
+                    ink = (255, 118, 20)
+                if ink is not None:
+                    rgb[3*x:3*x+3] = bytes(ink)
+        compressed.append(output.compress(b'\x00' + rgb))  # filter type None
+    compressed.append(output.flush())
+    header = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)
+    return (b'\x89PNG\r\n\x1a\n' + _sequent_png_chunk(b'IHDR', header) +
+            _sequent_png_chunk(b'IDAT', b''.join(compressed)) +
+            _sequent_png_chunk(b'IEND', b''))
+
+
+def sequent_desktop_screenshot(*, scope='All Monitors', max_width=3840, marker=True):
+    """Capture live Windows desktops to PNG via GDI, including negative monitor origins.
+
+    Returns (PNG bytes, (absolute mouse X, mouse Y)). All GDI handles are released.
+    The marker is placed at the cursor's location *at capture time*, not an older
+    recorded click or an independently polled mouse-motion history.
+    """
+    if os.name != 'nt':
+        raise MacroExecutionError('Desktop screenshots require Windows')
+    try:
+        max_width = int(max_width)
+    except (TypeError, ValueError):
+        raise MacroExecutionError('Screenshot: width must be a number') from None
+    if not 800 <= max_width <= 7680:
+        raise MacroExecutionError('Screenshot: max width must be between 800 and 7680 pixels')
+    cursor_x, cursor_y = get_mouse_pos()
+    if scope == 'All Monitors':
+        x, y, width, height = get_virtual_desktop_bounds()
+    elif scope == 'Monitor at Cursor':
+        u32 = ctypes.windll.user32
+        hmon = u32.MonitorFromPoint(POINT(cursor_x, cursor_y), 2)
+        if not hmon:
+            raise MacroExecutionError('Screenshot: unable to locate cursor monitor')
+        mon = SequentChromeMonitorInfo()
+        mon.cbSize = ctypes.sizeof(SequentChromeMonitorInfo)
+        if not u32.GetMonitorInfoW(hmon, ctypes.byref(mon)):
+            raise MacroExecutionError('Screenshot: unable to read cursor monitor bounds')
+        rc = mon.rcMonitor
+        x, y, width, height = rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top
+    else:
+        raise MacroExecutionError('Screenshot: unrecognized capture area')
+    if width <= 0 or height <= 0:
+        raise MacroExecutionError('Screenshot: desktop dimensions are invalid')
+    ratio = min(1.0, float(max_width) / width)
+    output_w = max(1, round(width * ratio))
+    output_h = max(1, round(height * ratio))
+    # Cap CPU, memory, and attachment size on large multi-monitor workstations.
+    if output_w * output_h > 12_000_000:
+        factor = (12_000_000 / (output_w * output_h)) ** 0.5
+        output_w, output_h = max(1, int(output_w*factor)), max(1, int(output_h*factor))
+    stride = ((output_w*3 + 3) // 4) * 4
+
+    handle = ctypes.c_void_p
+    u32, gdi = ctypes.windll.user32, ctypes.windll.gdi32
+    u32.GetDC.argtypes, u32.GetDC.restype = [handle], handle
+    u32.ReleaseDC.argtypes, u32.ReleaseDC.restype = [handle, handle], ctypes.c_int
+    gdi.CreateCompatibleDC.argtypes, gdi.CreateCompatibleDC.restype = [handle], handle
+    gdi.CreateCompatibleBitmap.argtypes = [handle, ctypes.c_int, ctypes.c_int]
+    gdi.CreateCompatibleBitmap.restype = handle
+    gdi.SelectObject.argtypes, gdi.SelectObject.restype = [handle, handle], handle
+    gdi.SetStretchBltMode.argtypes = [handle, ctypes.c_int]
+    gdi.SetStretchBltMode.restype = ctypes.c_int
+    gdi.StretchBlt.argtypes = [handle, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_int, handle, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    gdi.StretchBlt.restype = ctypes.c_int
+    gdi.GetDIBits.argtypes = [handle, handle, ctypes.c_uint, ctypes.c_uint,
+                              handle, handle, ctypes.c_uint]
+    gdi.GetDIBits.restype = ctypes.c_int
+    gdi.DeleteObject.argtypes, gdi.DeleteObject.restype = [handle], ctypes.c_int
+    gdi.DeleteDC.argtypes, gdi.DeleteDC.restype = [handle], ctypes.c_int
+
+    class Header(ctypes.Structure):
+        _fields_ = [('size', ctypes.c_uint32), ('width', ctypes.c_int32),
+                    ('height', ctypes.c_int32), ('planes', ctypes.c_uint16),
+                    ('bits', ctypes.c_uint16), ('compression', ctypes.c_uint32),
+                    ('image_size', ctypes.c_uint32), ('xppm', ctypes.c_int32),
+                    ('yppm', ctypes.c_int32), ('used', ctypes.c_uint32),
+                    ('important', ctypes.c_uint32)]
+
+    bmp_header = Header(size=ctypes.sizeof(Header), width=output_w,
+                        height=-output_h, planes=1, bits=24,
+                        compression=0, image_size=stride*output_h)
+    pixels = (ctypes.c_ubyte * (stride * output_h))()
+    desktop_dc = u32.GetDC(None)
+    if not desktop_dc:
+        raise MacroExecutionError('Screenshot: cannot access desktop')
+    memory_dc = bitmap = previous = None
+    try:
+        memory_dc = gdi.CreateCompatibleDC(desktop_dc)
+        if not memory_dc:
+            raise MacroExecutionError('Screenshot: cannot create bitmap context')
+        bitmap = gdi.CreateCompatibleBitmap(desktop_dc, output_w, output_h)
+        if not bitmap:
+            raise MacroExecutionError('Screenshot: cannot create bitmap')
+        previous = gdi.SelectObject(memory_dc, bitmap)
+        if not previous or previous == ctypes.c_void_p(-1).value:
+            previous = None
+            raise MacroExecutionError('Screenshot: cannot select bitmap')
+        gdi.SetStretchBltMode(memory_dc, 4)  # HALFTONE scaling
+        if not gdi.StretchBlt(memory_dc, 0, 0, output_w, output_h,
+                              desktop_dc, x, y, width, height, 0x00CC0020 | 0x40000000):
+            raise MacroExecutionError('Screenshot: desktop capture failed')
+        gdi.SelectObject(memory_dc, previous)
+        previous = None  # deselect bitmap before GetDIBits
+        if gdi.GetDIBits(desktop_dc, bitmap, 0, output_h, pixels,
+                          ctypes.byref(bmp_header), 0) != output_h:
+            raise MacroExecutionError('Screenshot: cannot read captured pixels')
+    finally:
+        if previous and memory_dc:
+            gdi.SelectObject(memory_dc, previous)
+        if bitmap:
+            gdi.DeleteObject(bitmap)
+        if memory_dc:
+            gdi.DeleteDC(memory_dc)
+        u32.ReleaseDC(None, desktop_dc)
+
+    marker_position = None
+    if marker:
+        mx = min(output_w-1, max(0, int((cursor_x - x) * output_w / width)))
+        my = min(output_h-1, max(0, int((cursor_y - y) * output_h / height)))
+        marker_position = (mx, my)
+    image = sequent_png_from_bgr(bytes(pixels), output_w, output_h, stride,
+                                 marker=marker_position)
+    return image, (cursor_x, cursor_y)
+
+
+def _sequent_ntfy_header(value):
+    """ntfy supports RFC 2047 headers; encode multiline/unicode text safely.
+
+    Python's standard HTTP client only accepts latin-1 headers and rejects
+    embedded newline characters. RFC 2047 encodes them while preserving
+    message text for ntfy subscribers. Limit size to avoid oversized headers.
+    """
+    value = str(value)
+    raw = value.encode('utf-8')
+    if len(raw) > 2500:
+        raise MacroExecutionError('ntfy screenshot: message/title exceeds 2500 UTF-8 bytes')
+    if any(ord(c) < 32 or ord(c) > 126 for c in value):
+        return '=?UTF-8?B?' + base64.b64encode(raw).decode('ascii') + '?='
+    return value
 
 
 def sequent_send_notification(engine, action):
@@ -7231,19 +7418,44 @@ def sequent_send_notification(engine, action):
                 topic = str(engine.interpolate(str(action.get('ntfy_topic', '')))).strip()
                 if not _NOTIFICATION_TOPIC.fullmatch(topic):
                     raise MacroExecutionError('ntfy: topic must be 5-64 letters, numbers, _ or -')
-                data = json.dumps({'topic': topic, 'title': title,
-                                   'message': message, 'priority': {'Low':2,'Normal':3,'High':4}.get(priority,3)},
-                                  ensure_ascii=False).encode('utf-8')
-                headers = {'Content-Type': 'application/json'}
+                screenshot = bool(action.get('attach_screenshot', False))
+                headers = {}
                 env_name = action.get('ntfy_token_env', '')
                 if env_name:
                     headers['Authorization'] = 'Bearer ' + _sequent_notification_env(env_name)
-                raw = _sequent_notification_https(server + '/', data, headers)
+                if screenshot:
+                    # One PUT is one notification containing both image and text.
+                    image, (mouse_x, mouse_y) = sequent_desktop_screenshot(
+                        scope=action.get('screenshot_scope', 'All Monitors'),
+                        max_width=action.get('screenshot_max_width', 3840),
+                        marker=bool(action.get('screenshot_cursor_marker', True)))
+                    if len(image) > 14_000_000:
+                        raise MacroExecutionError('Screenshot PNG is too large for ntfy.sh; '
+                                                  'reduce screenshot width or capture one monitor')
+                    if action.get('screenshot_cursor_coords', True):
+                        message += f'\nMouse location at capture: ({mouse_x}, {mouse_y})'
+                    headers.update({'Content-Type': 'image/png',
+                                    'Filename': 'sequent-desktop-' +
+                                        datetime.now().strftime('%Y%m%d-%H%M%S') + '.png',
+                                    'Title': _sequent_ntfy_header(title),
+                                    'Message': _sequent_ntfy_header(message),
+                                    'Priority': str({'Low':2,'Normal':3,'High':4}.get(priority,3))})
+                    raw = _sequent_notification_https(server + '/' + topic,
+                                                     image, headers, method='PUT')
+                else:
+                    data = json.dumps({'topic': topic, 'title': title,
+                                       'message': message,
+                                       'priority': {'Low':2,'Normal':3,'High':4}.get(priority,3)},
+                                      ensure_ascii=False).encode('utf-8')
+                    headers['Content-Type'] = 'application/json'
+                    raw = _sequent_notification_https(server + '/', data, headers)
                 body = json.loads(raw)
                 if body.get('event') != 'message':
                     raise MacroExecutionError('ntfy: server did not acknowledge a published notification')
-                return {'channel': 'ntfy', 'target': topic}
+                return {'channel': 'ntfy', 'target': topic, 'screenshot': screenshot}
             if provider == 'Pushover':
+                if action.get('attach_screenshot', False):
+                    raise MacroExecutionError('Screenshot attachment is currently supported only for ntfy')
                 token = _sequent_notification_env(action.get('pushover_token_env', 'SEQUENT_PUSHOVER_TOKEN'))
                 user = _sequent_notification_env(action.get('pushover_user_env', 'SEQUENT_PUSHOVER_USER'))
                 params = {'token':token,'user':user,'title':title,
@@ -8413,7 +8625,7 @@ class VSCodeQueueViewer(tk.Frame):
             ("Write File", "Create, overwrite or append a text file.", "WF"),
             ("Read JSON", "Read a JSON key or document into a variable.", "RJ"),
             ("Write JSON", "Set/delete JSON keys, append arrays, or replace a document.", "WJ"),
-            ("Send Phone Alert", "Push an alert to an ntfy/Pushover phone app.", "PN"),
+            ("Send Phone Alert", "Send a push alert, optionally with an annotated desktop screenshot through ntfy.", "PN"),
             ("Send Email", "Send a variable-filled email through SMTP.", "EM"),
 
             ("Clipboard Branch / Fallback", "On a keyword miss, set a Local/Global variable and/or run a macro.", "CB"),
@@ -12963,6 +13175,10 @@ class VSCodeQueueViewer(tk.Frame):
                          'Use the queue to order your IF / ELSE / END IF and LOOP / END LOOP actions.',
                      bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',9),wraplength=450,
                      justify='left').pack(fill=tk.X,pady=(4,8))
+        if type_name == 'notify_phone':
+            tk.Label(body, text='Optional ntfy screenshot: captures all monitors (or the monitor containing the mouse), marks the current cursor position, and uploads the image with the alert. WARNING: Anything visible on screen is transmitted to the configured ntfy server.',
+                     bg=BG_PANEL, fg=TEXT_MUTED, wraplength=460, justify='left',
+                     font=('Segoe UI', 8)).pack(fill=tk.X, pady=(5, 5))
         if type_name in ('notify_phone', 'notify_email'):
             hint = ('Requires Internet access and a subscribed phone app. For ntfy.sh, '
                     'treat unprotected topics as public and never send confidential work data. '
