@@ -22,6 +22,12 @@ import unicodedata
 import uuid
 from pathlib import Path
 import winsound
+import ssl
+import smtplib
+from email.message import EmailMessage
+from urllib import request as urlrequest
+from urllib import parse as urlparse
+from urllib import error as urlerror
 
 ACTIVE_SOUND_THEME = "Classic"
 CUSTOM_SOUND_PATHS = {
@@ -5017,6 +5023,26 @@ DYNAMIC_ACTION_SPECS = {
    ('value_type','Value type','choice','String',['String','JSON','Number','Boolean','Null']),
    ('mode','Operation','choice','Set Key',['Set Key','Delete Key','Append to Array','Replace Document']),
    ('create_dirs','Create missing folders','bool',True)]),
+ 'Send Phone Alert':('notify_phone',[
+   ('provider','Service','choice','ntfy',['ntfy','Pushover']),
+   ('title','Alert title (supports ${variables})','text','Sequent update'),
+   ('message','Message (supports ${variables})','multiline','Macro finished.'),
+   ('priority','Priority','choice','Normal',['Low','Normal','High']),
+   ('ntfy_server','ntfy HTTPS server','text','https://ntfy.sh'),
+   ('ntfy_topic','ntfy topic (subscribe on your phone)','text',''),
+   ('ntfy_token_env','Optional ntfy access-token ENV VARIABLE name','text',''),
+   ('pushover_token_env','Pushover app-token ENV VARIABLE name','text','SEQUENT_PUSHOVER_TOKEN'),
+   ('pushover_user_env','Pushover user-key ENV VARIABLE name','text','SEQUENT_PUSHOVER_USER')]),
+ 'Send Email':('notify_email',[
+   ('email_to','Recipient email address (supports ${variables})','text',''),
+   ('email_from','Sender email address','text',''),
+   ('email_subject','Email subject (supports ${variables})','text','Sequent update'),
+   ('message','Email body (supports ${variables})','multiline','Macro finished.'),
+   ('smtp_host','SMTP host','text','smtp.gmail.com'),
+   ('smtp_port','SMTP port','int',587),
+   ('smtp_security','Transport security','choice','STARTTLS',['STARTTLS','SSL/TLS']),
+   ('smtp_user','SMTP login username','text',''),
+   ('smtp_password_env','SMTP password ENV VARIABLE name','text','SEQUENT_SMTP_PASSWORD')]),
  'Load Text File → Variable':('load_text_variable',[
    ('path','Text file to read (.txt; relative paths use presets/text_files)','path','defect_description.txt'),
    ('var_name','Destination variable name','text','defect_description'),
@@ -5938,7 +5964,7 @@ DYNAMIC_ACTION_TYPES = frozenset({
     'end_if', 'loop_start', 'loop_end', 'loop_break', 'find_image', 'recovery',
     'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action', 'set_variable',
     'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro', 'text_process', 'macro_return',
-    'load_text_variable', 'file_read', 'file_write', 'json_read', 'json_write', 'compare_text', 'compare_variables', 'placement_guide'
+    'load_text_variable', 'file_read', 'file_write', 'json_read', 'json_write', 'notify_phone', 'notify_email', 'prompt_json_form', 'compare_text', 'compare_variables', 'placement_guide'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end','loop_break'})
 
@@ -7149,6 +7175,228 @@ def sequent_file_action(engine, action):
     except (OSError, UnicodeError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError) as exc:
         raise MacroExecutionError(f'{typ}: {exc}') from exc
 
+
+# --- Notifications: stdlib-only HTTPS and SMTP, no credentials embedded in macros ---
+_NOTIFICATION_ENV_NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+_NOTIFICATION_TOPIC = re.compile(r'^[A-Za-z0-9_-]{5,64}$')
+
+
+def _sequent_notification_env(name, *, required=True):
+    """Read *a variable name*, not a secret from the macro or exported preset."""
+    name = str(name or '').strip()
+    if not name and not required:
+        return ''
+    if not _NOTIFICATION_ENV_NAME.fullmatch(name):
+        raise MacroExecutionError('Notification: invalid environment variable name')
+    result = os.environ.get(name, '')
+    if required and not result:
+        raise MacroExecutionError(f'Notification: set the {name} environment variable before starting Sequent')
+    return result
+
+
+def _sequent_notification_https(url, payload, headers):
+    """Send one HTTPS request; close promptly and never echo credential contents."""
+    req = urlrequest.Request(url, data=payload, method='POST', headers=headers)
+    # urlopen uses certificate validation and the platform default CA bundle.
+    # Never follow a redirect that could reveal an Authorization header to a new host.
+    class NoRedirect(urlrequest.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+            return None
+    opener = urlrequest.build_opener(NoRedirect, urlrequest.HTTPSHandler(context=ssl.create_default_context()))
+    with opener.open(req, timeout=15) as response:
+        return response.read(8192)
+
+
+def sequent_send_notification(engine, action):
+    """Network notification action. Only invoked explicitly during macro playback.
+
+    Interpolates message and visible destinations at runtime. Secrets are read
+    from process environment variables, not stored in action dictionaries.
+    """
+    channel = action.get('type')
+    title = str(engine.interpolate(str(action.get('title', action.get('email_subject', 'Sequent update'))))).strip()
+    message = str(engine.interpolate(str(action.get('message', ''))))
+    if not message.strip():
+        raise MacroExecutionError('Notification: message cannot be empty')
+    try:
+        if channel == 'notify_phone':
+            provider = str(action.get('provider', 'ntfy')).strip()
+            priority = str(action.get('priority', 'Normal'))
+            if provider == 'ntfy':
+                server = str(action.get('ntfy_server', 'https://ntfy.sh')).strip().rstrip('/')
+                parsed = urlparse.urlsplit(server)
+                if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or
+                        parsed.password or parsed.query or parsed.fragment):
+                    raise MacroExecutionError('ntfy: server must be an HTTPS URL without credentials or query')
+                topic = str(engine.interpolate(str(action.get('ntfy_topic', '')))).strip()
+                if not _NOTIFICATION_TOPIC.fullmatch(topic):
+                    raise MacroExecutionError('ntfy: topic must be 5-64 letters, numbers, _ or -')
+                data = json.dumps({'topic': topic, 'title': title,
+                                   'message': message, 'priority': {'Low':2,'Normal':3,'High':4}.get(priority,3)},
+                                  ensure_ascii=False).encode('utf-8')
+                headers = {'Content-Type': 'application/json'}
+                env_name = action.get('ntfy_token_env', '')
+                if env_name:
+                    headers['Authorization'] = 'Bearer ' + _sequent_notification_env(env_name)
+                raw = _sequent_notification_https(server + '/', data, headers)
+                body = json.loads(raw)
+                if body.get('event') != 'message':
+                    raise MacroExecutionError('ntfy: server did not acknowledge a published notification')
+                return {'channel': 'ntfy', 'target': topic}
+            if provider == 'Pushover':
+                token = _sequent_notification_env(action.get('pushover_token_env', 'SEQUENT_PUSHOVER_TOKEN'))
+                user = _sequent_notification_env(action.get('pushover_user_env', 'SEQUENT_PUSHOVER_USER'))
+                params = {'token':token,'user':user,'title':title,
+                          'message':message,'priority':{'Low':-1,'Normal':0,'High':1}.get(priority,0)}
+                data = urlparse.urlencode(params).encode('utf-8')
+                raw = _sequent_notification_https('https://api.pushover.net/1/messages.json',
+                                                   data, {'Content-Type':'application/x-www-form-urlencoded'})
+                response = json.loads(raw)
+                if response.get('status') != 1:
+                    raise MacroExecutionError('Pushover: message not accepted by API')
+                return {'channel': 'Pushover', 'target': 'configured device'}
+            raise MacroExecutionError(f'Notification: unknown phone provider {provider!r}')
+        if channel == 'notify_email':
+            recipient = str(engine.interpolate(str(action.get('email_to','')))).strip()
+            sender = str(engine.interpolate(str(action.get('email_from','')))).strip()
+            username = str(action.get('smtp_user', '')).strip()
+            host = str(action.get('smtp_host','')).strip()
+            port = int(action.get('smtp_port',587))
+            security = action.get('smtp_security', 'STARTTLS')
+            # Strictly one mailbox per field; prevent accidental bulk mail or header injection.
+            for address in (recipient,sender):
+                if ('@' not in address or any(x in address for x in ('\r','\n',',',';'))):
+                    raise MacroExecutionError('Email: supply one valid sender and recipient address')
+            if (not host or any(c.isspace() for c in host) or
+                    not 1 <= port <= 65535 or security not in ('STARTTLS','SSL/TLS')):
+                raise MacroExecutionError('Email: invalid SMTP host, port, or TLS mode')
+            letter = EmailMessage()
+            letter['From'], letter['To'] = sender, recipient
+            letter['Subject'] = str(engine.interpolate(str(action.get('email_subject', 'Sequent update'))))
+            letter.set_content(message)
+            ssl_context = ssl.create_default_context()
+            server_class = smtplib.SMTP_SSL if security == 'SSL/TLS' else smtplib.SMTP
+            with server_class(host, port, timeout=15, **({'context': ssl_context} if security == 'SSL/TLS' else {})) as smtp:
+                if security == 'STARTTLS':
+                    smtp.ehlo()
+                    smtp.starttls(context=ssl_context)
+                    smtp.ehlo()
+                if username:
+                    password = _sequent_notification_env(action.get('smtp_password_env', 'SEQUENT_SMTP_PASSWORD'))
+                    smtp.login(username, password)
+                smtp.send_message(letter)
+            return {'channel': 'SMTP email', 'target': recipient}
+        raise MacroExecutionError('Unknown notification action type')
+    except MacroExecutionError:
+        raise
+    except (OSError, ValueError, KeyError, ssl.SSLError, smtplib.SMTPException,
+            urlerror.URLError, json.JSONDecodeError) as exc:
+        # Do not include raw server responses or request URLs in errors:
+        # they may contain sensitive information sent by the remote endpoint.
+        raise MacroExecutionError(f'Notification delivery failed ({type(exc).__name__}); '
+                                  'check settings, access, and connection') from exc
+
+# Multi-field Request Form → JSON. Files share the same relative base as Read/Write JSON.
+_JSON_FORM_PROPERTY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+def sequent_validate_json_form_fields(fields):
+    if not isinstance(fields, list) or not 1 <= len(fields) <= 20:
+        raise MacroExecutionError('Request Form → JSON requires 1 to 20 fields')
+    seen = set()
+    for item in fields:
+        if not isinstance(item, dict):
+            raise MacroExecutionError('Each form field must be an object')
+        label = str(item.get('label', '')).strip()
+        key = str(item.get('key', '')).strip()
+        if not label or not _JSON_FORM_PROPERTY.fullmatch(key):
+            raise MacroExecutionError('Each field needs a label and a JSON property name '
+                                      '(letters, digits, underscores; cannot begin with a digit)')
+        if key in seen:
+            raise MacroExecutionError(f'Duplicate JSON form property: {key}')
+        seen.add(key)
+    return fields
+
+
+def sequent_validate_json_form_key_path(path):
+    path = str(path).strip()
+    if path and not all(_JSON_FORM_PROPERTY.fullmatch(part) for part in path.split('.')):
+        raise MacroExecutionError('JSON key path must contain property names separated by dots')
+    return path
+
+
+def sequent_json_form_store(engine, action, answers):
+    """Append a record or merge fields, preserving existing JSON atomically.
+
+    Only called after an accepted form. Exposes the resulting path/index through
+    local variables so a later Read JSON can fetch e.g. entries.${_last_json_form_index}.notes.
+    """
+    fields = sequent_validate_json_form_fields(action.get('fields', []))
+    if not isinstance(answers, dict):
+        raise MacroExecutionError('Request Form → JSON: invalid form result')
+    values = {}
+    for item in fields:
+        key = str(item['key']).strip()
+        answer = answers.get(key, '')
+        if not isinstance(answer, str):
+            raise MacroExecutionError(f'Input {key} must be text')
+        if item.get('required') and not answer.strip():
+            raise MacroExecutionError(f'{item["label"]} is required')
+        values[key] = answer
+    raw_path = engine.interpolate(str(action.get('path', '')).strip())
+    if not raw_path:
+        raise MacroExecutionError('Request Form → JSON requires a file path')
+    path = Path(os.path.expandvars(os.path.expanduser(raw_path)))
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / 'presets' / 'files' / path
+    mode = action.get('mode', 'Append Record')
+    if mode not in ('Append Record', 'Update Object'):
+        raise MacroExecutionError(f'Unknown JSON form storage mode: {mode}')
+    key_path = sequent_validate_json_form_key_path(engine.interpolate(str(action.get('key', 'entries'))))
+    try:
+        if path.exists():
+            # Never reinterpret a corrupt or incompatible existing file as empty.
+            document = json.loads(path.read_text(encoding='utf-8-sig'))
+        else:
+            document = {} if key_path else ([] if mode == 'Append Record' else {})
+        target = document
+        if key_path:
+            if not isinstance(document, dict):
+                raise MacroExecutionError('JSON root must be an object for a named key path')
+            parts = key_path.split('.')
+            for part in parts[:-1]:
+                if part not in target:
+                    target[part] = {}
+                target = target[part]
+                if not isinstance(target, dict):
+                    raise MacroExecutionError(f'JSON parent at {part!r} is not an object')
+            leaf = parts[-1]
+            if leaf not in target:
+                target[leaf] = [] if mode == 'Append Record' else {}
+            container = target[leaf]
+        else:
+            container = document
+        if mode == 'Append Record':
+            if not isinstance(container, list):
+                raise MacroExecutionError('Append Record requires a JSON array at the selected key')
+            index = len(container)
+            container.append(values)
+        else:
+            if not isinstance(container, dict):
+                raise MacroExecutionError('Update Object requires a JSON object at the selected key')
+            container.update(values)
+            index = None
+        if action.get('create_dirs', True):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        # Only change the file after all validation succeeds.
+        sequent_atomic_text_write(path, json.dumps(document, indent=2, ensure_ascii=False) + '\n', 'utf-8')
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise MacroExecutionError(f'Request Form → JSON: {exc}') from exc
+    engine.app.variables['_last_json_form_path'] = str(path)
+    engine.app.variables['_last_json_form_index'] = str(index) if index is not None else ''
+    engine.app.variables['_last_json_form_record'] = json.dumps(values, ensure_ascii=False)
+    return {'path': str(path), 'index': index, 'fields': len(values), 'key': key_path, 'mode': mode}
+
+
 def sequent_json_get(document, key):
     current = document
     for part in key.split('.'):
@@ -7518,8 +7766,18 @@ class SequentDynamicEngine:
             destination = action.get('var_name', '')
             self._assign_variable(destination, transformed, action.get('var_scope'))
             result = {'variable':destination, 'value':transformed}
+        elif typ == 'prompt_json_form':
+            fields = sequent_validate_json_form_fields(action.get('fields', []))
+            values = self.app.prompt_user_json_form(action, self.interpolate)
+            if values is None:
+                raise MacroCancelled('Request Form → JSON cancelled; no file was changed')
+            if not idle and not self.app.playing:
+                raise MacroCancelled('Request Form → JSON stopped; no file was changed')
+            result = sequent_json_form_store(self, action, values)
         elif typ in ('file_read', 'file_write', 'json_read', 'json_write'):
             result = sequent_file_action(self, action)
+        elif typ in ('notify_phone', 'notify_email'):
+            result = sequent_send_notification(self, action)
         elif typ == 'load_text_variable':
             result = sequent_text_file_to_variable(self.app, action)
         elif typ == 'placement_guide':
@@ -8155,9 +8413,12 @@ class VSCodeQueueViewer(tk.Frame):
             ("Write File", "Create, overwrite or append a text file.", "WF"),
             ("Read JSON", "Read a JSON key or document into a variable.", "RJ"),
             ("Write JSON", "Set/delete JSON keys, append arrays, or replace a document.", "WJ"),
+            ("Send Phone Alert", "Push an alert to an ntfy/Pushover phone app.", "PN"),
+            ("Send Email", "Send a variable-filled email through SMTP.", "EM"),
 
             ("Clipboard Branch / Fallback", "On a keyword miss, set a Local/Global variable and/or run a macro.", "CB"),
             ("Request Input", "Ask the user for a value at runtime.", "IN"),
+            ("Request Form → JSON", "Ask for multiple text values and save them together to JSON.", "JF"),
             ("Request Choice", "Display custom buttons that save a choice or run saved macros.", "CH"),
             ("Type Variable", "Type the value of a saved variable.", "VR"),
             ("Text Processing", "Regex extract, replace, split, or format text variables.", "TX"),
@@ -9330,6 +9591,7 @@ class VSCodeQueueViewer(tk.Frame):
             "clip_fallback": "Clipboard Branch / Fallback",
             "gate_check": "Gate Check",
             "prompt_input": "Request Input",
+            "prompt_json_form": "Request Form → JSON",
             "prompt_choice": "Request Choice",
             "type_variable": "Type Variable",
             "search_area": "Search selected area",
@@ -9817,6 +10079,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Read Clipboard": self._render_read_clipboard_view,
             "Clipboard Branch / Fallback": self._render_clipboard_fallback_view,
             "Request Input": self._render_request_input_view,
+            "Request Form → JSON": self._render_request_json_form_view,
             "Request Choice": self._render_request_choice_view,
             "Type Variable": self._render_type_variable_view,
             "Search selected area": self._render_search_area_view,
@@ -11747,6 +12010,124 @@ class VSCodeQueueViewer(tk.Frame):
                      hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X, pady=(8, 0))
 
 
+    def _render_request_json_form_view(self, line_num, edit_idx=None):
+        """Configure a multi-field runtime prompt persisted as one JSON record."""
+        body = self.action_content_frame
+        old = (self.app.recorded_actions[edit_idx] if edit_idx is not None
+               and 0 <= edit_idx < len(self.app.recorded_actions) else {})
+        if old.get('type') != 'prompt_json_form':
+            old = {}
+
+        def field(label, initial='', *, parent=body):
+            tk.Label(parent, text=label, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8, 'bold'), anchor='w').pack(fill=tk.X, pady=(7, 2))
+            entry = tk.Entry(parent, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                             insertbackground=TEXT_PRIMARY, highlightthickness=1,
+                             highlightbackground=BG_BORDER, bd=0, font=('Segoe UI', 9))
+            entry.insert(0, str(initial))
+            entry.pack(fill=tk.X, ipady=4)
+            return entry
+
+        title = field('DIALOG TITLE', old.get('title', 'Save information'))
+        message = field('INSTRUCTIONS', old.get('message', 'Enter the details to save:'))
+        path = field('JSON FILE PATH (${variables} supported)', old.get('path', 'saved_entries.json'))
+        tk.Label(body, text='STORAGE MODE', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(9, 2))
+        mode = tk.StringVar(value=old.get('mode', 'Append Record'))
+        tk.OptionMenu(body, mode, 'Append Record', 'Update Object').pack(fill=tk.X)
+        destination = field('JSON KEY PATH (e.g. entries; empty = root array/object)',
+                            old.get('key', 'entries'))
+        tk.Label(body, text='Append Record adds a new object to a JSON array. Update Object merges '
+                 'your answers into an object, preserving its other keys. Existing records are not erased.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 wraplength=430, justify=tk.LEFT).pack(anchor='w', pady=(5, 8))
+        allow_dirs = tk.BooleanVar(value=bool(old.get('create_dirs', True)))
+        tk.Checkbutton(body, text='Create folders if needed', variable=allow_dirs,
+                       bg=BG_PANEL, fg=TEXT_PRIMARY, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, activeforeground=TEXT_PRIMARY).pack(anchor='w')
+
+        tk.Label(body, text='INPUT FIELDS (dragging not required)', bg=BG_PANEL,
+                 fg=SYNTAX_BLUE, font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(12, 5))
+        holder = tk.Frame(body, bg=BG_PANEL)
+        holder.pack(fill=tk.X)
+        rows = []
+
+        def add_input(config=None):
+            config = config or {}
+            if len(rows) >= 20:
+                return
+            panel = tk.Frame(holder, bg=BG_PANEL, highlightbackground=BG_BORDER,
+                             highlightthickness=1, padx=8, pady=7)
+            panel.pack(fill=tk.X, pady=3)
+            record = {'panel': panel}
+            record['label'] = field('Prompt label', config.get('label', ''), parent=panel)
+            record['key'] = field('JSON property name', config.get('key', ''), parent=panel)
+            record['default'] = field('Default value (optional, supports ${variables})',
+                                      config.get('default', ''), parent=panel)
+            record['required'] = tk.BooleanVar(value=bool(config.get('required', False)))
+            tk.Checkbutton(panel, text='Required', variable=record['required'],
+                           bg=BG_PANEL, fg=TEXT_PRIMARY, selectcolor=BG_INPUT,
+                           activebackground=BG_PANEL).pack(anchor='w', pady=(3, 0))
+            def remove():
+                rows.remove(record)
+                panel.destroy()
+            tk.Button(panel, text='Remove field', bg=BG_INPUT, fg=COLOR_DANGER,
+                      bd=0, command=remove).pack(anchor='e')
+            rows.append(record)
+
+        previous = old.get('fields', [{'label': 'Part Number', 'key': 'part_number', 'required': True},
+                                     {'label': 'Description', 'key': 'description'},
+                                     {'label': 'Notes', 'key': 'notes'}])
+        for config in previous if isinstance(previous, list) else []:
+            if isinstance(config, dict):
+                add_input(config)
+        tk.Button(body, text='+ Add Text Field', command=add_input,
+                  bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0).pack(fill=tk.X, pady=(6, 9))
+        if edit_idx is None:
+            position = tk.StringVar(value=f'Before Line {line_num}')
+            tk.OptionMenu(body, position, f'Before Line {line_num}',
+                          f'After Line {line_num}').pack(fill=tk.X, pady=(3, 8))
+        error = tk.Label(body, text='', bg=BG_PANEL, fg=COLOR_DANGER,
+                         wraplength=440, justify=tk.LEFT)
+        error.pack(fill=tk.X)
+
+        def save():
+            try:
+                configs = []
+                if not 1 <= len(rows) <= 20:
+                    raise ValueError('Provide between 1 and 20 text fields')
+                for record in rows:
+                    configs.append({'label': record['label'].get().strip(),
+                                    'key': record['key'].get().strip(),
+                                    'default': record['default'].get(),
+                                    'required': record['required'].get()})
+                sequent_validate_json_form_fields(configs)
+                if not path.get().strip():
+                    raise ValueError('Select a JSON file path')
+                if mode.get() not in ('Append Record', 'Update Object'):
+                    raise ValueError('Select a valid storage mode')
+                sequent_validate_json_form_key_path(destination.get().strip())
+                action = {'type': 'prompt_json_form', 'title': title.get().strip() or 'Save information',
+                          'message': message.get(), 'path': path.get().strip(),
+                          'key': destination.get().strip(), 'mode': mode.get(),
+                          'create_dirs': allow_dirs.get(), 'fields': configs}
+                idx = edit_idx if edit_idx is not None else max(0, min(
+                    line_num - 1 if 'After' in position.get() else line_num - 2,
+                    len(self.app.recorded_actions)))
+                if edit_idx is not None:
+                    self.app.recorded_actions[idx] = action
+                else:
+                    self.app.recorded_actions.insert(idx, action)
+                self.close_sub_menu()
+                self.app.display_actions_in_queue(self.app.recorded_actions)
+                self.app.set_active_action_index(idx)
+                self.app.update_status('Request Form → JSON saved', COLOR_SUCCESS)
+            except (ValueError, MacroExecutionError) as exc:
+                error.config(text=str(exc))
+        ModernButton(body, text='Save Changes' if edit_idx is not None else 'Add Request Form → JSON',
+                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                     command=save).pack(fill=tk.X, pady=(5, 12))
+
     def _render_request_choice_view(self, line_num, edit_idx=None):
         """Configure a runtime dialog with user-defined macro/variable buttons."""
         body = self.action_content_frame
@@ -12450,6 +12831,13 @@ class VSCodeQueueViewer(tk.Frame):
                 tk.Checkbutton(body,variable=val,bg=BG_PANEL,fg=TEXT_PRIMARY,
                                selectcolor=BG_INPUT,activebackground=BG_PANEL).pack(anchor='w')
                 vars_[key]=(kind,val)
+            elif kind=='multiline':
+                field=tk.Text(body,height=5,bg=BG_INPUT,fg=TEXT_PRIMARY,
+                              font=('Consolas',9),insertbackground=TEXT_PRIMARY,
+                              wrap='word',bd=0,highlightbackground=BG_BORDER,highlightthickness=1)
+                field.insert('1.0',str(old.get(key,default)))
+                field.pack(fill=tk.X, pady=(0, 3))
+                vars_[key]=(kind,field)
             elif kind=='json':
                 field=tk.Text(body,height=5,bg=BG_INPUT,fg=SYNTAX_GREEN,
                               font=('Consolas',9),insertbackground=TEXT_PRIMARY,
@@ -12575,6 +12963,16 @@ class VSCodeQueueViewer(tk.Frame):
                          'Use the queue to order your IF / ELSE / END IF and LOOP / END LOOP actions.',
                      bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',9),wraplength=450,
                      justify='left').pack(fill=tk.X,pady=(4,8))
+        if type_name in ('notify_phone', 'notify_email'):
+            hint = ('Requires Internet access and a subscribed phone app. For ntfy.sh, '
+                    'treat unprotected topics as public and never send confidential work data. '
+                    'Pushover keys must be supplied through Windows environment variables.'
+                    if type_name == 'notify_phone' else
+                    'Requires an authorized SMTP account, network access, and TLS. '
+                    'Use an app-specific password in an environment variable, never your '
+                    'normal account password. Some work accounts block SMTP.')
+            tk.Label(body,text=hint,bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',8),
+                     wraplength=460,justify='left').pack(fill=tk.X,pady=(3,8))
         if type_name=='load_text_variable':
             tk.Label(body, text='Reads the complete UTF-8 file on every run and stores its '
                          'text unchanged in the selected Local or Global variable. '
@@ -12663,7 +13061,7 @@ class VSCodeQueueViewer(tk.Frame):
             try:
                 action=dict(old,type=type_name)
                 for key,(kind,var) in vars_.items():
-                    val=var.get('1.0','end').strip() if kind=='json' else var.get()
+                    val=var.get('1.0','end-1c') if kind in ('json','multiline') else var.get()
                     if kind=='int':val=int(val)
                     elif kind=='float':val=float(val)
                     elif kind=='area':val=list(dynamic_area(val))
@@ -20261,6 +20659,10 @@ class BuiltInMacroApp:
             if act_type == 'loop_end': return "↻ END LOOP"
             if act_type == 'loop_break': return "↳ BREAK LOOP"
             detail = action.get('name') or action.get('match') or action.get('path') or action.get('var_name') or action.get('kind') or ''
+            if act_type == 'notify_phone':
+                detail = action.get('provider', 'ntfy')
+            elif act_type == 'notify_email':
+                detail = action.get('email_to', '')
             if act_type in ('set_variable', 'ocr_extract'):
                 detail = f"{action.get('var_scope', 'local')}: {action.get('var_name', '')}"
             return f"{kind}({str(detail)[:34]})"
@@ -20317,6 +20719,10 @@ class BuiltInMacroApp:
             kws = action.get('keywords', [])
             preview = kws[0] if len(kws) == 1 else f"{len(kws)} keywords"
             return f"clipboard.find({preview!r} -> ${action.get('var_name')} [legacy])"
+        elif act_type == "prompt_json_form":
+            return (f"user.form_to_json({action.get('path', 'data.json')!r}, "
+                    f"{len(action.get('fields', []))} text fields, "
+                    f"{action.get('mode', 'Append Record')})")
         elif act_type == "prompt_choice":
             return f"user.choice({action.get('title', 'Choose an option')!r}, {len(action.get('choices', []))} buttons)"
         elif act_type == "prompt_input": 
@@ -24829,6 +25235,120 @@ try {{
         self.queue_viewer.code_text.yview_moveto(old_scroll[0])
         self.queue_viewer.gutter.yview_moveto(old_scroll[0])
 
+
+    def prompt_user_json_form(self, action, interpolate):
+        """Collect several strings in one native Tk window on the UI thread."""
+        import threading
+        fields = sequent_validate_json_form_fields(action.get('fields', []))
+        done = threading.Event()
+        result = {'data': None, 'error': None}
+        window = [None]
+
+        def show():
+            dlg = None
+            try:
+                dlg = tk.Toplevel(self.root)
+                window[0] = dlg
+                dlg.title(str(action.get('title', 'Save information')))
+                dlg.configure(bg=BG_PANEL)
+                dlg.resizable(True, True)
+                dlg.minsize(400, 300)
+                dlg.transient(self.root)
+                dlg.attributes('-topmost', True)
+                width = 495
+                height = min(690, max(335, 195 + 62 * len(fields)))
+                dlg.geometry(f'{width}x{height}')
+                dlg.update_idletasks()
+                # Native Windows window movement and resize only; no custom drag handlers.
+                try:
+                    x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+                    y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+                    if os.name == 'nt':
+                        position_toplevel_on_screen(dlg, x, y, width, height, activate=True)
+                    else:
+                        dlg.geometry(f'{width}x{height}+{max(0, x)}+{max(0, y)}')
+                except (OSError, tk.TclError):
+                    pass
+
+                header = tk.Frame(dlg, bg=BG_PANEL, padx=18, pady=15)
+                header.pack(fill=tk.X)
+                tk.Label(header, text=str(action.get('title', 'Save information')),
+                         bg=BG_PANEL, fg=SYNTAX_BLUE, font=('Segoe UI', 13, 'bold'),
+                         wraplength=445, justify='left').pack(anchor='w')
+                tk.Label(header, text=str(action.get('message', 'Enter the details to save:')),
+                         bg=BG_PANEL, fg=TEXT_PRIMARY, font=('Segoe UI', 9),
+                         wraplength=445, justify='left').pack(anchor='w', pady=(7, 0))
+
+                canvas = tk.Canvas(dlg, bg=BG_PANEL, highlightthickness=0, bd=0)
+                scrollbar = tk.Scrollbar(dlg, orient='vertical', command=canvas.yview)
+                canvas.configure(yscrollcommand=scrollbar.set)
+                scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                canvas.pack(fill=tk.BOTH, expand=True, padx=(18, 0))
+                form = tk.Frame(canvas, bg=BG_PANEL)
+                form_id = canvas.create_window((0, 0), window=form, anchor='nw')
+                form.bind('<Configure>', lambda _e: canvas.configure(scrollregion=canvas.bbox('all')))
+                canvas.bind('<Configure>', lambda e: canvas.itemconfigure(form_id, width=e.width))
+                inputs = {}
+                for config in fields:
+                    key = str(config['key']).strip()
+                    label = str(config['label']).strip() + (' *' if config.get('required') else '')
+                    tk.Label(form, text=label, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                             font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(7, 3))
+                    entry = tk.Entry(form, bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0,
+                                     font=('Segoe UI', 10), insertbackground=TEXT_PRIMARY,
+                                     highlightbackground=BG_BORDER, highlightthickness=1)
+                    entry.pack(fill=tk.X, ipady=5, padx=(0, 12), pady=(0, 7))
+                    entry.insert(0, str(interpolate(str(config.get('default', '')))))
+                    inputs[key] = entry
+                footer = tk.Frame(dlg, bg=BG_PANEL, padx=18, pady=12)
+                footer.pack(side=tk.BOTTOM, fill=tk.X)
+                validation = tk.Label(footer, text='', bg=BG_PANEL, fg=COLOR_DANGER,
+                                      wraplength=445, anchor='w')
+                validation.pack(fill=tk.X, pady=(0, 3))
+
+                def finish(data=None):
+                    if done.is_set():
+                        return
+                    result['data'] = data
+                    done.set()
+                    try:
+                        dlg.destroy()
+                    except tk.TclError:
+                        pass
+
+                def submit(_event=None):
+                    values = {key: entry.get() for key, entry in inputs.items()}
+                    for config in fields:
+                        if config.get('required') and not values[config['key']].strip():
+                            validation.configure(text=f'{config["label"]} is required')
+                            inputs[config['key']].focus_set()
+                            return
+                    finish(values)
+                ModernButton(footer, text='Save to JSON', bg_color=COLOR_ACCENT,
+                             hover_color=COLOR_ACCENT_HOV, command=submit).pack(side=tk.RIGHT)
+                tk.Button(footer, text='Cancel', bg=BG_INPUT, fg=TEXT_PRIMARY,
+                          bd=0, command=finish).pack(side=tk.RIGHT, padx=(0, 9), ipadx=8, ipady=5)
+                dlg.protocol('WM_DELETE_WINDOW', finish)
+                dlg.bind('<Escape>', lambda _e: finish())
+                if inputs:
+                    next(iter(inputs.values())).focus_set()
+            except Exception as exc:
+                result['error'] = str(exc)
+                done.set()
+                if dlg is not None:
+                    try: dlg.destroy()
+                    except tk.TclError: pass
+
+        self.root.after(0, show)
+        while not done.wait(0.05):
+            if not self.playing and not self.recording:
+                if window[0] is not None:
+                    try: self.root.after(0, window[0].destroy)
+                    except tk.TclError: pass
+                return None
+        if result['error']:
+            raise MacroExecutionError(f'Request Form → JSON dialog: {result["error"]}')
+        return result['data']
 
     def prompt_user_choice(self, action):
         """Show a choice dialog on Tk's main thread; wait on playback worker."""
