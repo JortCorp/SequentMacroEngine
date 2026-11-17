@@ -9186,7 +9186,7 @@ class VSCodeQueueViewer(tk.Frame):
             pass
 
     def _on_queue_ctrl_release(self, event):
-        """Disarm drag if the user releases either Ctrl key mid-gesture."""
+        """Disarm reordering when Alt is released mid-gesture."""
         if self._dnd_pressed:
             self._cancel_queue_drag()
             return "break"
@@ -9215,8 +9215,8 @@ class VSCodeQueueViewer(tk.Frame):
             self.app.current_action_idx = act_idx
             if self.app.recording or self.app.playing or self.app.chain_running:
                 return "break"
-            alt = self._queue_modifier_down(VK_MENU)
-            ctrl = self._queue_modifier_down(VK_CONTROL)
+            alt = self._queue_modifier_down(VK_MENU) or bool(event.state & 0x0008)
+            ctrl = self._queue_modifier_down(VK_CONTROL) or bool(event.state & 0x0004)
             self._queue_gesture = "reorder" if alt and not ctrl else ("select" if ctrl and not alt else "none")
             if self._queue_gesture == "reorder":
                 self._dnd_start_idx = act_idx
@@ -9252,7 +9252,7 @@ class VSCodeQueueViewer(tk.Frame):
         if self._queue_gesture != "reorder" or not self._dnd_pressed:
             return "break"  # Ordinary drag never selects or reorders.
         start = self._dnd_start_idx
-        if (not self.interactive_enabled or not (self._queue_alt_down(event)) or
+        if (not self.interactive_enabled or not (self._queue_modifier_down(VK_MENU)) or
                 self.app.recording or self.app.playing or self.app.chain_running or
                 start is None or not 0 <= start < len(self.app.recorded_actions) or
                 self.app.recorded_actions[start] is not self._dnd_action_identity):
@@ -9279,11 +9279,12 @@ class VSCodeQueueViewer(tk.Frame):
 
     def _on_code_release(self, event):
         had_gesture = self._dnd_pressed
+        was_reorder = self._queue_gesture == "reorder"
         start = self._dnd_start_idx
         end = self._dnd_hover_idx
         original_action = self._dnd_action_identity
         should_reorder = (
-            had_gesture and self._dnd_active and (self._queue_alt_down(event)) and
+            was_reorder and had_gesture and self._dnd_active and self._queue_modifier_down(VK_MENU) and
             start is not None and end is not None and start != end and
             self.interactive_enabled and
             not (self.app.playing or self.app.recording or self.app.chain_running) and
