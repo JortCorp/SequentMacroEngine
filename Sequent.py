@@ -8130,7 +8130,7 @@ class SequentDynamicEngine:
 
 # --- VS Code-Style Playback Queue Viewer ---
 class VSCodeQueueViewer(tk.Frame):
-    # Reorder only with Ctrl + left mouse drag. A small movement threshold
+    # Reorder only with Alt + left mouse drag. A small movement threshold
     # distinguishes dragging from an ordinary Ctrl-click; no hold timer.
     QUEUE_DRAG_SLOP_PX = 5
     # Categorized action catalog. Existing action type names are unchanged,
@@ -8221,6 +8221,7 @@ class VSCodeQueueViewer(tk.Frame):
         self.sub_menu = None
         # Queue gestures are independent of the OS input recorder.
         # Mouse-down must begin with Ctrl held; no asynchronous hold timer.
+        self._selection_anchor = None
         self._dnd_pressed = False
         self._dnd_active = False
         self._dnd_start_idx = None
@@ -8306,12 +8307,14 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter.bind("<Double-Button-1>", self._on_double_click)
         self.code_text.bind("<Double-Button-1>", self._on_double_click)
 
-        self.code_text.bind("<<Selection>>", self._on_text_selection_changed)
+        # Selection is explicitly enabled with Ctrl+drag; previews run on mouse-up.
+        # Avoid rescanning screen pixels on every selection-motion event.
+        self.code_text.bind("<<Selection>>", lambda event: None)
         self.code_text.bind("<B1-Motion>", self._on_dnd_motion)
         self.code_text.bind("<ButtonRelease-1>", self._on_code_release)
-        # If Ctrl is released while dragging, cancel before mouse-up.
-        self.code_text.bind("<KeyRelease-Control_L>", self._on_queue_ctrl_release)
-        self.code_text.bind("<KeyRelease-Control_R>", self._on_queue_ctrl_release)
+        # Alt+drag reorders; Ctrl+drag selects. Releasing modifiers cancels reordering.
+        self.code_text.bind("<KeyRelease-Alt_L>", self._on_queue_ctrl_release)
+        self.code_text.bind("<KeyRelease-Alt_R>", self._on_queue_ctrl_release)
 
         self.code_text.tag_configure("active_line", background="#36394a")
         self.code_text.tag_lower("active_line")
@@ -9191,6 +9194,7 @@ class VSCodeQueueViewer(tk.Frame):
         if self.sub_menu and self.sub_menu.winfo_exists():
             self.close_sub_menu()
         self._cancel_queue_drag()
+        self._selection_anchor = None
         if not self.interactive_enabled:
             return "break"
         try:
@@ -9199,31 +9203,46 @@ class VSCodeQueueViewer(tk.Frame):
             act_idx = line_num - 2
             if not 0 <= act_idx < len(self.app.recorded_actions):
                 return "break"
-            # A click still selects immediately; reorder is never implicit.
             self.app.set_active_action_index(act_idx)
             if self.app.recording or self.app.playing or self.app.chain_running:
                 return "break"
-            # Ctrl must already be down on mouse press, and Shift+click still
-            # performs its normal text/range selection behavior.
-            if not (event.state & 0x0004) or (event.state & 0x0001):
-                return "break"
-            self._dnd_start_idx = act_idx
-            self._dnd_press_screen_xy = (event.x_root, event.y_root)
-            self._dnd_action_identity = self.app.recorded_actions[act_idx]
-            self._dnd_pressed = True
-            self.code_text.focus_set()
-            self.code_text.config(cursor="fleur")
-            # Prevent the Text widget from treating Ctrl+drag as text selection.
+            if event.state & 0x0008:  # Alt+drag: reorder.
+                self._dnd_start_idx = act_idx
+                self._dnd_press_screen_xy = (event.x_root, event.y_root)
+                self._dnd_action_identity = self.app.recorded_actions[act_idx]
+                self._dnd_pressed = True
+                self.code_text.focus_set()
+                self.code_text.config(cursor="fleur")
+            elif event.state & 0x0004:  # Ctrl+drag: select a range.
+                self._selection_anchor = clicked_pos
+                self.code_text.mark_set("insert", clicked_pos)
+                self.code_text.tag_remove("sel", "1.0", "end")
+                self.code_text.focus_set()
+            else:  # Normal click: place cursor, no selection drag.
+                self.code_text.mark_set("insert", clicked_pos)
+                self.code_text.tag_remove("sel", "1.0", "end")
             return "break"
         except (tk.TclError, ValueError, IndexError):
             self._cancel_queue_drag()
         return "break"
 
     def _on_dnd_motion(self, event):
+        if self._selection_anchor is not None:
+            try:
+                current = self.code_text.index(f"@{event.x},{event.y}")
+                anchor = self._selection_anchor
+                self.code_text.tag_remove("sel", "1.0", "end")
+                if self.code_text.compare(anchor, "<", current):
+                    self.code_text.tag_add("sel", anchor, current)
+                elif self.code_text.compare(current, "<", anchor):
+                    self.code_text.tag_add("sel", current, anchor)
+            except tk.TclError:
+                pass
+            return "break"
         if not self._dnd_pressed:
-            return "break"  # Queue rows are actions, not selectable text.
+            return "break"  # Ordinary drag never selects or reorders.
         start = self._dnd_start_idx
-        if (not self.interactive_enabled or not (event.state & 0x0004) or
+        if (not self.interactive_enabled or not (event.state & 0x0008) or
                 self.app.recording or self.app.playing or self.app.chain_running or
                 start is None or not 0 <= start < len(self.app.recorded_actions) or
                 self.app.recorded_actions[start] is not self._dnd_action_identity):
@@ -9254,7 +9273,7 @@ class VSCodeQueueViewer(tk.Frame):
         end = self._dnd_hover_idx
         original_action = self._dnd_action_identity
         should_reorder = (
-            had_gesture and self._dnd_active and (event.state & 0x0004) and
+            had_gesture and self._dnd_active and (event.state & 0x0008) and
             start is not None and end is not None and start != end and
             self.interactive_enabled and
             not (self.app.playing or self.app.recording or self.app.chain_running) and
@@ -9262,6 +9281,8 @@ class VSCodeQueueViewer(tk.Frame):
             0 <= end < len(self.app.recorded_actions) and
             self.app.recorded_actions[start] is original_action
         )
+        had_selection = self._selection_anchor is not None
+        self._selection_anchor = None
         self._cancel_queue_drag()
         if should_reorder:
             before = self.app._begin_queue_deletion()  # Ctrl+Z preserves undo.
@@ -9280,12 +9301,15 @@ class VSCodeQueueViewer(tk.Frame):
             self.app.current_action_idx = shifted(self.app.current_action_idx)
             self.app._finish_queue_deletion(before, "Reordered Action")
             self.app.set_active_action_index(self.app.current_action_idx)
-        # Suppress Text's default mouse-up selection handling after Ctrl+drag.
-        return "break"  # Prevent Tk Text from extending a selection on release.
+        if had_gesture or had_selection:
+            self.code_text.after_idle(self._on_text_selection_changed)
+            return "break"
+        return "break"
 
     def _on_double_click(self, event):
         # A double-click is always edit, never the start of a long-press drag.
         self._cancel_queue_drag()
+        self._selection_anchor = None
         self._dnd_start_idx = None
         if not self.interactive_enabled or not self.app.recorded_actions:
             return "break"
