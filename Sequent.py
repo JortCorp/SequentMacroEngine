@@ -8227,6 +8227,9 @@ class VSCodeQueueViewer(tk.Frame):
         self._queue_press_xy = None      # absolute screen pixels
         self._queue_drag_started = False
         self._queue_original_action = None
+        self._queue_anchor_text = None   # character index on Ctrl mouse-down
+        self._queue_autoscroll_job = None
+        self._queue_drag_xy = None
         self._queue_range_anchor = None  # Shift+click selection support
 
         self._sub_drag_start_x = 0
@@ -8315,9 +8318,9 @@ class VSCodeQueueViewer(tk.Frame):
         self.gutter.bind("<Double-Button-1>", self._on_double_click)
         self.code_text.bind("<Double-Button-1>", self._on_double_click)
 
-        # Tk Text's built-in drag selection is suppressed by returning 'break'
-        # from *every* press/motion/release path. The queue selects whole rows.
-        # Redraw previews only after the completed gesture, never while moving.
+        # Tk Text's class-level handlers must not race the queue's custom gestures.
+        # Ctrl + drag paints a native-looking character selection in real time;
+        # Alt + drag moves actions. Heavy previews run only after mouse-up.
         self.code_text.bind("<<Selection>>", lambda event: None)
         for sequence in ("<B1-Motion>", "<Control-B1-Motion>",
                          "<Alt-B1-Motion>"):
@@ -8328,9 +8331,16 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.bind("<KeyRelease-Alt_L>", self._on_queue_alt_release)
         self.code_text.bind("<KeyRelease-Alt_R>", self._on_queue_alt_release)
         self.code_text.bind("<Escape>", self._on_queue_escape)
-        # An entire action is the selection unit, not an arbitrary text range.
-        self.code_text.configure(selectbackground=BG_HOVER,
+        # A separate high-priority visual tag keeps the selection obvious even
+        # when active-line backgrounds and syntax tags are present. The real
+        # Tk 'sel' tag is kept in sync for Delete, Copy and context menus.
+        selection_color = blend_hex(COLOR_ACCENT, BG_INPUT, 0.56)
+        self.code_text.configure(selectbackground=selection_color,
                                  selectforeground=TEXT_PRIMARY)
+        self.code_text.tag_configure('queue_selection_visual',
+                                     background=selection_color,
+                                     foreground=TEXT_PRIMARY)
+        self.code_text.tag_raise('queue_selection_visual')
 
         self.code_text.tag_configure("active_line", background="#36394a")
         self.code_text.tag_lower("active_line")
@@ -8786,7 +8796,7 @@ class VSCodeQueueViewer(tk.Frame):
         self._queue_range_anchor = None
         self.close_sub_menu()
         self.plus_btn.place_forget()
-        self.code_text.tag_remove("sel", "1.0", "end")  # Forcibly clear selections
+        self._queue_clear_selection()  # Forcibly clear both logical and visual selection
         self.code_text.tag_remove("active_line", "1.0", "end")
         self.gutter.tag_remove("active_line", "1.0", "end")
         self.line_count = 0
@@ -8918,6 +8928,75 @@ class VSCodeQueueViewer(tk.Frame):
 
         return "break"
     
+    def _queue_clear_selection(self):
+        """Clear logical text selection and the matching visible background."""
+        self.code_text.tag_remove('sel', '1.0', 'end')
+        self.code_text.tag_remove('queue_selection_visual', '1.0', 'end')
+
+    def _queue_set_selection(self, start, end):
+        """Show a Windows-style live selection and preserve Tk's real 'sel' tag.
+
+        Do not redraw the queue or trigger any coordinate previews here. The
+        selected characters can span actions, but Copy/Delete still use rows.
+        """
+        widget = self.code_text
+        a, b = widget.index(start), widget.index(end)
+        self._queue_clear_selection()
+        if widget.compare(a, '>', b):
+            a, b = b, a
+        if widget.compare(a, '<', b):
+            widget.tag_add('sel', a, b)
+            widget.tag_add('queue_selection_visual', a, b)
+            widget.tag_raise('queue_selection_visual')
+
+    def _queue_text_index_at(self, x, y):
+        """Translate widget-relative pixels into an action-text position."""
+        widget = self.code_text
+        cursor = widget.index(f'@{x},{y}')
+        if widget.compare(cursor, '<', '2.0'):
+            cursor = '2.0'
+        last = f'{len(self.app.recorded_actions) + 2}.0'
+        if widget.compare(cursor, '>', last):
+            cursor = last
+        return cursor
+
+    def _queue_paint_text_selection(self, event):
+        """Select exact character positions while Ctrl is held, like a Text box."""
+        if self._queue_anchor_text is None:
+            return
+        try:
+            cursor = self._queue_text_index_at(event.x, event.y)
+            self._queue_set_selection(self._queue_anchor_text, cursor)
+            self.code_text.mark_set('insert', cursor)
+        except tk.TclError:
+            pass
+
+    def _queue_autoscroll(self):
+        """Scroll slowly past the top/bottom edge during Ctrl+drag selection."""
+        self._queue_autoscroll_job = None
+        if self._queue_mode != 'select' or self._queue_drag_xy is None:
+            return
+        x, y = self._queue_drag_xy
+        height = self.code_text.winfo_height()
+        step = -1 if y < 0 else (1 if y >= height else 0)
+        if step == 0:
+            return
+        old = self.code_text.yview()
+        self.code_text.yview_scroll(step, 'units')
+        new = self.code_text.yview()
+        if old != new:
+            self.gutter.yview_moveto(new[0])
+            # The drag pointer is still outside, so the end index changes as
+            # the viewport moves. Never recalculate screen coordinates here.
+            try:
+                cursor = self._queue_text_index_at(x, y)
+                self._queue_set_selection(self._queue_anchor_text, cursor)
+                self.code_text.mark_set('insert', cursor)
+            except tk.TclError:
+                pass
+            self.redraw_breakpoints()
+            self._queue_autoscroll_job = self.code_text.after(65, self._queue_autoscroll)
+
     def selected_action_indices(self):
         """Return all action rows touched by Tk's selection, never the header.
 
@@ -8946,9 +9025,8 @@ class VSCodeQueueViewer(tk.Frame):
         """Make pasted actions visible and selected without selecting the header."""
         if first_index > last_index:
             return
-        self.code_text.tag_remove('sel', '1.0', 'end')
-        self.code_text.tag_add('sel', f'{first_index + 2}.0',
-                               f'{last_index + 3}.0')
+        self._queue_set_selection(f'{first_index + 2}.0',
+                                  f'{last_index + 3}.0')
         self.code_text.mark_set('insert', f'{first_index + 2}.0')
         self.code_text.see(f'{first_index + 2}.0')
 
@@ -9130,6 +9208,10 @@ class VSCodeQueueViewer(tk.Frame):
         return "break"
 
     def _on_viewer_motion(self, event):
+        # No layout work or annotation redraw during a queue drag gesture.
+        if (event.widget == self.code_text and
+                self._queue_mode in ('select', 'reorder')):
+            return
         # The inactive breakpoint preview belongs to the leftmost 18px only.
         hover_line = None
         if event.widget == self.gutter_margin and 0 <= event.x < 15 and self.interactive_enabled:
@@ -9196,6 +9278,15 @@ class VSCodeQueueViewer(tk.Frame):
         self._queue_press_xy = None
         self._queue_drag_started = False
         self._queue_original_action = None
+        self._queue_anchor_text = None
+        self._queue_drag_xy = None
+        job = getattr(self, '_queue_autoscroll_job', None)
+        if job is not None:
+            self._queue_autoscroll_job = None
+            try:
+                self.code_text.after_cancel(job)
+            except tk.TclError:
+                pass
         try:
             self.code_text.tag_remove("dnd_target", "1.0", "end")
             self.code_text.configure(cursor="xterm")
@@ -9241,8 +9332,7 @@ class VSCodeQueueViewer(tk.Frame):
         first = max(0, min(int(anchor), int(hover), count - 1))
         last = max(0, min(max(int(anchor), int(hover)), count - 1))
         try:
-            self.code_text.tag_remove("sel", "1.0", "end")
-            self.code_text.tag_add("sel", f"{first + 2}.0", f"{last + 3}.0")
+            self._queue_set_selection(f"{first + 2}.0", f"{last + 3}.0")
             self.code_text.mark_set("insert", f"{hover + 2}.0")
         except tk.TclError:
             pass
@@ -9266,83 +9356,101 @@ class VSCodeQueueViewer(tk.Frame):
         return "break"
 
     def _on_code_click(self, event, requested_mode=None):
-        """Lock select/reorder/idle once; never switch mode during a drag.
+        """Start one gesture, deriving Ctrl/Alt from the actual key state.
 
-        requested_mode is populated only by dedicated Control/Alt bindings.
-        A plain left-click MUST NOT start reordering, regardless of any stale
-        modifier-bit values emitted by the platform.
+        Tk may deliver <Button-1> instead of a modifier-specific sequence on
+        some Windows configurations. Don't depend on which binding wins.
         """
         if self.sub_menu and self.sub_menu.winfo_exists():
             self.close_sub_menu()
         self._cancel_queue_drag()
         if not self.interactive_enabled:
-            return "break"
+            return 'break'
         idx = self._queue_index_at(event)
         if idx is None:
-            return "break"
+            return 'break'
         self.app.current_action_idx = idx
         self._queue_range_anchor = idx
         try:
-            self.code_text.mark_set("insert", f"{idx + 2}.0")
+            self.code_text.mark_set('insert', f'{idx + 2}.0')
             self.code_text.focus_set()
         except tk.TclError:
-            return "break"
+            return 'break'
         if self.app.recording or self.app.playing or self.app.chain_running:
-            return "break"
+            return 'break'
 
-        # The explicit Alt/Ctrl binding is the authorization. If both are held,
-        # do neither; it must NEVER accidentally reorder.
         ctrl = bool(event.state & 0x0004)
-        alt = bool(event.state & 0x0008)
-        if requested_mode == "reorder" and ctrl:
-            requested_mode = None
-        if requested_mode == "select" and alt:
-            requested_mode = None
-        self._queue_mode = requested_mode if requested_mode in ("select", "reorder") else "idle"
+        alt = bool(event.state & (0x0008 | 0x20000))
+        if os.name == 'nt':
+            try:
+                user32 = ctypes.windll.user32
+                ctrl |= bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+                alt |= bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
+            except (AttributeError, OSError):
+                pass
+        # Dedicated widget bindings provide a fallback when a modifier bit
+        # is omitted. Never let Ctrl+Alt accidentally authorize a reorder.
+        if requested_mode == 'select':
+            ctrl = True
+        elif requested_mode == 'reorder':
+            alt = True
+        mode = 'idle'
+        if ctrl and not alt:
+            mode = 'select'
+        elif alt and not ctrl:
+            mode = 'reorder'
+
+        self._queue_mode = mode
         self._queue_anchor_idx = idx
         self._queue_hover_idx = idx
         self._queue_original_action = self.app.recorded_actions[idx]
         self._queue_press_xy = (event.x_root, event.y_root)
         self._queue_drag_started = False
-
-        if self._queue_mode == "select":
-            self._queue_paint_range(idx, idx)
-        elif self._queue_mode == "reorder":
-            self.code_text.tag_remove("sel", "1.0", "end")
-            self.code_text.configure(cursor="fleur")
-        else:
-            self.code_text.tag_remove("sel", "1.0", "end")
-        return "break"
+        self._queue_clear_selection()
+        if mode == 'select':
+            try:
+                self._queue_anchor_text = self.code_text.index(f'@{event.x},{event.y}')
+            except tk.TclError:
+                self._queue_anchor_text = f'{idx + 2}.0'
+        elif mode == 'reorder':
+            self.code_text.configure(cursor='fleur')
+        return 'break'
 
     def _on_dnd_motion(self, event):
-        """Keep the two mouse gestures independent, without Text class selection."""
+        """Ctrl selects characters live, Alt previews one reorder; plain drag inert."""
         mode = self._queue_mode
-        if mode not in ("select", "reorder"):
-            return "break"  # Bare left-drag never changes the queue.
+        if mode not in ('select', 'reorder'):
+            return 'break'
         anchor = self._queue_anchor_idx
         if (not self.interactive_enabled or anchor is None or
                 not 0 <= anchor < len(self.app.recorded_actions) or
                 self.app.recording or self.app.playing or self.app.chain_running or
                 self.app.recorded_actions[anchor] is not self._queue_original_action):
             self._cancel_queue_drag()
-            return "break"
+            return 'break'
         if not self._queue_drag_started:
             sx, sy = self._queue_press_xy
             if (abs(event.x_root - sx) <= self.QUEUE_DRAG_SLOP_PX and
                     abs(event.y_root - sy) <= self.QUEUE_DRAG_SLOP_PX):
-                return "break"
+                return 'break'
             self._queue_drag_started = True
         idx = self._queue_index_at(event, clamp=True)
-        if idx is None or idx == self._queue_hover_idx:
-            return "break"
-        self._queue_hover_idx = idx
-        if mode == "select":
-            # No screen scans, hover overlays or action redraws during movement.
-            self._queue_paint_range(anchor, idx)
-        else:
-            self.code_text.tag_remove("dnd_target", "1.0", "end")
-            self.code_text.tag_add("dnd_target", f"{idx + 2}.0", f"{idx + 2}.end+1c")
-        return "break"
+        if mode == 'select':
+            # Updating only when the *row* changes misses partial text drags.
+            # Selection uses the actual pointer column on EVERY motion event.
+            self._queue_paint_text_selection(event)
+            self._queue_hover_idx = idx
+            self._queue_drag_xy = (event.x, event.y)
+            if ((event.y < 0 or event.y >= self.code_text.winfo_height())
+                    and self._queue_autoscroll_job is None):
+                self._queue_autoscroll_job = self.code_text.after(
+                    65, self._queue_autoscroll)
+        elif idx is not None and idx != self._queue_hover_idx:
+            self._queue_hover_idx = idx
+            self.code_text.tag_remove('dnd_target', '1.0', 'end')
+            self.code_text.tag_add('dnd_target', f'{idx + 2}.0',
+                                   f'{idx + 2}.end+1c')
+        return 'break'
 
     def _on_code_release(self, event):
         """Commit an Alt reorder once, or preserve a completed Ctrl selection."""
@@ -9350,6 +9458,7 @@ class VSCodeQueueViewer(tk.Frame):
         start = self._queue_anchor_idx
         end = self._queue_hover_idx
         original_action = self._queue_original_action
+        selection_anchor = self._queue_anchor_text
         moved = self._queue_drag_started
         reorder = (
             mode == "reorder" and moved and start is not None and end is not None
@@ -9378,8 +9487,21 @@ class VSCodeQueueViewer(tk.Frame):
             self._queue_range_anchor = end
             self.app._finish_queue_deletion(before, "Reordered Action")
             self.app.set_active_action_index(self.app.current_action_idx)
-        elif mode == "select" and moved and start != end:
-            self.code_text.after_idle(self._on_text_selection_changed)
+        elif mode == 'select':
+            if moved:
+                # Commit the mouse-up endpoint even if there was no final
+                # B1-Motion event (common with rapid Windows mouse movement).
+                # _cancel_queue_drag cleared the anchor, so use the saved one.
+                if selection_anchor is not None:
+                    try:
+                        self._queue_set_selection(
+                            selection_anchor,
+                            self._queue_text_index_at(event.x, event.y))
+                    except tk.TclError:
+                        pass
+                self.code_text.after_idle(self._on_text_selection_changed)
+            elif start is not None:
+                self.select_action_range(start, start)
         return "break"
 
     def _on_double_click(self, event):
