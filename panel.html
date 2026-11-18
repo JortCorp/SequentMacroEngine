@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Sequent Remote — Portable Panel</title>
+<style>
+:root{--bg:#0c1017;--card:#151c27;--card2:#1c2734;--border:#2a3849;--ink:#eef3f9;--muted:#9aacbf;--accent:#f58b4d;--good:#62d9a7;--bad:#fa7780;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+*{box-sizing:border-box}body{margin:0;color:var(--ink);background:radial-gradient(ellipse at top,#242634 0%,var(--bg) 56%);min-height:100dvh}main{max-width:700px;margin:auto;padding:20px 15px 80px}.heading{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:14px 0 19px}.brand{display:flex;gap:12px;align-items:center}.logo{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;color:#121720;background:linear-gradient(130deg,#ffb565,var(--accent));font-weight:900;font-size:24px}.eyebrow{font-size:.69rem;letter-spacing:.18em;color:var(--accent);font-weight:800}h1{font-size:1.37rem;line-height:1.2;margin:2px 0 0}h2{font-size:1rem;margin:0 0 5px}.hint{color:var(--muted);font-size:.83rem;line-height:1.5}.badge{font-size:.72rem;border:1px solid var(--border);border-radius:100px;padding:7px 9px;color:var(--muted);white-space:nowrap}.badge.online{border-color:#32785c;color:var(--good)}.badge.error{border-color:#984b57;color:var(--bad)}.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:17px;margin:12px 0;box-shadow:0 8px 24px #0002}.hide{display:none!important}label{font-size:.83rem;color:#d6dfeb;display:block;font-weight:600;margin:14px 0 7px}input,select{width:100%;font:inherit;font-size:.96rem;background:#101822;color:var(--ink);border:1px solid var(--border);padding:12px 14px;border-radius:11px;min-height:46px}input:focus,select:focus{outline:2px solid #b66a3c;outline-offset:1px}button{font:inherit;border:1px solid var(--border);background:var(--card2);color:var(--ink);border-radius:11px;min-height:46px;padding:9px 11px;font-weight:650;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}button:hover:not(:disabled){filter:brightness(1.15)}button.primary{background:linear-gradient(110deg,#ffa45d,#df713b);color:#19120d;border:0}button.warn{background:#502d34;color:#fff1f0;border-color:#8c4a50}.two{display:grid;grid-template-columns:1fr 1fr;gap:9px}.three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.actions button{display:flex;flex-direction:column;gap:5px;align-items:center;justify-content:center;min-height:67px}.actions button span{font-size:1.2rem}.headrow{display:flex;justify-content:space-between;align-items:center;gap:12px}.textbutton{border:0;background:transparent;color:var(--muted);padding:2px;min-height:24px;font-size:.81rem}.status{font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:#b7c8d8;font-size:.8rem;line-height:1.65;background:#101822;border-radius:10px;padding:12px;margin:10px 0 0;max-height:170px;overflow:auto}.row{display:flex;gap:9px;align-items:flex-end}.row>div{flex:1}.row>button{flex:none}.feed{display:grid;gap:8px;margin-top:10px;max-height:310px;overflow:auto}.item{padding:11px;border-radius:10px;background:#101822;border:1px solid #243345}.item b{font-size:.84rem}.item small{display:block;color:var(--muted);margin:5px 0}.item p{font-size:.8rem;color:#c9d6e4;white-space:pre-wrap;margin:6px 0}.item a{color:#ffc18d;font-size:.8rem;word-break:break-all}.preview{max-width:100%;max-height:220px;object-fit:contain;border-radius:7px}.msg{font-size:.82rem;min-height:19px;margin:10px 0;line-height:1.5}.msg.error{color:var(--bad)}.msg.ok{color:var(--good)}.subtle{font-size:.74rem;color:#8194a6}.footnote{text-align:center;font-size:.74rem;color:#8194a6;margin-top:25px}.split{height:1px;background:var(--border);margin:15px 0}#expiry{color:#ffb771}
+@media (max-width:420px){main{padding:14px 10px 60px}.card{padding:14px}.actions button{font-size:.85rem}}
+</style>
+<script>/* SEQUENT_PANEL_CONFIG */</script>
+</head>
+<body><main>
+ <header class="heading"><div class="brand"><div class="logo">S</div><div><div class="eyebrow">AUTOMATION CONTROL</div><h1>SEQUENT REMOTE</h1></div></div><span class="badge" id="connectionBadge">LOCKED</span></header>
+ <section class="card" id="loginCard"><h2>Unlock your control panel</h2><div class="hint">Enter the password you configured in Sequent's Remote Console. It never gets sent to ntfy.</div><label for="password">Panel password</label><input id="password" type="password" autocomplete="off" placeholder="Enter your Sequent panel password"><button class="primary" style="width:100%;margin-top:12px" id="login">Unlock & connect</button><p class="msg" id="loginMessage" role="status"></p><div class="subtle">This downloaded panel works only while its Sequent session is active and expires after two hours. ntfy and internet access are required.</div></section>
+ <section id="dashboard" class="hide">
+ <div class="card"><div class="headrow"><div><h2>Playback controls</h2><div class="hint">Commands are delivered through ntfy</div></div><button class="textbutton" id="logout">Lock</button></div><div class="three actions" style="margin-top:13px"><button data-op="pause"><span>Ⅱ</span>Pause</button><button data-op="resume"><span>▶</span>Resume</button><button class="warn" data-op="stop"><span>■</span>Stop</button></div></div>
+ <div class="card"><div class="headrow"><div><h2>Current status</h2><div class="hint" id="lastUpdated">Refreshing every 8 seconds</div></div><button class="textbutton" id="refresh">↻ Refresh</button></div><div class="status" id="status">Connecting to Sequent...</div><div class="two" style="margin-top:12px"><button data-op="status">Send status notification</button><button data-op="screenshot" id="screenshot">Request screenshot</button></div></div>
+ <div class="card"><h2>Macro launcher</h2><div class="hint">Only presets approved in Sequent Remote Console are available.</div><label for="macro">Approved preset</label><select id="macro"></select><div class="two" style="margin-top:12px"><button class="primary" id="run">▶ Run macro</button><button id="schedule">Schedule in 15 min</button></div></div>
+ <div class="card"><div class="headrow"><div><h2>Recent notifications</h2><div class="hint">Read from the configured ntfy phone topic</div></div><button class="textbutton" id="refreshFeed">↻ Refresh</button></div><div id="feed" class="feed"><div class="hint">Checking for notifications...</div></div></div>
+ <p class="msg" id="actionMessage" role="status"></p>
+ </section>
+ <p class="footnote" id="expiry">This panel requires a connected Sequent session.</p>
+ <p class="footnote">No cloud dashboard or Discord required. Only use approved ntfy servers/topics for sensitive workflows.</p>
+</main>
+<script>
+'use strict';
+(function(){
+ const cfg=window.SEQUENT_PANEL_CONFIG, el=id=>document.getElementById(id);
+ let signingKey=null,loggedIn=false,replyCursor='all',phoneCursor='all',busy=false,waiting=new Map(),lastReplyCheck=0;
+ const textEncoder=new TextEncoder();
+ const api=cfg.server.replace(/\/$/,'');
+ const now=()=>Math.floor(Date.now()/1000);
+ const uiMessage=(id,msg,error=false)=>{const node=el(id);node.textContent=msg;node.className='msg '+(error?'error':'ok');};
+ const hex=bytes=>Array.from(new Uint8Array(bytes), b=>b.toString(16).padStart(2,'0')).join('');
+ function randomHex(){const bytes=new Uint8Array(12);crypto.getRandomValues(bytes);return hex(bytes);}
+ function expired(){return now()>=cfg.expires;}
+ function canonical(o){const ordered={};Object.keys(o).sort().forEach(k=>ordered[k]=o[k]);return JSON.stringify(ordered);}
+ async function deriveKey(password){
+   const seed=await crypto.subtle.importKey('raw',textEncoder.encode(password),'PBKDF2',false,['deriveBits']);
+   const salt=Uint8Array.from(cfg.salt.match(/../g),pair=>parseInt(pair,16));
+   const bits=await crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:cfg.iterations,hash:'SHA-256'},seed,256);
+   return crypto.subtle.importKey('raw',bits,{name:'HMAC',hash:'SHA-256'},false,['sign']);
+ }
+ async function publish(op,value=''){
+   if(!signingKey||expired())throw new Error('Panel locked or expired. Request a new file from Sequent.');
+   const data={v:4,src:'panel',op,value:String(value),session:cfg.session,nonce:randomHex(),exp:now()+90};
+   const signed=await crypto.subtle.sign('HMAC',signingKey,textEncoder.encode(canonical(data)));
+   data.sig=hex(signed);
+   const response=await fetch(api+'/'+cfg.inbox,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(data),cache:'no-store'});
+   if(!response.ok)throw new Error('ntfy rejected command (HTTP '+response.status+').');
+   return data.nonce;
+ }
+ async function readTopic(topic,kind){
+   let cursor=kind==='reply'?replyCursor:phoneCursor;
+   const response=await fetch(api+'/'+topic+'/json?poll=1&since='+encodeURIComponent(cursor),{cache:'no-store'});
+   if(!response.ok)throw new Error('ntfy returned HTTP '+response.status);
+   const raw=await response.text();
+   for(const line of raw.split('\n')){
+     if(!line.trim())continue;
+     let msg;try{msg=JSON.parse(line);}catch{continue;}
+     if(msg.event!=='message'||msg.topic!==topic)continue;
+     if(typeof msg.id==='string'){if(kind==='reply')replyCursor=msg.id;else phoneCursor=msg.id;}
+     if(kind==='reply'){
+       let body;try{body=JSON.parse(msg.message||'');}catch{continue;}
+       // A public ntfy topic is NOT an authentication authority. Check Sequent's
+       // HMAC before trusting a login, status, or command acknowledgment.
+       if(!signingKey||body.v!==4||body.session!==cfg.session||
+          !Number.isInteger(body.issued)||Math.abs(now()-body.issued)>180||
+          typeof body.sig!=='string'||!/^([a-f0-9]{64})$/.test(body.sig))continue;
+       const verifiedBody={...body};delete verifiedBody.sig;
+       const sigBytes=Uint8Array.from(body.sig.match(/../g),pair=>parseInt(pair,16));
+       if(!await crypto.subtle.verify('HMAC',signingKey,sigBytes,textEncoder.encode(canonical(verifiedBody))))continue;
+       if(body.kind==='status'&&loggedIn){el('status').textContent=body.text||'No status returned';el('lastUpdated').textContent='Updated '+new Date().toLocaleTimeString();}
+       const pending=waiting.get(body.nonce);
+       if(pending){waiting.delete(body.nonce);pending(body);}
+     }else{renderNotification(msg);}
+   }
+ }
+ const feedItems=[];
+ function renderNotification(msg){
+   if(feedItems.some(it=>it.id===msg.id))return;
+   feedItems.unshift(msg);feedItems.splice(12);
+   const target=el('feed');target.replaceChildren();
+   for(const item of feedItems){
+     const block=document.createElement('div');block.className='item';
+     const title=document.createElement('b');title.textContent=item.title||'Sequent notification';block.append(title);
+     const date=document.createElement('small');date.textContent=new Date((item.time||now())*1000).toLocaleString();block.append(date);
+     if(item.message){const body=document.createElement('p');body.textContent=item.message.slice(0,4000);block.append(body);}
+     if(item.attachment&&item.attachment.url&&/^https:\/\//.test(item.attachment.url)){
+       const a=document.createElement('a');a.href=item.attachment.url;a.target='_blank';a.rel='noopener noreferrer';a.textContent='View attachment';block.append(a);
+       if(/\.(png|jpe?g|webp)(\?|$)/i.test(item.attachment.name||item.attachment.url)){
+         const img=document.createElement('img');img.className='preview';img.loading='lazy';img.alt='Sequent screenshot';img.src=item.attachment.url;block.append(img);
+       }
+     }
+     target.append(block);
+   }
+ }
+ async function waitFor(nonce,timeoutMs=12000){
+   return new Promise((resolve,reject)=>{
+     waiting.set(nonce,resolve);
+     setTimeout(()=>{if(waiting.delete(nonce))reject(new Error('No response from Sequent. Check the password, connection or panel expiration.'));},timeoutMs);
+   });
+ }
+ async function send(op,value=''){
+   try{
+     const nonce=await publish(op,value);uiMessage('actionMessage','Command sent. Awaiting Sequent acknowledgment...');
+     const answer=await waitFor(nonce);
+     uiMessage('actionMessage',answer.kind==='accepted'?'Command accepted by Sequent; execution is not guaranteed until status updates.':('Response: '+answer.kind));
+     if(op==='pause'||op==='resume'||op==='stop'||op==='launch')setTimeout(()=>sendQuietStatus(),1000);
+   }catch(error){uiMessage('actionMessage',error.message,true);}
+ }
+ async function sendQuietStatus(){if(!loggedIn)return;try{await publish('panel_status');}catch{}}
+ async function poll(){
+   if(!loggedIn||expired())return;
+   try{await readTopic(cfg.reply,'reply');}catch(error){uiMessage('actionMessage','Cannot read ntfy replies: '+error.message,true);}
+   try{await readTopic(cfg.phone,'phone');}catch(error){el('feed').textContent='Cannot load ntfy feed: '+error.message;}
+ }
+ async function doLoginSafe(){
+   if(busy)return;
+   if(expired()){uiMessage('loginMessage','This panel expired. Request a fresh panel.html.',true);return;}
+   if(!globalThis.crypto?.subtle){uiMessage('loginMessage','This file viewer does not support secure browser cryptography. Try Chrome or host the panel over HTTPS.',true);return;}
+   const value=el('password').value;if(!value){uiMessage('loginMessage','Enter your panel password.',true);return;}
+   busy=true;el('login').disabled=true;
+   try{
+     uiMessage('loginMessage','Authenticating with Sequent...');
+     signingKey=await deriveKey(value);el('password').value='';
+     const nonce=await publish('panel_login');
+     const answer=await new Promise((resolve,reject)=>{
+       waiting.set(nonce,resolve);
+       const deadline=Date.now()+14500;
+       const check=async()=>{
+         if(!waiting.has(nonce))return;
+         try{await readTopic(cfg.reply,'reply');}catch(e){uiMessage('loginMessage','Polling ntfy: '+e.message,true);}
+         if(Date.now()>=deadline){waiting.delete(nonce);reject(new Error('No login reply: wrong password, offline Sequent, or blocked ntfy access.'));return;}
+         setTimeout(check,900);
+       };
+       check();
+     });
+     if(answer.kind!=='login'||!answer.ok)throw new Error('Sequent rejected the password.');
+     loggedIn=true;el('connectionBadge').textContent='CONNECTED';el('connectionBadge').className='badge online';
+     el('loginCard').classList.add('hide');el('dashboard').classList.remove('hide');
+     uiMessage('actionMessage','Authenticated. Commands will be signed and expire automatically.');
+     await sendQuietStatus();await poll();
+   }catch(e){signingKey=null;uiMessage('loginMessage',e.message,true);el('connectionBadge').className='badge error';el('connectionBadge').textContent='LOCKED';}
+   finally{busy=false;el('login').disabled=false;}
+ }
+ el('login').addEventListener('click',doLoginSafe);el('password').addEventListener('keydown',ev=>{if(ev.key==='Enter')doLoginSafe();});
+ el('logout').addEventListener('click',()=>{signingKey=null;loggedIn=false;waiting.clear();el('loginCard').classList.remove('hide');el('dashboard').classList.add('hide');el('connectionBadge').textContent='LOCKED';el('connectionBadge').className='badge';});
+ document.querySelectorAll('[data-op]').forEach(btn=>btn.addEventListener('click',()=>send(btn.dataset.op)));
+ el('refresh').addEventListener('click',()=>sendQuietStatus());el('refreshFeed').addEventListener('click',()=>poll());
+ const macros=Array.isArray(cfg.allowed_macros)?cfg.allowed_macros:[];
+ for(const name of macros){const option=document.createElement('option');option.value=name;option.textContent=name;el('macro').append(option);}
+ if(!macros.length){const option=document.createElement('option');option.value='';option.textContent='No approved macros';el('macro').append(option);el('run').disabled=true;el('schedule').disabled=true;}
+ el('run').addEventListener('click',()=>{const name=el('macro').value;if(name&&confirm('Run approved macro "'+name+'" on your PC?'))send('launch',name);});
+ el('schedule').addEventListener('click',()=>{const name=el('macro').value;if(name&&confirm('Schedule "'+name+'" to run in 15 minutes?'))send('schedule',name+'@15');});
+ el('screenshot').disabled=!cfg.screenshots;
+ el('expiry').textContent='Panel expires '+new Date(cfg.expires*1000).toLocaleString()+'. Keep Sequent open and connected.';
+ setInterval(()=>{if(loggedIn){if(expired()){signingKey=null;loggedIn=false;el('dashboard').classList.add('hide');el('loginCard').classList.remove('hide');uiMessage('loginMessage','Panel expired. Request a new file.',true);}else{poll();}}},4000);
+ setInterval(()=>{if(loggedIn)sendQuietStatus();},8000);
+ window.addEventListener('pagehide',()=>{signingKey=null;});
+})();
+</script>
+</body>
+</html>

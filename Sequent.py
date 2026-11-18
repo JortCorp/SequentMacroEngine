@@ -28,7 +28,7 @@ from email.message import EmailMessage
 from urllib import request as urlrequest
 from urllib import parse as urlparse
 from urllib import error as urlerror
-from sequent_remote import RemoteRelay, load_config as sequent_remote_load_config, save_config as sequent_remote_save_config, config_default as sequent_remote_default_config, TOPIC_RE as SEQUENT_REMOTE_TOPIC_RE
+from sequent_remote import RemoteRelay, load_config as sequent_remote_load_config, save_config as sequent_remote_save_config, config_default as sequent_remote_default_config, set_panel_password as sequent_set_panel_password, TOPIC_RE as SEQUENT_REMOTE_TOPIC_RE
 
 ACTIVE_SOUND_THEME = "Classic"
 CUSTOM_SOUND_PATHS = {
@@ -25770,6 +25770,25 @@ try {{
         elif operation == 'status':
             snapshot = self._remote_status_text()
             self._remote_thread(lambda:self.sequent_remote.publish('Sequent Status',snapshot),'Status reply')
+        elif operation == 'panel_file':
+            if not (self._remote_config.get('local_panel_enabled') and self._remote_ready()):
+                self._remote_log_event('HTML Panel request rejected: disabled or offline')
+                return
+            relay = self.sequent_remote
+            self._remote_thread(relay.send_panel_file, 'Send HTML panel')
+        elif operation == 'panel_status':
+            if self._remote_ready():
+                relay = self.sequent_remote
+                snapshot = self._remote_status_text()
+                self._remote_thread(lambda: relay.panel_status_reply(value, snapshot),
+                                    'Panel status reply')
+        elif operation == 'dashboard':
+            if not (self._remote_config.get('web_enabled') and
+                    self._remote_config.get('dashboard_url') and self._remote_ready()):
+                self._remote_log_event('Dashboard link request rejected: web access is disabled or offline')
+                return
+            relay = self.sequent_remote
+            self._remote_thread(relay.send_dashboard_link, 'Dashboard link reply')
         elif operation == 'screenshot':
             if not self._remote_config.get('allow_screenshots',False):
                 self._remote_log_event('Screenshot rejected: disabled in Remote Console')
@@ -25956,6 +25975,7 @@ try {{
         scope = tk.StringVar(value=cfg.get('screen_scope', 'Monitor at Cursor'))
         discord_enabled = tk.BooleanVar(value=bool(cfg.get('discord_enabled', False)))
         web_enabled = tk.BooleanVar(value=bool(cfg.get('web_enabled', False)))
+        local_panel_enabled = tk.BooleanVar(value=bool(cfg.get('local_panel_enabled', False)))
         feedback = tk.StringVar(value='Changes are not saved until you click Save & Connect.')
 
         # Sticky footer: Save & Connect is always visible, including at 125%
@@ -26121,12 +26141,45 @@ try {{
                            'Phone-sized browser controls through a private Cloudflare Worker. '
                            'The relay sends signed commands through ntfy; no local port is opened.')
         toggle(web_section, 'Allow signed commands from the Web Dashboard', web_enabled)
+        dashboard_url = field(
+            web_section, 'Hosted dashboard URL (HTTPS)', cfg.get('dashboard_url', ''),
+            'Paste your deployed Cloudflare Worker URL ending in / or /panel.html. '
+            'The ntfy notification shares this link only — never your password or signing key.')
         tk.Label(web_section,
                  text='Deploy web_dashboard/worker.mjs, configure its secrets and login password, '
                       'then enable this checkbox and Save & Connect. Keep the signing key '
                       'server-side, never in a public webpage. See WEB_DASHBOARD_SETUP.md.',
                  bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
                  justify='left', wraplength=605).pack(anchor='w', fill=tk.X, pady=(4, 2))
+
+        attachment_panel = card('Downloadable HTML Panel  •  No hosting required',
+                                'Request /panel through ntfy. Sequent sends panel.html as an attachment. '
+                                'The file opens in your phone browser and signs commands with a password '
+                                'you set here; no remote signing secret is included in the file.')
+        toggle(attachment_panel, 'Enable downloadable HTML panel commands', local_panel_enabled)
+        panel_password = field(
+            attachment_panel, 'Set or change panel password (16+ characters)', '',
+            'Leave empty to retain the existing password. Password is never written to panel.html. '
+            'For safety, use a unique, long password. A newly set password invalidates older downloads.')
+        panel_password.configure(show='•')
+        tk.Label(attachment_panel,
+                 text='From the ntfy Android app, publish /panel to the Sequent command topic. '
+                      'The requested panel is delivered to your configured phone notification topic. '
+                      'Downloaded pages expire after two hours or when Sequent reconnects.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 justify='left', wraplength=605).pack(anchor='w', fill=tk.X, pady=(7, 6))
+        tk.Button(attachment_panel, text='Copy ntfy command topic',
+                  command=lambda: bridge_copy('Command topic',self._remote_config.get('inbox_topic','')),
+                  bg=BG_HOVER, fg=TEXT_PRIMARY, activebackground=BG_BORDER,
+                  activeforeground=TEXT_PRIMARY, relief='flat', bd=0,
+                  font=('Segoe UI', 9), padx=12, pady=8,
+                  cursor='hand2').pack(anchor='w', fill=tk.X, pady=(0, 5))
+        tk.Label(attachment_panel,
+                 text='Security: ntfy.sh public topics are NOT private. Do not send work screenshots '
+                      'or sensitive data through an unauthenticated topic. Browser-side ntfy access '
+                      'requires CORS and may vary by mobile file viewer.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 justify='left', wraplength=605).pack(anchor='w', fill=tk.X, pady=(2, 2))
 
         automation = card('Scheduling & Heartbeat',
                           'Optional periodic heartbeat and a strict allowlist for preset launches.')
@@ -26169,14 +26222,19 @@ try {{
                     raise ValueError('Heartbeat must be 0 or at least 5 minutes')
                 selected = [available[int(index)] for index in presets.curselection()]
                 new_cfg = dict(self._remote_config,
+                               local_panel_enabled=local_panel_enabled.get(),
                                enabled=enabled.get(), server=server.get().strip(),
                                phone_topic=phone.get().strip(), token_env=token.get().strip(),
                                allow_screenshots=allow_screens.get(), allow_launch=allow_launch.get(),
                                discord_enabled=discord_enabled.get(),
                                web_enabled=web_enabled.get(),
+                               dashboard_url=dashboard_url.get().strip(),
                                auto_error_alert=errors.get(), error_screenshot=error_shot.get(),
                                screen_scope=scope.get(), heartbeat_minutes=minutes,
                                allowed_macros=selected)
+                # Derive password locally. Never persist or transmit plaintext.
+                if panel_password.get():
+                    sequent_set_panel_password(new_cfg, panel_password.get())
                 # Validate before changing the running connection; failed
                 # saves leave the previous configuration untouched.
                 sequent_remote_save_config(new_cfg)
@@ -26220,6 +26278,34 @@ try {{
             self._remote_thread(lambda: self.sequent_remote.publish('Sequent Remote Test',
                                 self._remote_status_text()), 'Test phone alert')
 
+        def send_dashboard():
+            if not self._remote_ready():
+                feedback.set('Remote is offline. Click Save & Connect first.')
+                footer_message.configure(fg=COLOR_DANGER)
+                return
+            if not (self._remote_config.get('web_enabled') and self._remote_config.get('dashboard_url')):
+                feedback.set('Enable Web Dashboard, enter the deployed URL, then Save & Connect.')
+                footer_message.configure(fg=COLOR_DANGER)
+                return
+            relay = self.sequent_remote
+            self._remote_thread(relay.send_dashboard_link, 'Send dashboard link')
+            feedback.set('Sending a dashboard link to your ntfy phone topic…')
+            footer_message.configure(fg=COLOR_SUCCESS)
+
+        def send_attached_panel():
+            if not self._remote_ready():
+                feedback.set('Remote is offline. Save & Connect first.')
+                footer_message.configure(fg=COLOR_DANGER)
+                return
+            if not self._remote_config.get('local_panel_enabled'):
+                feedback.set('Enable Downloadable HTML Panel and Save & Connect first.')
+                footer_message.configure(fg=COLOR_DANGER)
+                return
+            relay=self.sequent_remote
+            self._remote_thread(relay.send_panel_file, 'Send HTML panel')
+            feedback.set('Sending panel.html to your ntfy phone topic…')
+            footer_message.configure(fg=COLOR_SUCCESS)
+
         def schedule():
             approved = self._remote_config.get('allowed_macros', [])
             if not self._remote_config.get('allow_launch') or not approved:
@@ -26247,7 +26333,9 @@ try {{
         quick = card('Quick Actions', 'Available after saving and connecting Remote.')
         quick_row = tk.Frame(quick, bg=BG_PANEL)
         quick_row.pack(fill=tk.X, pady=(2, 0))
-        for column, (label, command) in enumerate((('Send Phone Controls', panel),
+        for index, (label, command) in enumerate((('Send Phone Controls', panel),
+                                                    ('Send HTML Panel', send_attached_panel),
+                                                    ('Send Dashboard Link', send_dashboard),
                                                     ('Test Notification', test),
                                                     ('Schedule Preset', schedule))):
             button = tk.Button(quick_row, text=label, command=command,
@@ -26256,7 +26344,9 @@ try {{
                                activeforeground=TEXT_PRIMARY,
                                font=('Segoe UI', 9), bd=0, relief='flat',
                                cursor='hand2', padx=8, pady=9)
-            button.grid(row=0, column=column, sticky='ew', padx=(0, 7) if column < 2 else 0)
+            row_index, column = divmod(index, 2)
+            button.grid(row=row_index, column=column, sticky='ew',
+                        padx=(0, 7) if column == 0 else 0, pady=(0, 7))
             quick_row.columnconfigure(column, weight=1)
 
         activity = card('Remote Activity', 'Recent local events. No credentials are stored in the activity log.')
