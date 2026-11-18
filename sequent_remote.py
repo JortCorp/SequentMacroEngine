@@ -29,6 +29,10 @@ SAFE_COMMANDS = frozenset({'pause', 'resume', 'stop', 'status', 'screenshot', 'd
 PANEL_KDF_ROUNDS = 310_000
 PANEL_LIFETIME = 2 * 3600
 MAX_RESPONSE = 256_000
+# ntfy.sh replenishes request tokens slowly; use one cache poll per 10s on
+# networks where the efficient streaming subscription is unavailable.
+FALLBACK_POLL_SECONDS = 10
+STREAM_PROBE_INTERVAL_SECONDS = 900
 
 
 class _IdleStreamTimeout(Exception):
@@ -185,7 +189,7 @@ class RemoteRelay:
         self._status_throttle = {}
         # Streaming is preferable, but some networks allow uploads while
         # timing out the long-lived GET subscription. Fall back to deliberately
-        # slow polling until the next periodic stream probe.
+        # conservative polling until a periodic streaming probe.
         self._fallback_until = 0
         self._fallback_last_ok = 0
         self._stream_connect_failures = 0
@@ -668,14 +672,16 @@ class RemoteRelay:
                     if not self.ready.is_set():
                         self.poll_once()
                     if self._fallback_until > self.clock():
-                        # A controlled 40-second poll avoids repeated streaming
-                        # connection timeouts and ntfy request-rate exhaustion.
+                        # Streaming is unavailable on this network. One cache
+                        # poll every 10 seconds is much more responsive than
+                        # the old 40-second fallback while respecting ntfy's
+                        # request-token refill (429 still uses Retry-After).
                         self.poll_once()
                         self._fallback_last_ok = self.clock()
                         self.poll_failures = 0
                         self.next_retry = 0
                         self.last_error = ''
-                        delay = 40
+                        delay = FALLBACK_POLL_SECONDS
                     else:
                         self._fallback_until = 0
                         streaming_attempt = True
@@ -721,11 +727,11 @@ class RemoteRelay:
                     self._stream_connect_failures += 1
                     if (self._stream_connect_failures >= 2 and
                             code not in (401, 403, 429) and self.ready.is_set()):
-                        self._fallback_until = self.clock() + 300
+                        self._fallback_until = self.clock() + STREAM_PROBE_INTERVAL_SECONDS
                         self._fallback_last_ok = 0
                         delay = max(delay, 15)
                         self._diagnostic('Live ntfy subscription could not open; '
-                                         'switching to 40-second polling for 5 minutes.')
+                                         'switching to 10-second polling until the next live-connection probe.')
                 elif streaming_attempt:
                     # A stream established successfully, so treat a later read
                     # failure separately from repeated handshake failures.
