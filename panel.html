@@ -9,12 +9,21 @@
 :root{--bg:#0c1017;--card:#151c27;--card2:#1c2734;--border:#2a3849;--ink:#eef3f9;--muted:#9aacbf;--accent:#f58b4d;--good:#62d9a7;--bad:#fa7780;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
 *{box-sizing:border-box}body{margin:0;color:var(--ink);background:radial-gradient(ellipse at top,#242634 0%,var(--bg) 56%);min-height:100dvh}main{max-width:700px;margin:auto;padding:20px 15px 80px}.heading{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:14px 0 19px}.brand{display:flex;gap:12px;align-items:center}.logo{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;color:#121720;background:linear-gradient(130deg,#ffb565,var(--accent));font-weight:900;font-size:24px}.eyebrow{font-size:.69rem;letter-spacing:.18em;color:var(--accent);font-weight:800}h1{font-size:1.37rem;line-height:1.2;margin:2px 0 0}h2{font-size:1rem;margin:0 0 5px}.hint{color:var(--muted);font-size:.83rem;line-height:1.5}.badge{font-size:.72rem;border:1px solid var(--border);border-radius:100px;padding:7px 9px;color:var(--muted);white-space:nowrap}.badge.online{border-color:#32785c;color:var(--good)}.badge.error{border-color:#984b57;color:var(--bad)}.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:17px;margin:12px 0;box-shadow:0 8px 24px #0002}.hide{display:none!important}label{font-size:.83rem;color:#d6dfeb;display:block;font-weight:600;margin:14px 0 7px}input,select{width:100%;font:inherit;font-size:.96rem;background:#101822;color:var(--ink);border:1px solid var(--border);padding:12px 14px;border-radius:11px;min-height:46px}input:focus,select:focus{outline:2px solid #b66a3c;outline-offset:1px}button{font:inherit;border:1px solid var(--border);background:var(--card2);color:var(--ink);border-radius:11px;min-height:46px;padding:9px 11px;font-weight:650;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}button:hover:not(:disabled){filter:brightness(1.15)}button.primary{background:linear-gradient(110deg,#ffa45d,#df713b);color:#19120d;border:0}button.warn{background:#502d34;color:#fff1f0;border-color:#8c4a50}.two{display:grid;grid-template-columns:1fr 1fr;gap:9px}.three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.actions button{display:flex;flex-direction:column;gap:5px;align-items:center;justify-content:center;min-height:67px}.actions button span{font-size:1.2rem}.headrow{display:flex;justify-content:space-between;align-items:center;gap:12px}.textbutton{border:0;background:transparent;color:var(--muted);padding:2px;min-height:24px;font-size:.81rem}.status{font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:#b7c8d8;font-size:.8rem;line-height:1.65;background:#101822;border-radius:10px;padding:12px;margin:10px 0 0;max-height:170px;overflow:auto}.row{display:flex;gap:9px;align-items:flex-end}.row>div{flex:1}.row>button{flex:none}.feed{display:grid;gap:8px;margin-top:10px;max-height:310px;overflow:auto}.item{padding:11px;border-radius:10px;background:#101822;border:1px solid #243345}.item b{font-size:.84rem}.item small{display:block;color:var(--muted);margin:5px 0}.item p{font-size:.8rem;color:#c9d6e4;white-space:pre-wrap;margin:6px 0}.item a{color:#ffc18d;font-size:.8rem;word-break:break-all}.preview{max-width:100%;max-height:220px;object-fit:contain;border-radius:7px}#lastPreview .preview{max-height:400px;width:100%;display:block}#previewHistory .item{padding:7px 10px}.msg{font-size:.82rem;min-height:19px;margin:10px 0;line-height:1.5}.msg.error{color:var(--bad)}.msg.ok{color:var(--good)}.subtle{font-size:.74rem;color:#8194a6}.footnote{text-align:center;font-size:.74rem;color:#8194a6;margin-top:25px}.split{height:1px;background:var(--border);margin:15px 0}#expiry{color:#ffb771}
 @media (max-width:420px){main{padding:14px 10px 60px}.card{padding:14px}.actions button{font-size:.85rem}}
+
+/* Inline password visibility control: no extra row height on mobile. */
+.password-wrap{position:relative}
+.password-wrap input{padding-right:59px}
+.password-eye{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:42px;min-height:38px;height:38px;border:0;background:transparent;border-radius:8px;display:grid;place-items:center;color:var(--muted);padding:0;touch-action:manipulation}
+.password-eye:hover,.password-eye:focus-visible{color:var(--ink);background:#26384b;filter:none}
+.password-eye svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+.password-eye .eye-slash{display:none}
+.password-eye[aria-pressed="true"] .eye-slash{display:block}
 </style>
 <script>/* SEQUENT_PANEL_CONFIG */</script>
 </head>
 <body><main>
  <header class="heading"><div class="brand"><div class="logo">S</div><div><div class="eyebrow">AUTOMATION CONTROL</div><h1>SEQUENT REMOTE</h1></div></div><span class="badge" id="connectionBadge">LOCKED</span></header>
- <section class="card" id="loginCard"><h2>Unlock your control panel</h2><div class="hint">Enter the password you configured in Sequent's Remote Console. It never gets sent to ntfy.</div><label for="password">Panel password</label><input id="password" type="password" autocomplete="off" placeholder="Enter your Sequent panel password"><button class="primary" style="width:100%;margin-top:12px" id="login">Unlock & connect</button><p class="msg" id="loginMessage" role="status"></p><div class="subtle">This downloaded panel works only while its Sequent session is active and expires after two hours. ntfy and internet access are required.</div></section>
+ <section class="card" id="loginCard"><h2>Unlock your control panel</h2><div class="hint">Enter the password you configured in Sequent's Remote Console. It never gets sent to ntfy.</div><label for="password">Panel password</label><div class="password-wrap"><input id="password" type="password" autocomplete="off" placeholder="Enter your Sequent panel password"><button id="passwordEye" class="password-eye" type="button" aria-label="Show password" aria-pressed="false" title="Show password"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.1 12s3.6-7 9.9-7 9.9 7 9.9 7-3.6 7-9.9 7-9.9-7-9.9-7z"/><circle cx="12" cy="12" r="3"/><path class="eye-slash" d="m3 21 18-18"/></svg></button></div><button class="primary" style="width:100%;margin-top:12px" id="login">Unlock & connect</button><p class="msg" id="loginMessage" role="status"></p><div class="subtle">This downloaded panel works only while its Sequent session is active and expires after two hours. ntfy and internet access are required.</div></section>
  <section id="dashboard" class="hide">
  <div class="card"><div class="headrow"><div><h2>Playback controls</h2><div class="hint">Commands are delivered through ntfy</div></div><button class="textbutton" id="logout">Lock</button></div><div class="three actions" style="margin-top:13px"><button data-op="pause"><span>Ⅱ</span>Pause</button><button data-op="resume"><span>▶</span>Resume</button><button class="warn" data-op="stop"><span>■</span>Stop</button></div></div>
  <div class="card"><div class="headrow"><div><h2>Recording</h2><div class="hint">Remotely record desktop inputs; stop automatically after 10 minutes.</div></div></div>
@@ -271,7 +280,7 @@
     busy=true;el('login').disabled=true;
     try{
       uiMessage('loginMessage','Connecting to Sequent. Waiting for authenticated reply...');
-      signingKey=await deriveKey(value);el('password').value='';
+      signingKey=await deriveKey(value);el('password').value='';setPasswordVisibility(false);
       // Start listening BEFORE the login command. Early replies are buffered.
       startReceiving();
       const nonce=await publish('panel_login');
@@ -294,6 +303,20 @@
     el('connectionBadge').textContent='LOCKED';el('connectionBadge').className='badge';
     if(message)uiMessage('loginMessage',message,true);
   }
+  // Password is hidden by default; the eye is a purely local display toggle.
+  const passwordInput=el('password'), passwordEye=el('passwordEye');
+  function setPasswordVisibility(visible){
+    passwordInput.type=visible?'text':'password';
+    passwordEye.setAttribute('aria-pressed',visible?'true':'false');
+    passwordEye.setAttribute('aria-label',visible?'Hide password':'Show password');
+    passwordEye.title=visible?'Hide password':'Show password';
+  }
+  passwordEye.addEventListener('click',()=>{
+    const start=passwordInput.selectionStart, end=passwordInput.selectionEnd;
+    setPasswordVisibility(passwordInput.type==='password');
+    passwordInput.focus({preventScroll:true});
+    try{passwordInput.setSelectionRange(start,end);}catch(_ignored){}
+  });
   el('login').addEventListener('click',doLoginSafe);
   el('password').addEventListener('keydown',ev=>{if(ev.key==='Enter')void doLoginSafe();});
   el('logout').addEventListener('click',()=>lock());

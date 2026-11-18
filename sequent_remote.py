@@ -286,7 +286,7 @@ def config_default():
             'local_panel_enabled': False, 'panel_salt': '', 'panel_auth_key': '',
             'schedule': [], 'allow_remote_record': False, 'allow_remote_lock': False,
             'allow_live_preview': False, 'lock_after_execution': False,
-            'safety_locked': False}
+            'safety_locked': False, 'auto_approve_new_presets': True}
 
 
 def set_panel_password(cfg, password):

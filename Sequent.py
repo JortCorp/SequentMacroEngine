@@ -19756,6 +19756,7 @@ class BuiltInMacroApp:
                 with open(old,'rb') as f: raw=f.read()
                 json.loads(raw.decode('utf-8'))
                 with open(new,'xb') as out:out.write(raw)
+                self._remote_approve_new_preset(dest)
                 refresh();self.refresh_preset_menu()
             except (OSError,ValueError) as exc:
                 messagebox.showerror('Duplicate failed',str(exc),parent=window)
@@ -24408,10 +24409,13 @@ try {{
             full = os.path.abspath(file_path)
             if os.path.normcase(full) == os.path.normcase(os.path.join(self.presets_dir, 'globals.json')):
                 raise ValueError('globals.json stores Global variables and cannot be used as a macro preset')
+            was_existing_preset = os.path.exists(full)
             self._write_json_atomically(full, self.recorded_actions)
             if os.path.normcase(os.path.dirname(full)) == os.path.normcase(os.path.abspath(self.presets_dir)):
                 # An explicit Export into presets becomes the current saved preset.
                 stem = os.path.splitext(os.path.basename(full))[0]
+                if not was_existing_preset:
+                    self._remote_approve_new_preset(stem)
                 self.current_source_label = f"Preset: {stem}"
                 self._bind_preset_autosave(full)
                 self.refresh_preset_menu(selected=stem)
@@ -25799,6 +25803,31 @@ try {{
                 'Action: '+str(progress.get('action','Idle'))+'\n'
                 'Updated: '+time.strftime('%Y-%m-%d %H:%M:%S'))
 
+    def _remote_approve_new_preset(self, name):
+        """Approve an explicitly newly saved local preset, if opted in.
+
+        Never alter an existing preset's approval state merely because it was
+        re-saved. Persist the allowlist before applying it to the live relay.
+        """
+        if not self._remote_config.get('auto_approve_new_presets', True):
+            return False
+        if not isinstance(name, str) or name not in self.get_preset_names():
+            return False
+        approved = list(self._remote_config.get('allowed_macros', []))
+        if name in approved:
+            return True
+        candidate = dict(self._remote_config, allowed_macros=approved + [name])
+        try:
+            sequent_remote_save_config(candidate)
+        except (OSError, ValueError, TypeError) as exc:
+            self._remote_log_event('Could not auto-approve new preset '+name+': '+str(exc)[:100])
+            return False
+        self._remote_config = candidate
+        if self.sequent_remote is not None:
+            self.sequent_remote.cfg['allowed_macros'] = list(candidate['allowed_macros'])
+        self._remote_log_event('New preset approved for remote launch: '+name)
+        return True
+
     def _remote_save_recording(self):
         # Save without opening a file dialog on the locked/unattended desktop.
         if not self.recorded_actions:
@@ -25811,6 +25840,7 @@ try {{
             try:
                 with open(path, 'x', encoding='utf-8') as output:
                     json.dump(self.recorded_actions, output, indent=2, ensure_ascii=False)
+                self._remote_approve_new_preset(name)
                 self._remote_log_event('Recording saved as '+name+' ('+str(len(self.recorded_actions))+' actions)')
                 return name
             except FileExistsError:
@@ -26217,6 +26247,7 @@ try {{
         enabled = tk.BooleanVar(value=bool(cfg.get('enabled', False)))
         allow_screens = tk.BooleanVar(value=bool(cfg.get('allow_screenshots', False)))
         allow_launch = tk.BooleanVar(value=bool(cfg.get('allow_launch', False)))
+        approve_new_presets = tk.BooleanVar(value=bool(cfg.get('auto_approve_new_presets', True)))
         errors = tk.BooleanVar(value=bool(cfg.get('auto_error_alert', False)))
         error_shot = tk.BooleanVar(value=bool(cfg.get('error_screenshot', False)))
         scope = tk.StringVar(value=cfg.get('screen_scope', 'Monitor at Cursor'))
@@ -26282,15 +26313,60 @@ try {{
                 tk.Frame(inner, bg=BG_PANEL, height=10).pack()
             return inner
 
-        def field(parent, label, value, hint=None):
+        def field(parent, label, value, hint=None, *, password=False):
             tk.Label(parent, text=label, bg=BG_PANEL, fg=TEXT_PRIMARY,
                      font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(7, 4))
             border = tk.Frame(parent, bg=BG_BORDER, padx=1, pady=1)
             border.pack(fill=tk.X)
-            entry = tk.Entry(border, bg=BG_INPUT, fg=TEXT_PRIMARY,
+            # A password field gets a compact eye INSIDE the same border.
+            # The normal field layout is unchanged for every other setting.
+            input_host = tk.Frame(border, bg=BG_INPUT) if password else border
+            if password:
+                input_host.pack(fill=tk.X)
+            entry = tk.Entry(input_host, bg=BG_INPUT, fg=TEXT_PRIMARY,
                              insertbackground=TEXT_PRIMARY, relief='flat', bd=0,
-                             font=('Segoe UI', 10), highlightthickness=0)
-            entry.pack(fill=tk.X, ipady=7, padx=10)
+                             font=('Segoe UI', 10), highlightthickness=0,
+                             show='•' if password else '')
+            if password:
+                entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=7, padx=(10, 0))
+                eye = tk.Canvas(input_host, width=43, height=37, bg=BG_INPUT,
+                                highlightthickness=0, bd=0, relief='flat',
+                                cursor='hand2', takefocus=1)
+                eye.pack(side=tk.RIGHT, padx=(0, 3))
+                visible = [False]
+
+                def paint_eye():
+                    eye.delete('all')
+                    # Vector eye, with diagonal slash when the text is revealed.
+                    eye.create_line(8, 18, 13, 13, 21, 11, 29, 13, 35, 18,
+                                    smooth=True, width=2, fill=TEXT_MUTED)
+                    eye.create_line(8, 18, 13, 23, 21, 25, 29, 23, 35, 18,
+                                    smooth=True, width=2, fill=TEXT_MUTED)
+                    eye.create_oval(18, 15, 25, 22, fill=TEXT_PRIMARY, outline='')
+                    if visible[0]:
+                        eye.create_line(9, 29, 35, 7, width=2.3, fill=COLOR_ACCENT)
+
+                def toggle_password(_event=None):
+                    visible[0] = not visible[0]
+                    entry.configure(show='' if visible[0] else '•')
+                    paint_eye()
+                    entry.focus_set()
+                    return 'break'
+
+                paint_eye()
+                def hide_password():
+                    visible[0] = False
+                    entry.configure(show='•')
+                    paint_eye()
+
+                # Keep the eye's internal state in sync when Save clears the
+                # password; don't accidentally reveal the next password typed.
+                entry._sequent_hide_password = hide_password
+                eye.bind('<Button-1>', toggle_password)
+                eye.bind('<Return>', toggle_password)
+                eye.bind('<space>', toggle_password)
+            else:
+                entry.pack(fill=tk.X, ipady=7, padx=10)
             entry.insert(0, str(value))
             entry.bind('<FocusIn>', lambda e: border.configure(bg=COLOR_ACCENT), add='+')
             entry.bind('<FocusOut>', lambda e: border.configure(bg=BG_BORDER), add='+')
@@ -26413,8 +26489,17 @@ try {{
         panel_password = field(
             attachment_panel, 'Set or change panel password (16+ characters)', '',
             'Leave empty to retain the existing password. Password is never written to panel.html. '
-            'For safety, use a unique, long password. A newly set password invalidates older downloads.')
-        panel_password.configure(show='•')
+            'For safety, use a unique, long password. A newly set password invalidates older downloads.',
+            password=True)
+        panel_password_status = tk.StringVar(value=(
+            'Password saved securely  •  Enter a new one only to replace it.'
+            if cfg.get('panel_auth_key') and cfg.get('panel_salt')
+            else 'No panel password saved yet.'))
+        password_status_label = tk.Label(
+            attachment_panel, textvariable=panel_password_status,
+            bg=BG_PANEL, fg=COLOR_SUCCESS if cfg.get('panel_auth_key') else TEXT_MUTED,
+            font=('Segoe UI', 9), anchor='w', justify='left')
+        password_status_label.pack(anchor='w', fill=tk.X, pady=(5, 4))
         tk.Label(attachment_panel,
                  text='From the ntfy Android app, publish /panel to the Sequent command topic. '
                       'The requested panel is delivered to your configured phone notification topic. '
@@ -26464,9 +26549,17 @@ try {{
         heartbeat = field(automation, 'Heartbeat interval (minutes)',
                           cfg.get('heartbeat_minutes', 0),
                           '0 disables heartbeat notifications. Other values must be at least 5.')
-        tk.Label(automation, text='APPROVED PRESETS  •  Ctrl / Shift to select multiple',
+        toggle(automation, 'Automatically approve newly saved presets (default on)',
+               approve_new_presets)
+        tk.Label(automation,
+                 text='Newly recorded/saved presets are approved automatically. '
+                      'Remote launching still requires its own permission.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 anchor='w', justify='left', wraplength=600).pack(
+                     anchor='w', fill=tk.X, pady=(0, 6))
+        tk.Label(automation, text='APPROVED PRESETS  •  Ctrl+click to toggle  •  Shift+click to select a range',
                  bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(13, 5))
+                 font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(10, 5))
         preset_box = tk.Frame(automation, bg=BG_INPUT, highlightthickness=1,
                               highlightbackground=BG_BORDER)
         preset_box.pack(fill=tk.X)
@@ -26474,13 +26567,15 @@ try {{
                                     troughcolor=BG_GUTTER, bg=BG_BORDER,
                                     activebackground=COLOR_ACCENT)
         preset_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        presets = tk.Listbox(preset_box, height=6, selectmode=tk.EXTENDED,
+        # Tk's EXTENDED selection supports native Ctrl+click additive/toggle,
+        # Shift+click ranges and Ctrl+Shift+click without taking away focus.
+        presets = tk.Listbox(preset_box, height=8, selectmode=tk.EXTENDED,
                              bg=BG_INPUT, fg=TEXT_PRIMARY,
                              selectforeground=TEXT_ON_ACCENT,
                              selectbackground=COLOR_ACCENT, relief='flat', bd=0,
                              highlightthickness=0, exportselection=False,
-                             font=('Segoe UI', 9), activestyle='none',
-                             yscrollcommand=preset_scroll.set)
+                             font=('Segoe UI', 9), activestyle='dotbox',
+                             takefocus=1, yscrollcommand=preset_scroll.set)
         presets.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=7, pady=5)
         preset_scroll.configure(command=presets.yview)
         available = list(self.get_preset_names())
@@ -26488,6 +26583,58 @@ try {{
             presets.insert(tk.END, name)
             if name in cfg.get('allowed_macros', []):
                 presets.selection_set(i)
+        selected_count = tk.StringVar()
+
+        def update_selected_count(event=None):
+            selected_count.set(f'{len(presets.curselection())} of {presets.size()} presets approved')
+
+        def select_all_presets(event=None):
+            if presets.size():
+                presets.selection_set(0, tk.END)
+                presets.activate(0)
+                presets.selection_anchor(0)
+            update_selected_count()
+            return 'break'
+
+        def deselect_all_presets(event=None):
+            presets.selection_clear(0, tk.END)
+            update_selected_count()
+            return 'break'
+
+        def refresh_local_presets():
+            # Preserve unsaved user selection when files change while the
+            # console is open; include newly auto-approved presets as well.
+            nonlocal available
+            old_selected = {available[int(i)] for i in presets.curselection()}
+            current = list(self.get_preset_names())
+            new_names = set(current) - set(available)
+            auto_approved = set(self._remote_config.get('allowed_macros', []))
+            available = current
+            presets.delete(0, tk.END)
+            for index, name in enumerate(available):
+                presets.insert(tk.END, name)
+                if name in old_selected or (name in new_names and name in auto_approved):
+                    presets.selection_set(index)
+            update_selected_count()
+
+        presets.bind('<<ListboxSelect>>', update_selected_count, add='+')
+        presets.bind('<Control-a>', select_all_presets)
+        presets.bind('<Control-A>', select_all_presets)
+        presets.bind('<Control-d>', deselect_all_presets)
+        presets.bind('<Control-D>', deselect_all_presets)
+        bulk_row = tk.Frame(automation, bg=BG_PANEL)
+        bulk_row.pack(fill=tk.X, pady=(8, 2))
+        for label, callback in (('Select All', select_all_presets),
+                                ('Deselect All', deselect_all_presets),
+                                ('Refresh List', refresh_local_presets)):
+            tk.Button(bulk_row, text=label, command=callback,
+                      bg=BG_HOVER, fg=TEXT_PRIMARY, activebackground=BG_BORDER,
+                      activeforeground=TEXT_PRIMARY, font=('Segoe UI', 9),
+                      bd=0, relief='flat', padx=10, pady=7,
+                      cursor='hand2').pack(side=tk.LEFT, padx=(0, 7))
+        tk.Label(automation, textvariable=selected_count, bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=('Segoe UI', 9)).pack(anchor='w', pady=(3, 2))
+        update_selected_count()
         if not available:
             tk.Label(automation, text='No saved presets found. You can enable this later.',
                      bg=BG_PANEL, fg=TEXT_MUTED,
@@ -26499,6 +26646,12 @@ try {{
                 if minutes != 0 and minutes < 5:
                     raise ValueError('Heartbeat must be 0 or at least 5 minutes')
                 selected = [available[int(index)] for index in presets.curselection()]
+                # Preserve new approved presets saved in the background while
+                # the console was open; don't reapprove manually unselected rows.
+                current_on_disk = set(self.get_preset_names())
+                extra_new = [name for name in self._remote_config.get('allowed_macros', [])
+                             if name not in available and name in current_on_disk]
+                selected.extend(name for name in extra_new if name not in selected)
                 new_cfg = dict(self._remote_config,
                                local_panel_enabled=local_panel_enabled.get(),
                                enabled=enabled.get(), server=server.get().strip(),
@@ -26511,14 +26664,26 @@ try {{
                                dashboard_url=dashboard_url.get().strip(),
                                auto_error_alert=errors.get(), error_screenshot=error_shot.get(),
                                screen_scope=scope.get(), heartbeat_minutes=minutes,
-                               allowed_macros=selected)
-                # Derive password locally. Never persist or transmit plaintext.
-                if panel_password.get():
-                    sequent_set_panel_password(new_cfg, panel_password.get())
+                               allowed_macros=selected,
+                               auto_approve_new_presets=approve_new_presets.get())
+                # The password and every other setting are committed by this
+                # *one* Save & Connect transaction. Keep only its PBKDF2 verifier.
+                entered_password = panel_password.get()
+                if entered_password:
+                    sequent_set_panel_password(new_cfg, entered_password)
                 # Validate before changing the running connection; failed
                 # saves leave the previous configuration untouched.
                 sequent_remote_save_config(new_cfg)
                 self._remote_config = new_cfg
+                if entered_password:
+                    panel_password.delete(0, tk.END)
+                    panel_password._sequent_hide_password()
+                password_status_label.configure(
+                    fg=COLOR_SUCCESS if new_cfg.get('panel_auth_key') else TEXT_MUTED)
+                panel_password_status.set(
+                    'Password saved securely  •  Enter a new one only to replace it.'
+                    if new_cfg.get('panel_auth_key') and new_cfg.get('panel_salt')
+                    else 'No panel password saved yet.')
                 self._remote_connect()
                 self._remote_last_heartbeat = time.monotonic()
                 feedback.set('Settings saved. ' + ('Connecting to ntfy…' if enabled.get()
