@@ -17,7 +17,7 @@
  <section class="card" id="loginCard"><h2>Unlock your control panel</h2><div class="hint">Enter the password you configured in Sequent's Remote Console. It never gets sent to ntfy.</div><label for="password">Panel password</label><input id="password" type="password" autocomplete="off" placeholder="Enter your Sequent panel password"><button class="primary" style="width:100%;margin-top:12px" id="login">Unlock & connect</button><p class="msg" id="loginMessage" role="status"></p><div class="subtle">This downloaded panel works only while its Sequent session is active and expires after two hours. ntfy and internet access are required.</div></section>
  <section id="dashboard" class="hide">
  <div class="card"><div class="headrow"><div><h2>Playback controls</h2><div class="hint">Commands are delivered through ntfy</div></div><button class="textbutton" id="logout">Lock</button></div><div class="three actions" style="margin-top:13px"><button data-op="pause"><span>Ⅱ</span>Pause</button><button data-op="resume"><span>▶</span>Resume</button><button class="warn" data-op="stop"><span>■</span>Stop</button></div></div>
- <div class="card"><div class="headrow"><div><h2>Current status</h2><div class="hint" id="lastUpdated">Refreshing every 8 seconds</div></div><button class="textbutton" id="refresh">↻ Refresh</button></div><div class="status" id="status">Connecting to Sequent...</div><div class="two" style="margin-top:12px"><button data-op="status">Send status notification</button><button data-op="screenshot" id="screenshot">Request screenshot</button></div></div>
+ <div class="card"><div class="headrow"><div><h2>Current status</h2><div class="hint" id="lastUpdated">Refreshing periodically</div></div><button class="textbutton" id="refresh">↻ Refresh</button></div><div class="status" id="status">Connecting to Sequent...</div><div class="two" style="margin-top:12px"><button data-op="status">Send status notification</button><button data-op="screenshot" id="screenshot">Request screenshot</button></div></div>
  <div class="card"><h2>Macro launcher</h2><div class="hint">Only presets approved in Sequent Remote Console are available.</div><label for="macro">Approved preset</label><select id="macro"></select><div class="two" style="margin-top:12px"><button class="primary" id="run">▶ Run macro</button><button id="schedule">Schedule in 15 min</button></div></div>
  <div class="card"><div class="headrow"><div><h2>Recent notifications</h2><div class="hint">Read from the configured ntfy phone topic</div></div><button class="textbutton" id="refreshFeed">↻ Refresh</button></div><div id="feed" class="feed"><div class="hint">Checking for notifications...</div></div></div>
  <p class="msg" id="actionMessage" role="status"></p>
@@ -130,11 +130,11 @@
      const nonce=await publish('panel_login');
      const answer=await new Promise((resolve,reject)=>{
        waiting.set(nonce,resolve);
-       const deadline=Date.now()+14500;
+       const deadline=Date.now()+26000;
        const check=async()=>{
          if(!waiting.has(nonce))return;
          try{await readTopic(cfg.reply,'reply');}catch(e){uiMessage('loginMessage','Polling ntfy: '+e.message,true);}
-         if(Date.now()>=deadline){waiting.delete(nonce);reject(new Error('No login reply: wrong password, offline Sequent, or blocked ntfy access.'));return;}
+         if(Date.now()>=deadline){waiting.delete(nonce);reject(new Error('No authenticated login reply. Check Remote Console → Remote Activity for a rejected login or delivery error. Confirm Sequent is connected; if you changed settings or restarted Sequent, request a FRESH panel.html. A wrong password also causes this timeout.'));return;}
          setTimeout(check,900);
        };
        check();
@@ -159,7 +159,7 @@
  el('screenshot').disabled=!cfg.screenshots;
  el('expiry').textContent='Panel expires '+new Date(cfg.expires*1000).toLocaleString()+'. Keep Sequent open and connected.';
  setInterval(()=>{if(loggedIn){if(expired()){signingKey=null;loggedIn=false;el('dashboard').classList.add('hide');el('loginCard').classList.remove('hide');uiMessage('loginMessage','Panel expired. Request a new file.',true);}else{poll();}}},4000);
- setInterval(()=>{if(loggedIn)sendQuietStatus();},8000);
+ setInterval(()=>{if(loggedIn&&!document.hidden)sendQuietStatus();},45000);
  window.addEventListener('pagehide',()=>{signingKey=null;});
 })();
 </script>

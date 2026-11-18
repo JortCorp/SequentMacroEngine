@@ -25712,13 +25712,42 @@ try {{
                     and not self.sequent_remote.stop_event.is_set())
 
     def _remote_connect(self):
-        if self.sequent_remote:
-            self.sequent_remote.stop()
+        previous = self.sequent_remote
+        if previous:
+            previous.stop()
         self.sequent_remote = None
         if not self._remote_config.get('enabled'):
             return
         try:
-            relay = RemoteRelay(self._remote_config, self._remote_command_async)
+            relay = RemoteRelay(self._remote_config, self._remote_command_async,
+                                on_diagnostic=self._remote_log_event)
+            # Save & Connect should not invalidate an already-downloaded panel
+            # when connection credentials and routing are unchanged.
+            stable_fields = ('server', 'inbox_topic', 'phone_topic',
+                             'panel_auth_key', 'panel_salt', 'local_panel_enabled',
+                             'token_env', 'secret')
+            can_preserve = (previous is not None and
+                            all(previous.cfg.get(key) == relay.cfg.get(key)
+                                for key in stable_fields))
+            if can_preserve:
+                now = time.time()
+                relay.panel_sessions = {
+                    sid: dict(info) for sid, info in previous.panel_sessions.items()
+                    if info.get('expires', 0) > now}
+                # Preserve the command cursor and used nonces across reconnection
+                # so duplicate commands never run a second time.
+                with previous.pending_lock:
+                    relay.seen.update(previous.seen)
+                if previous.ready.is_set() and previous.last_id != 'latest':
+                    relay.last_id = previous.last_id
+                    relay.ready.set()
+                if relay.panel_sessions:
+                    self._remote_log_event(
+                        f'Retained {len(relay.panel_sessions)} active HTML panel session(s).')
+            elif previous and previous.panel_sessions:
+                self._remote_log_event(
+                    'Existing HTML panels invalidated by changed connection or password; '
+                    'request a new panel.html.')
             relay.start()
             self.sequent_remote = relay
         except Exception as exc:

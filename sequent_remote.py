@@ -140,7 +140,8 @@ def save_config(cfg, path=None):
 
 
 class RemoteRelay:
-    def __init__(self, config, on_command, *, transport=_request, clock=time.time):
+    def __init__(self, config, on_command, *, transport=_request, clock=time.time,
+                 on_diagnostic=None):
         self.cfg = dict(config)
         self.server = _safe_url(self.cfg['server'])
         if not TOPIC_RE.fullmatch(self.cfg['inbox_topic']):
@@ -148,6 +149,7 @@ class RemoteRelay:
         if not re.fullmatch(r'[a-f0-9]{64}', self.cfg['secret']):
             raise ValueError('Invalid signing secret')
         self.on_command = on_command
+        self.on_diagnostic = on_diagnostic
         self.transport, self.clock = transport, clock
         self.stop_event = threading.Event()
         self.ready = threading.Event()
@@ -162,6 +164,14 @@ class RemoteRelay:
         self.last_poll = 0
         self._status_throttle = {}
         self.panel_sessions = {}  # ephemeral two-hour downloadable-panel sessions
+
+    def _diagnostic(self, detail):
+        """Report protocol failures locally, not on public ntfy topics."""
+        if self.on_diagnostic is not None:
+            try:
+                self.on_diagnostic('Remote panel: ' + str(detail)[:170])
+            except Exception:
+                pass
 
     def _headers(self):
         env = self.cfg.get('token_env', '').strip()
@@ -330,7 +340,17 @@ class RemoteRelay:
         marker='/* SEQUENT_PANEL_CONFIG */'
         if template_data.count(marker)!=1:
             del self.panel_sessions[sid]
-            raise ValueError('panel.html has an invalid configuration placeholder')
+            if 'Sequent Remote · Command Center' in template_data or 'Sequent Remote &middot; Command Center' in template_data:
+                raise ValueError(
+                    'Wrong panel.html: this is the hosted web_dashboard/panel.html. '
+                    'Replace it with the DOWNLOADABLE panel.html from the top level '
+                    'of the Sequent package, next to Sequent.py and sequent_remote.py. '
+                    f'File checked: {template}')
+            raise ValueError(
+                'Invalid downloadable panel template: expected one '
+                "'/* SEQUENT_PANEL_CONFIG */' marker in the project-root "
+                f'panel.html, but found {template_data.count(marker)}. '
+                f'File checked: {template}')
         safe_json=json.dumps(data,ensure_ascii=False,separators=(',',':')).replace('<',r'\u003c').replace('>',r'\u003e').replace('&',r'\u0026')
         document=template_data.replace(marker, 'window.SEQUENT_PANEL_CONFIG = '+safe_json+';')
         payload=document.encode('utf-8')
@@ -372,10 +392,34 @@ class RemoteRelay:
         except (ValueError,TypeError,OverflowError):
             return False
         if not payload:
+            # A wrong password must never receive a remotely distinguishable
+            # error reply; diagnostics are available ONLY on the local console.
+            try:
+                candidate = json.loads(raw)
+            except (ValueError, TypeError):
+                candidate = None
+            if (isinstance(candidate, dict) and candidate.get('v') == 4
+                    and candidate.get('op') == 'panel_login'):
+                sid = candidate.get('session')
+                if not isinstance(sid, str) or sid not in self.panel_sessions:
+                    self._diagnostic('Login rejected: session no longer exists. '
+                                     'Request a NEW panel.html after reconnecting.')
+                else:
+                    self._diagnostic('Login rejected: signature/password mismatch, '
+                                     'duplicate request, expired command, or clock skew.')
             return False
         version=payload['v']
         if version==4 and payload['op']=='panel_login':
-            self._panel_reply(payload['session'],{'kind':'login','nonce':payload['nonce'],'ok':True})
+            self._diagnostic('Valid login received; sending signed reply to phone.')
+            try:
+                if not self._panel_reply(payload['session'],
+                        {'kind':'login','nonce':payload['nonce'],'ok':True}):
+                    self._diagnostic('Login reply was not acknowledged by ntfy.')
+                    return False
+            except Exception as exc:
+                self._diagnostic('Failed to send login reply: '
+                                 f'{type(exc).__name__}: {exc}')
+                raise
         elif version==4 and payload['op']=='panel_status':
             now=self.clock()
             sid=payload['session']
