@@ -26440,7 +26440,7 @@ try {{
                 else:
                     state = relay.connection_state()
                     ink = {'CONNECTED': COLOR_SUCCESS, 'CONNECTING': SYNTAX_ORANGE,
-                           'RECONNECTING': SYNTAX_ORANGE, 'RATE LIMITED': SYNTAX_ORANGE,
+                           'RECONNECTING': SYNTAX_ORANGE, 'POLLING': SYNTAX_ORANGE, 'RATE LIMITED': SYNTAX_ORANGE,
                            'OFFLINE': COLOR_DANGER}[state]
                 connection_badge.configure(text='  ' + state + '  ', bg=ink,
                                             fg=TEXT_ON_ACCENT if state in ('CONNECTED','OFFLINE')

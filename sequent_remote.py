@@ -183,6 +183,14 @@ class RemoteRelay:
         self._idle_rollovers = 0
         self._stream_lock = threading.RLock()
         self._status_throttle = {}
+        # Streaming is preferable, but some networks allow uploads while
+        # timing out the long-lived GET subscription. Fall back to deliberately
+        # slow polling until the next periodic stream probe.
+        self._fallback_until = 0
+        self._fallback_last_ok = 0
+        self._stream_connect_failures = 0
+        self._stream_open_count = 0
+        self._stream_started_at = 0
         self.panel_sessions = {}  # ephemeral two-hour downloadable-panel sessions
 
     def _diagnostic(self, detail):
@@ -501,12 +509,16 @@ class RemoteRelay:
         return True
 
     def poll_once(self):
+        # 'latest' is a *moving* boundary: using it for every fallback poll
+        # would return no messages forever. Convert an empty startup poll to a
+        # fixed Unix-time cursor for subsequent polling/reconnection.
+        initial = not self.ready.is_set()
+        floor = str(int(self.clock())) if initial and self.last_id == 'latest' else None
         query = urllib.parse.urlencode({'poll':'1', 'since':self.last_id})
         url = self.server+'/'+self.cfg['inbox_topic']+'/json?'+query
         content = self.transport(url, headers=self._headers(), timeout=12)
         self.last_poll = self.clock()
         # Initialize cursor but never accept old commands cached before connecting.
-        initial = not self.ready.is_set()
         for line in content.splitlines():
             try:
                 msg = json.loads(line)
@@ -517,6 +529,8 @@ class RemoteRelay:
                     self.last_id = msg['id']
                 if not initial:
                     self.receive_message(msg)
+        if floor is not None and self.last_id == 'latest':
+            self.last_id = floor
         self.ready.set()
 
     def start(self):
@@ -535,6 +549,12 @@ class RemoteRelay:
             return 'RATE LIMITED'
         if not self.ready.is_set():
             return 'CONNECTING'
+        # In fallback mode, a recent successful cache poll is a working
+        # receiver, albeit with slower command delivery than streaming.
+        if self.transport is _request and self._fallback_until > now:
+            if self._fallback_last_ok and now - self._fallback_last_ok <= 100:
+                return 'POLLING'
+            return 'RECONNECTING'
         # The normal production transport holds an active HTTPS subscription.
         # After it closes, do not claim a live connection merely because the
         # previous keepalive was recent. This also covers failed reconnects.
@@ -582,6 +602,9 @@ class RemoteRelay:
             NoRedirect, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
         request=urllib.request.Request(url, headers=self._headers())
         with opener.open(request, timeout=65) as response:
+            self._stream_open_count += 1
+            self._stream_started_at = self.clock()
+            self._stream_connect_failures = 0
             with self._stream_lock:
                 self._active_stream = response
                 self._stream_active = True
@@ -637,28 +660,43 @@ class RemoteRelay:
 
     def _loop(self):
         while not self.stop_event.is_set():
+            streaming_attempt = False
+            opening_count = self._stream_open_count
             try:
                 if self.transport is _request:
                     # One initial poll seeds the cursor; no cached commands run.
                     if not self.ready.is_set():
                         self.poll_once()
-                    self.stream_once()
+                    if self._fallback_until > self.clock():
+                        # A controlled 40-second poll avoids repeated streaming
+                        # connection timeouts and ntfy request-rate exhaustion.
+                        self.poll_once()
+                        self._fallback_last_ok = self.clock()
+                        self.poll_failures = 0
+                        self.next_retry = 0
+                        self.last_error = ''
+                        delay = 40
+                    else:
+                        self._fallback_until = 0
+                        streaming_attempt = True
+                        self.stream_once()
+                        self.poll_failures = 0
+                        self.next_retry = 0
+                        self.last_error = ''
+                        delay = 2
                 else:
-                    # Test transports keep the original single-request interface.
+                    # Mock transports keep the original single-request interface.
                     self.poll_once()
-                if self.poll_failures:
-                    self._diagnostic('ntfy connection recovered.')
-                self.poll_failures=0
-                self.next_retry=0
-                self.last_error=''
-                delay=2 if self.transport is _request else 20
+                    if self.poll_failures:
+                        self._diagnostic('ntfy connection recovered.')
+                    self.poll_failures = 0
+                    self.next_retry = 0
+                    self.last_error = ''
+                    delay = 20
             except _IdleStreamTimeout:
                 if self.stop_event.is_set():
                     break
-                # Socket read timeouts after an established connection are
-                # normal subscription rollovers. Reopen from last_id without
-                # invalidating sessions, re-seeding the cursor, or reconnecting
-                # the entire RemoteRelay object.
+                # Quiet refresh, not a failed connection.
                 self._idle_rollovers += 1
                 self.poll_failures = 0
                 self.last_error = ''
@@ -669,14 +707,30 @@ class RemoteRelay:
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
-                self.poll_failures+=1
-                code=getattr(exc,'code',None)
-                self.last_error=(f'HTTP {code} (ntfy rate limit)' if code==429
-                                 else (f'HTTP {code}' if isinstance(code,int)
-                                       else type(exc).__name__))
-                delay=self._retry_seconds(exc,self.poll_failures)
-                self.next_retry=self.clock()+delay
-                if self.poll_failures in (1,3,10):
+                self.poll_failures += 1
+                code = getattr(exc, 'code', None)
+                self.last_error = (f'HTTP {code} (ntfy rate limit)' if code == 429
+                                   else (f'HTTP {code}' if isinstance(code, int)
+                                         else type(exc).__name__))
+                delay = self._retry_seconds(exc, self.poll_failures)
+                self.next_retry = self.clock() + delay
+                # A successful POST does not prove that a long-lived GET works.
+                # After two failed connection handshakes, use poll=1 temporarily
+                # rather than repeatedly opening a stream the network rejects.
+                if streaming_attempt and self._stream_open_count == opening_count:
+                    self._stream_connect_failures += 1
+                    if (self._stream_connect_failures >= 2 and
+                            code not in (401, 403, 429) and self.ready.is_set()):
+                        self._fallback_until = self.clock() + 300
+                        self._fallback_last_ok = 0
+                        delay = max(delay, 15)
+                        self._diagnostic('Live ntfy subscription could not open; '
+                                         'switching to 40-second polling for 5 minutes.')
+                elif streaming_attempt:
+                    # A stream established successfully, so treat a later read
+                    # failure separately from repeated handshake failures.
+                    self._stream_connect_failures = 0
+                if self.poll_failures in (1, 3, 10):
                     self._diagnostic(f'{self.last_error}; retrying in {int(delay)}s. '
                                      'The receiver has not been restarted.')
             self.stop_event.wait(delay)
