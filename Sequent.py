@@ -25954,6 +25954,8 @@ try {{
         errors = tk.BooleanVar(value=bool(cfg.get('auto_error_alert', False)))
         error_shot = tk.BooleanVar(value=bool(cfg.get('error_screenshot', False)))
         scope = tk.StringVar(value=cfg.get('screen_scope', 'Monitor at Cursor'))
+        discord_enabled = tk.BooleanVar(value=bool(cfg.get('discord_enabled', False)))
+        web_enabled = tk.BooleanVar(value=bool(cfg.get('web_enabled', False)))
         feedback = tk.StringVar(value='Changes are not saved until you click Save & Connect.')
 
         # Sticky footer: Save & Connect is always visible, including at 125%
@@ -26075,6 +26077,57 @@ try {{
                                     state='readonly', style='SequentRemote.TCombobox')
         scope_select.pack(fill=tk.X, ipady=2)
 
+        # Discord commands are signed by a separate HTTPS relay, then delivered
+        # through the existing outbound-only ntfy command receiver. This is an
+        # additional permission, not automatically granted with phone controls.
+        discord_section = card('Discord Bridge',
+                               'Control approved macros with /sequent slash commands. '
+                               'Requires a separately deployed, authenticated Discord relay.')
+        toggle(discord_section, 'Allow signed commands from the Discord Bridge', discord_enabled)
+        tk.Label(discord_section, text='Relay deployment details', bg=BG_PANEL,
+                 fg=TEXT_PRIMARY, font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(10, 6))
+
+        def bridge_copy(label, content, confirm=False):
+            if confirm and not messagebox.askyesno(
+                    'Copy private signing key',
+                    'This key authorizes remote commands. Copy it only into your '
+                    'private relay secret configuration. Never share it in Discord '
+                    'or paste it into a public repository. Continue?', parent=win):
+                return
+            win.clipboard_clear()
+            win.clipboard_append(content)
+            win.update()
+            feedback.set(label + ' copied to clipboard. Keep private values secure.')
+            footer_message.configure(fg=COLOR_SUCCESS)
+
+        for title, value, is_secret in (
+                ('Copy ntfy server', cfg.get('server', 'https://ntfy.sh'), False),
+                ('Copy command topic', cfg.get('inbox_topic', ''), False),
+                ('Copy signing secret', cfg.get('secret', ''), True)):
+            b = tk.Button(discord_section, text=title,
+                          command=lambda t=title, v=value, x=is_secret: bridge_copy(t, v, x),
+                          bg=BG_HOVER, fg=TEXT_PRIMARY, activebackground=BG_BORDER,
+                          activeforeground=TEXT_PRIMARY, relief='flat', bd=0,
+                          font=('Segoe UI', 9), padx=12, pady=8, cursor='hand2')
+            b.pack(anchor='w', fill=tk.X, pady=(0, 5))
+        tk.Label(discord_section,
+                 text='The signing secret must be configured as a secret on the relay. '
+                      'The bridge is disabled until you enable this checkbox and click Save & Connect. '
+                      'See DISCORD_BRIDGE_SETUP.md in the download.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 justify='left', wraplength=605).pack(anchor='w', fill=tk.X, pady=(4, 2))
+
+        web_section = card('Web Dashboard',
+                           'Phone-sized browser controls through a private Cloudflare Worker. '
+                           'The relay sends signed commands through ntfy; no local port is opened.')
+        toggle(web_section, 'Allow signed commands from the Web Dashboard', web_enabled)
+        tk.Label(web_section,
+                 text='Deploy web_dashboard/worker.mjs, configure its secrets and login password, '
+                      'then enable this checkbox and Save & Connect. Keep the signing key '
+                      'server-side, never in a public webpage. See WEB_DASHBOARD_SETUP.md.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 justify='left', wraplength=605).pack(anchor='w', fill=tk.X, pady=(4, 2))
+
         automation = card('Scheduling & Heartbeat',
                           'Optional periodic heartbeat and a strict allowlist for preset launches.')
         heartbeat = field(automation, 'Heartbeat interval (minutes)',
@@ -26119,6 +26172,8 @@ try {{
                                enabled=enabled.get(), server=server.get().strip(),
                                phone_topic=phone.get().strip(), token_env=token.get().strip(),
                                allow_screenshots=allow_screens.get(), allow_launch=allow_launch.get(),
+                               discord_enabled=discord_enabled.get(),
+                               web_enabled=web_enabled.get(),
                                auto_error_alert=errors.get(), error_screenshot=error_shot.get(),
                                screen_scope=scope.get(), heartbeat_minutes=minutes,
                                allowed_macros=selected)

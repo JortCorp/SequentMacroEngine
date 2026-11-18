@@ -61,7 +61,7 @@ def config_default():
             'secret': secrets.token_hex(32), 'token_env':'',
             'auto_error_alert': False, 'error_screenshot': False,
             'heartbeat_minutes': 0, 'allowed_macros': [], 'commands_enabled': True,
-            'allow_screenshots': False, 'allow_launch': False, 'screen_scope':'Monitor at Cursor',
+            'allow_screenshots': False, 'allow_launch': False, 'discord_enabled': False, 'web_enabled': False, 'screen_scope':'Monitor at Cursor',
             'schedule': []}
 
 
@@ -165,24 +165,56 @@ class RemoteRelay:
         return action
 
     def verify(self, payload):
-        if not isinstance(payload,dict) or set(payload) != {'v','op','value','request','nonce','exp','sig'}:
+        """Authenticate phone buttons (v1), Discord (v2), and Web (v3).
+
+        Each relay has a separate explicit permission. The HMAC covers the
+        source field, so commands cannot bypass disabled channels.
+        """
+        if not isinstance(payload, dict):
             return None
-        if payload['v'] != 1 or payload['op'] not in SAFE_COMMANDS:
+        v1_fields = {'v', 'op', 'value', 'request', 'nonce', 'exp', 'sig'}
+        source_fields = v1_fields | {'src'}
+        version = payload.get('v')
+        if version == 1:
+            if set(payload) != v1_fields:
+                return None
+        elif version in (2, 3):
+            expected_source = 'discord' if version == 2 else 'web'
+            permission = 'discord_enabled' if version == 2 else 'web_enabled'
+            if (set(payload) != source_fields or
+                    payload.get('src') != expected_source or
+                    not self.cfg.get(permission, False)):
+                return None
+        else:
             return None
-        if any(not isinstance(payload[k],str) or len(payload[k]) > 250 for k in ('value','request','nonce','sig')):
+        if payload['op'] not in SAFE_COMMANDS:
             return None
-        if not isinstance(payload['exp'],int) or payload['exp'] < self.clock() or payload['exp'] > self.clock()+3601:
+        if version in (2, 3) and payload['op'] in ('approve', 'choose'):
+            # Remote decisions require individual one-time phone buttons.
             return None
-        msg = json.dumps({k:v for k,v in payload.items() if k != 'sig'},sort_keys=True,separators=(',',':')).encode('utf-8')
-        expected = hmac.new(bytes.fromhex(self.cfg['secret']),msg,hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected,payload['sig']):
+        if any(not isinstance(payload[k], str) or len(payload[k]) > 250
+               for k in ('value', 'request', 'nonce', 'sig')):
+            return None
+        if not isinstance(payload['exp'], int) or isinstance(payload['exp'], bool):
+            return None
+        now = self.clock()
+        if payload['exp'] < now or payload['exp'] > now + (181 if version in (2, 3) else 3601):
+            return None
+        signed = {k: v for k, v in payload.items() if k != 'sig'}
+        # Keep the v1 wire format unchanged for existing ntfy action buttons.
+        msg = json.dumps(signed, sort_keys=True, separators=(',', ':'),
+                         ensure_ascii=(version == 1)).encode('utf-8')
+        expected = hmac.new(bytes.fromhex(self.cfg['secret']), msg, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, payload['sig']):
             return None
         nonce = payload['nonce']
+        if not nonce or not re.fullmatch(r'[A-Za-z0-9_-]{6,64}', nonce):
+            return None
         with self.pending_lock:
             if nonce in self.seen:
                 return None
             self.seen[nonce] = payload['exp']
-            while len(self.seen)>1500:
+            while len(self.seen) > 1500:
                 self.seen.popitem(last=False)
         return payload
 
