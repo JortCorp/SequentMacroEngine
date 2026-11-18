@@ -26433,20 +26433,20 @@ try {{
                 if not win.winfo_exists():
                     return
                 relay = self.sequent_remote
-                connected = self._remote_ready()
-                if connected:
-                    state, ink, caption = 'CONNECTED', COLOR_SUCCESS, 'Connected • polling commands'
-                elif self._remote_config.get('enabled'):
-                    state, ink, caption = 'CONNECTING', SYNTAX_ORANGE, 'Connecting / offline'
+                if not self._remote_config.get('enabled'):
+                    state, ink = 'DISABLED', BG_BORDER
+                elif relay is None:
+                    state, ink = 'CONNECTING', SYNTAX_ORANGE
                 else:
-                    state, ink, caption = 'DISABLED', BG_BORDER, 'Remote receiver disabled'
+                    state = relay.connection_state()
+                    ink = {'CONNECTED': COLOR_SUCCESS, 'CONNECTING': SYNTAX_ORANGE,
+                           'RECONNECTING': SYNTAX_ORANGE, 'RATE LIMITED': SYNTAX_ORANGE,
+                           'OFFLINE': COLOR_DANGER}[state]
                 connection_badge.configure(text='  ' + state + '  ', bg=ink,
-                                            fg=TEXT_ON_ACCENT if connected else TEXT_PRIMARY)
-                # Preserve a fresh save/error message; status is already visible
-                # in the fixed header and never overwrites the footer feedback.
-                if relay and relay.last_error:
-                    connection_badge.configure(text='  OFFLINE  ', bg=COLOR_DANGER,
-                                                fg=TEXT_ON_ACCENT)
+                                            fg=TEXT_ON_ACCENT if state in ('CONNECTED','OFFLINE')
+                                               else TEXT_PRIMARY)
+                # Status comes from the receiver's health/backoff, not just the
+                # presence of one transient HTTP exception.
                 rows = '\n'.join(self._remote_log[-30:])
                 if log.get('1.0', 'end-1c') != rows:
                     log.configure(state='normal')

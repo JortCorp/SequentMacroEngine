@@ -29,7 +29,8 @@
 'use strict';
 (function(){
  const cfg=window.SEQUENT_PANEL_CONFIG, el=id=>document.getElementById(id);
- let signingKey=null,loggedIn=false,replyCursor='all',phoneCursor='all',busy=false,waiting=new Map(),lastReplyCheck=0;
+ let signingKey=null,loggedIn=false,replyCursor='all',phoneCursor='latest',busy=false,waiting=new Map(),lastReplyCheck=0;
+ let ntfyCooldownUntil=0,pollInProgress=false,rateLimitMessage='';
  const textEncoder=new TextEncoder();
  const api=cfg.server.replace(/\/$/,'');
  const now=()=>Math.floor(Date.now()/1000);
@@ -49,13 +50,25 @@
    const data={v:4,src:'panel',op,value:String(value),session:cfg.session,nonce:randomHex(),exp:now()+90};
    const signed=await crypto.subtle.sign('HMAC',signingKey,textEncoder.encode(canonical(data)));
    data.sig=hex(signed);
+   if(Date.now()<ntfyCooldownUntil)throw new Error(rateLimitMessage||'ntfy is rate-limiting requests. Try again later.');
    const response=await fetch(api+'/'+cfg.inbox,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(data),cache:'no-store'});
+   if(response.status===429)rateLimited(response);
    if(!response.ok)throw new Error('ntfy rejected command (HTTP '+response.status+').');
    return data.nonce;
  }
+ function rateLimited(response){
+   const raw=response.headers.get('Retry-After');
+   const numeric=raw!==null?Number(raw):NaN;
+   const parsed=raw&&!Number.isFinite(numeric)?Date.parse(raw):NaN;
+   const delay=Number.isFinite(numeric)?numeric*1000:(Number.isFinite(parsed)?parsed-Date.now():60000);
+   ntfyCooldownUntil=Date.now()+Math.min(900000,Math.max(15000,delay));
+   rateLimitMessage='ntfy rate limit (HTTP 429). Requests paused temporarily; retry after '+new Date(ntfyCooldownUntil).toLocaleTimeString()+'.';
+ }
  async function readTopic(topic,kind){
+   if(Date.now()<ntfyCooldownUntil)throw new Error(rateLimitMessage);
    let cursor=kind==='reply'?replyCursor:phoneCursor;
    const response=await fetch(api+'/'+topic+'/json?poll=1&since='+encodeURIComponent(cursor),{cache:'no-store'});
+   if(response.status===429)rateLimited(response);
    if(!response.ok)throw new Error('ntfy returned HTTP '+response.status);
    const raw=await response.text();
    for(const line of raw.split('\n')){
@@ -107,16 +120,20 @@
  async function send(op,value=''){
    try{
      const nonce=await publish(op,value);uiMessage('actionMessage','Command sent. Awaiting Sequent acknowledgment...');
-     const answer=await waitFor(nonce);
+     const answer=await waitFor(nonce,30000);
      uiMessage('actionMessage',answer.kind==='accepted'?'Command accepted by Sequent; execution is not guaranteed until status updates.':('Response: '+answer.kind));
      if(op==='pause'||op==='resume'||op==='stop'||op==='launch')setTimeout(()=>sendQuietStatus(),1000);
    }catch(error){uiMessage('actionMessage',error.message,true);}
  }
  async function sendQuietStatus(){if(!loggedIn)return;try{await publish('panel_status');}catch{}}
  async function poll(){
-   if(!loggedIn||expired())return;
-   try{await readTopic(cfg.reply,'reply');}catch(error){uiMessage('actionMessage','Cannot read ntfy replies: '+error.message,true);}
-   try{await readTopic(cfg.phone,'phone');}catch(error){el('feed').textContent='Cannot load ntfy feed: '+error.message;}
+   if(!loggedIn||expired()||pollInProgress||Date.now()<ntfyCooldownUntil)return;
+   pollInProgress=true;
+   try{
+     try{await readTopic(cfg.reply,'reply');}catch(error){uiMessage('actionMessage','Cannot read ntfy replies: '+error.message,true);}
+     if(Date.now()<ntfyCooldownUntil)return;
+     try{await readTopic(cfg.phone,'phone');}catch(error){el('feed').textContent='Cannot load ntfy feed: '+error.message;}
+   }finally{pollInProgress=false;}
  }
  async function doLoginSafe(){
    if(busy)return;
@@ -135,7 +152,7 @@
          if(!waiting.has(nonce))return;
          try{await readTopic(cfg.reply,'reply');}catch(e){uiMessage('loginMessage','Polling ntfy: '+e.message,true);}
          if(Date.now()>=deadline){waiting.delete(nonce);reject(new Error('No authenticated login reply. Check Remote Console → Remote Activity for a rejected login or delivery error. Confirm Sequent is connected; if you changed settings or restarted Sequent, request a FRESH panel.html. A wrong password also causes this timeout.'));return;}
-         setTimeout(check,900);
+         setTimeout(check,2500);
        };
        check();
      });
@@ -158,8 +175,8 @@
  el('schedule').addEventListener('click',()=>{const name=el('macro').value;if(name&&confirm('Schedule "'+name+'" to run in 15 minutes?'))send('schedule',name+'@15');});
  el('screenshot').disabled=!cfg.screenshots;
  el('expiry').textContent='Panel expires '+new Date(cfg.expires*1000).toLocaleString()+'. Keep Sequent open and connected.';
- setInterval(()=>{if(loggedIn){if(expired()){signingKey=null;loggedIn=false;el('dashboard').classList.add('hide');el('loginCard').classList.remove('hide');uiMessage('loginMessage','Panel expired. Request a new file.',true);}else{poll();}}},4000);
- setInterval(()=>{if(loggedIn&&!document.hidden)sendQuietStatus();},45000);
+ setInterval(()=>{if(loggedIn){if(expired()){signingKey=null;loggedIn=false;el('dashboard').classList.add('hide');el('loginCard').classList.remove('hide');uiMessage('loginMessage','Panel expired. Request a new file.',true);}else{poll();}}},20000);
+ setInterval(()=>{if(loggedIn&&!document.hidden)sendQuietStatus();},120000);
  window.addEventListener('pagehide',()=>{signingKey=null;});
 })();
 </script>

@@ -19,6 +19,9 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 
 TOPIC_RE = re.compile(r'^[A-Za-z0-9_-]{12,64}$')
 SAFE_COMMANDS = frozenset({'pause', 'resume', 'stop', 'status', 'screenshot', 'dashboard', 'approve', 'choose', 'launch', 'schedule', 'panel_file', 'panel_login', 'panel_status'})
@@ -162,6 +165,10 @@ class RemoteRelay:
         self.last_command = ''
         self.last_push = 0
         self.last_poll = 0
+        self.poll_failures = 0
+        self.next_retry = 0
+        self._active_stream = None
+        self._stream_lock = threading.RLock()
         self._status_throttle = {}
         self.panel_sessions = {}  # ephemeral two-hour downloadable-panel sessions
 
@@ -506,17 +513,133 @@ class RemoteRelay:
         self.worker = threading.Thread(target=self._loop, daemon=True, name='SequentRemoteRelay')
         self.worker.start()
 
+    def connection_state(self, now=None):
+        """Expose actual network health instead of showing OFFLINE on one failed poll."""
+        now = self.clock() if now is None else now
+        if self.stop_event.is_set():
+            return 'OFFLINE'
+        if self.last_error.startswith('HTTP 429') and now < self.next_retry:
+            return 'RATE LIMITED'
+        if not self.ready.is_set():
+            return 'CONNECTING'
+        if self.last_poll and now - self.last_poll > 75:
+            return 'RECONNECTING'
+        return 'CONNECTED'
+
+    def _retry_seconds(self, exc, failures):
+        """Honor ntfy Retry-After, otherwise exponential cooldown without hammering."""
+        code = getattr(exc, 'code', None)
+        if code == 429:
+            headers = getattr(exc, 'headers', None)
+            raw = headers.get('Retry-After') if headers else None
+            if raw:
+                try:
+                    delay = float(raw)
+                except (ValueError, TypeError):
+                    try:
+                        delay = (parsedate_to_datetime(raw) -
+                                 datetime.now(timezone.utc)).total_seconds()
+                    except (ValueError, TypeError, OverflowError):
+                        delay = 60
+                return max(5.0, min(900.0, delay))
+            return min(300.0, 60.0 * (2 ** min(3, failures-1)))
+        return min(60.0, 5.0 * (2 ** min(4, failures-1)))
+
+    def stream_once(self):
+        """Hold one JSON stream instead of issuing an HTTP poll every four seconds.
+
+        Initial cached events are skipped by poll_once() before connecting.
+        ntfy's open/keepalive frames are used to track connection health.
+        """
+        query=urllib.parse.urlencode({'since':self.last_id})
+        url=self.server+'/'+self.cfg['inbox_topic']+'/json?'+query
+        # Match _request: no redirects or non-HTTPS requests, and system TLS.
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, request, fp, code, message, hdrs, newurl):
+                return None
+        opener=urllib.request.build_opener(
+            NoRedirect, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        request=urllib.request.Request(url, headers=self._headers())
+        with opener.open(request, timeout=65) as response:
+            with self._stream_lock:
+                self._active_stream=response
+            self.last_poll=self.clock()
+            self.ready.set()
+            try:
+                while not self.stop_event.is_set():
+                    line=response.readline(MAX_RESPONSE+1)
+                    if not line:
+                        break
+                    if len(line)>MAX_RESPONSE:
+                        raise ValueError('ntfy stream message exceeded safety limit')
+                    try:
+                        msg=json.loads(line)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    event=msg.get('event')
+                    if event in ('open','keepalive','message'):
+                        self.last_poll=self.clock()
+                    if event != 'message' or msg.get('topic') != self.cfg['inbox_topic']:
+                        continue
+                    mid=msg.get('id')
+                    if isinstance(mid,str) and 0<len(mid)<100:
+                        # A reconnection can replay the last message: skip it.
+                        if mid == self.last_id:
+                            continue
+                        self.last_id=mid
+                    self.receive_message(msg)
+            finally:
+                with self._stream_lock:
+                    if self._active_stream is response:
+                        self._active_stream=None
+        if not self.stop_event.is_set():
+            # A healthy stream remains open. Fast disconnects must back off,
+            # not turn into another rapid request loop.
+            raise ConnectionError('ntfy subscription stream ended')
+
     def _loop(self):
         while not self.stop_event.is_set():
             try:
-                self.poll_once()
-                self.last_error = ''
+                if self.transport is _request:
+                    # One initial poll seeds the cursor; no cached commands run.
+                    if not self.ready.is_set():
+                        self.poll_once()
+                    self.stream_once()
+                else:
+                    # Test transports keep the original single-request interface.
+                    self.poll_once()
+                if self.poll_failures:
+                    self._diagnostic('ntfy connection recovered.')
+                self.poll_failures=0
+                self.next_retry=0
+                self.last_error=''
+                delay=2 if self.transport is _request else 20
             except Exception as exc:
-                self.last_error = f'{type(exc).__name__}: {exc}'[:300]
-            self.stop_event.wait(4)
+                if self.stop_event.is_set():
+                    break
+                self.poll_failures+=1
+                code=getattr(exc,'code',None)
+                self.last_error=(f'HTTP {code} (ntfy rate limit)' if code==429
+                                 else (f'HTTP {code}' if isinstance(code,int)
+                                       else type(exc).__name__))
+                delay=self._retry_seconds(exc,self.poll_failures)
+                self.next_retry=self.clock()+delay
+                if self.poll_failures in (1,3,10):
+                    self._diagnostic(f'{self.last_error}; retrying in {int(delay)}s. '
+                                     'The receiver has not been restarted.')
+            self.stop_event.wait(delay)
 
     def stop(self):
         self.stop_event.set()
+        # Release long-lived subscription when the Remote Console reconnects.
+        with self._stream_lock:
+            stream=self._active_stream
+            self._active_stream=None
+        if stream is not None:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
         with self.pending_lock:
             for record in self.pending.values():
                 record['event'].set()
