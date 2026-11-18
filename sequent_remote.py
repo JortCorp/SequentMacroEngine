@@ -7,8 +7,10 @@ running sensitive workflows or when the relay is not approved.
 """
 from __future__ import annotations
 import collections
+import base64
 import hashlib
 import hmac
+import struct
 import json
 import os
 from pathlib import Path
@@ -43,6 +45,185 @@ class _IdleStreamTimeout(Exception):
     evidence that the receiver's worker has stopped.
     """
 
+
+
+
+class _SecureNtfyWebSocket:
+    """Small, read-only RFC 6455 client for ntfy's WSS subscription endpoint.
+
+    Uses only Python's standard library, validates TLS and the WebSocket
+    handshake, supports HTTP CONNECT proxies, and caps every received frame.
+    The client only sends protocol control frames (masked ping/pong/close),
+    never unauthenticated application commands.
+    """
+
+    def __init__(self, server, topic, since, headers=None, timeout=12):
+        parsed = urllib.parse.urlsplit(server)
+        if parsed.scheme != 'https' or not parsed.hostname:
+            raise ValueError('Secure WebSocket requires an HTTPS ntfy server')
+        host = parsed.hostname
+        port = parsed.port or 443
+        socket_host = host
+        socket_port = port
+        proxy = None
+        try:
+            if not urllib.request.proxy_bypass(host):
+                proxy = urllib.request.getproxies().get('https')
+        except (OSError, ValueError):
+            proxy = urllib.request.getproxies().get('https')
+        if proxy:
+            # urllib accepts proxy names without a scheme on Windows.
+            pp = urllib.parse.urlsplit(proxy if '://' in proxy else 'http://' + proxy)
+            if pp.scheme.lower() != 'http' or not pp.hostname:
+                raise ConnectionError('WebSocket proxy protocol unsupported; trying HTTPS streaming')
+            if pp.username or pp.password:
+                raise ConnectionError('Authenticated WebSocket proxy unsupported; trying HTTPS streaming')
+            socket_host, socket_port = pp.hostname, pp.port or 80
+        self.sock = None
+        self.reader = None
+        try:
+            conn = socket.create_connection((socket_host, socket_port), timeout=timeout)
+            self.sock = conn
+            conn.settimeout(timeout)
+            if proxy:
+                authority = f'{host}:{port}'
+                conn.sendall((f'CONNECT {authority} HTTP/1.1\r\n'
+                              f'Host: {authority}\r\n'
+                              'Proxy-Connection: Keep-Alive\r\n\r\n').encode('ascii'))
+                pfile = conn.makefile('rb')
+                try:
+                    code, _headers = self._read_headers(pfile)
+                finally:
+                    pfile.close()
+                if code != 200:
+                    raise ConnectionError(f'WebSocket proxy CONNECT failed (HTTP {code})')
+            tls = ssl.create_default_context().wrap_socket(conn, server_hostname=host)
+            self.sock = tls
+            tls.settimeout(timeout)
+            urlpath = ('/' + urllib.parse.quote(topic, safe='') + '/ws?' +
+                       urllib.parse.urlencode({'since': str(since)}))
+            key = base64.b64encode(secrets.token_bytes(16)).decode('ascii')
+            authority = host if port == 443 else f'{host}:{port}'
+            parts = [f'GET {urlpath} HTTP/1.1', f'Host: {authority}',
+                     'Upgrade: websocket', 'Connection: Upgrade',
+                     f'Sec-WebSocket-Key: {key}', 'Sec-WebSocket-Version: 13',
+                     'Cache-Control: no-cache']
+            for name, value in (headers or {}).items():
+                if name.lower() not in ('authorization',):
+                    raise ValueError('Unexpected WebSocket header')
+                if '\r' in value or '\n' in value:
+                    raise ValueError('Invalid WebSocket authorization header')
+                parts.append(f'{name}: {value}')
+            tls.sendall(('\r\n'.join(parts) + '\r\n\r\n').encode('ascii'))
+            self.reader = tls.makefile('rb')
+            status, response_headers = self._read_headers(self.reader)
+            if status != 101:
+                if status == 429:
+                    raise urllib.error.HTTPError(server, 429, 'ntfy WebSocket rate limited',
+                                                 response_headers, None)
+                raise ConnectionError(f'ntfy WebSocket upgrade returned HTTP {status}')
+            expected = base64.b64encode(hashlib.sha1(
+                (key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode('ascii')
+            ).digest()).decode('ascii')
+            if (response_headers.get('sec-websocket-accept') != expected or
+                    response_headers.get('upgrade', '').lower() != 'websocket' or
+                    'upgrade' not in response_headers.get('connection','').lower()):
+                raise ConnectionError('ntfy WebSocket handshake validation failed')
+            tls.settimeout(85)  # ntfy keepalives normally arrive before this.
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _read_headers(reader):
+        first = reader.readline(2049)
+        if len(first) > 2048 or not first.startswith(b'HTTP/1.'):
+            raise ConnectionError('Invalid ntfy HTTP upgrade response')
+        try:
+            status = int(first.split(b' ', 2)[1])
+        except (ValueError, IndexError):
+            raise ConnectionError('Invalid ntfy HTTP response status') from None
+        values = {}
+        total = len(first)
+        for _ in range(64):
+            line = reader.readline(2049)
+            total += len(line)
+            if total > 16384 or len(line) > 2048 or not line:
+                raise ConnectionError('Oversized or truncated ntfy HTTP headers')
+            if line in (b'\r\n', b'\n'):
+                return status, values
+            if b':' in line:
+                name, value = line.split(b':', 1)
+                values[name.decode('ascii','ignore').strip().lower()] = value.decode('latin1').strip()
+        raise ConnectionError('Too many ntfy HTTP headers')
+
+    def _read_exact(self, size):
+        data = self.reader.read(size)
+        if data is None or len(data) != size:
+            raise ConnectionError('ntfy WebSocket closed unexpectedly')
+        return data
+
+    def _control(self, opcode, payload=b''):
+        if len(payload) > 125:
+            raise ValueError('WebSocket control frame too long')
+        mask = secrets.token_bytes(4)
+        masked = bytes(byte ^ mask[i%4] for i, byte in enumerate(payload))
+        self.sock.sendall(bytes([0x80 | opcode, 0x80 | len(payload)]) + mask + masked)
+
+    def recv_json(self):
+        accumulated = bytearray()
+        fragmented = False
+        while True:
+            b1, b2 = self._read_exact(2)
+            fin, opcode, masked = bool(b1 & 0x80), b1 & 0x0f, bool(b2 & 0x80)
+            if b1 & 0x70 or masked:
+                raise ConnectionError('Invalid ntfy WebSocket frame')
+            length = b2 & 0x7f
+            if length == 126:
+                length = struct.unpack('!H', self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack('!Q', self._read_exact(8))[0]
+            if length > MAX_RESPONSE or len(accumulated) + length > MAX_RESPONSE:
+                raise ValueError('ntfy WebSocket message exceeded safety limit')
+            payload = self._read_exact(length)
+            if opcode == 0x8:
+                raise ConnectionError('ntfy WebSocket closed the subscription')
+            if opcode == 0x9:
+                if not fin or length > 125:
+                    raise ConnectionError('Invalid ntfy WebSocket ping')
+                self._control(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode not in (0x0, 0x1) or (opcode == 0x0) != fragmented:
+                raise ConnectionError('Unsupported ntfy WebSocket frame sequence')
+            if opcode == 0x1:
+                fragmented = not fin
+                accumulated = bytearray(payload)
+            else:
+                accumulated.extend(payload)
+                fragmented = not fin
+            if fin:
+                return json.loads(accumulated.decode('utf-8'))
+
+    def close(self):
+        sock, self.sock = self.sock, None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except (OSError, ValueError):
+                pass
+        reader, self.reader = self.reader, None
+        if reader is not None:
+            try:
+                reader.close()
+            except (OSError, ValueError):
+                pass
+        if sock is not None:
+            try:
+                sock.close()
+            except (OSError, ValueError):
+                pass
 
 
 def _config_dir():
@@ -195,6 +376,8 @@ class RemoteRelay:
         self._stream_connect_failures = 0
         self._stream_open_count = 0
         self._stream_started_at = 0
+        self._live_transport = 'websocket'
+        self._live_name = ''
         self.panel_sessions = {}  # ephemeral two-hour downloadable-panel sessions
 
     def _diagnostic(self, detail):
@@ -590,6 +773,49 @@ class RemoteRelay:
             return min(300.0, 60.0 * (2 ** min(3, failures-1)))
         return min(60.0, 5.0 * (2 ** min(4, failures-1)))
 
+    def websocket_once(self):
+        """Preferred low-latency ntfy transport (WSS, stdlib only)."""
+        ws = _SecureNtfyWebSocket(self.server, self.cfg['inbox_topic'],
+                                 self.last_id, self._headers(), timeout=12)
+        with self._stream_lock:
+            self._active_stream = ws
+            self._stream_active = True
+        self._stream_open_count += 1
+        self._stream_started_at = self.clock()
+        self._stream_connect_failures = 0
+        self._live_name = 'WebSocket'
+        self.poll_failures = 0
+        self.last_error = ''
+        self.next_retry = 0
+        self.last_poll = self.clock()
+        self.ready.set()
+        self._diagnostic('ntfy LIVE via secure WebSocket.')
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    msg = ws.recv_json()
+                except (TimeoutError, socket.timeout) as exc:
+                    raise _IdleStreamTimeout() from exc
+                event = msg.get('event') if isinstance(msg, dict) else None
+                if event in ('open','keepalive','message'):
+                    self.last_poll = self.clock()
+                if event != 'message' or msg.get('topic') != self.cfg['inbox_topic']:
+                    continue
+                mid = msg.get('id')
+                if isinstance(mid, str) and 0 < len(mid) < 100:
+                    if mid == self.last_id:
+                        continue
+                    self.last_id = mid
+                self.receive_message(msg)
+        finally:
+            with self._stream_lock:
+                if self._active_stream is ws:
+                    self._active_stream = None
+                self._stream_active = False
+            ws.close()
+        if not self.stop_event.is_set():
+            raise ConnectionError('ntfy WebSocket subscription ended')
+
     def stream_once(self):
         """Hold one JSON stream instead of issuing an HTTP poll every four seconds.
 
@@ -605,9 +831,16 @@ class RemoteRelay:
         opener=urllib.request.build_opener(
             NoRedirect, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
         request=urllib.request.Request(url, headers=self._headers())
-        with opener.open(request, timeout=65) as response:
+        with opener.open(request, timeout=18) as response:
+            # Fail a buffered/proxied upgrade quickly, but allow long idle
+            # reads once HTTP response headers have actually arrived.
+            try:
+                response.fp.raw._sock.settimeout(85)
+            except (AttributeError, OSError, ValueError):
+                pass
             self._stream_open_count += 1
             self._stream_started_at = self.clock()
+            self._live_name = 'HTTP stream'
             self._stream_connect_failures = 0
             with self._stream_lock:
                 self._active_stream = response
@@ -663,19 +896,22 @@ class RemoteRelay:
             raise ConnectionError('ntfy subscription stream ended')
 
     def _loop(self):
+        """Live WebSocket first, live HTTP second, rate-aware polling last.
+
+        An ntfy server may allow POST and cache GET while a proxy buffers
+        streaming responses. Trying the separate WebSocket protocol prevents
+        permanently relegating a healthy WebSocket-capable network to polling.
+        """
         while not self.stop_event.is_set():
-            streaming_attempt = False
+            live_attempt = False
+            mode_attempted = None
             opening_count = self._stream_open_count
             try:
                 if self.transport is _request:
-                    # One initial poll seeds the cursor; no cached commands run.
                     if not self.ready.is_set():
-                        self.poll_once()
-                    if self._fallback_until > self.clock():
-                        # Streaming is unavailable on this network. One cache
-                        # poll every 10 seconds is much more responsive than
-                        # the old 40-second fallback while respecting ntfy's
-                        # request-token refill (429 still uses Retry-After).
+                        self.poll_once()  # fixed startup cursor; ignore older commands
+                    now = self.clock()
+                    if self._fallback_until > now:
                         self.poll_once()
                         self._fallback_last_ok = self.clock()
                         self.poll_failures = 0
@@ -683,18 +919,23 @@ class RemoteRelay:
                         self.last_error = ''
                         delay = FALLBACK_POLL_SECONDS
                     else:
-                        self._fallback_until = 0
-                        streaming_attempt = True
-                        self.stream_once()
+                        if self._fallback_until:
+                            self._fallback_until = 0
+                            self._live_transport = 'websocket'
+                        live_attempt = True
+                        mode_attempted = self._live_transport
+                        if mode_attempted == 'websocket':
+                            self.websocket_once()
+                        else:
+                            self.stream_once()
                         self.poll_failures = 0
                         self.next_retry = 0
                         self.last_error = ''
                         delay = 2
                 else:
-                    # Mock transports keep the original single-request interface.
+                    # Existing injectable fake transports exercise the JSON
+                    # polling protocol; never attempt real network in tests.
                     self.poll_once()
-                    if self.poll_failures:
-                        self._diagnostic('ntfy connection recovered.')
                     self.poll_failures = 0
                     self.next_retry = 0
                     self.last_error = ''
@@ -702,14 +943,13 @@ class RemoteRelay:
             except _IdleStreamTimeout:
                 if self.stop_event.is_set():
                     break
-                # Quiet refresh, not a failed connection.
                 self._idle_rollovers += 1
                 self.poll_failures = 0
                 self.last_error = ''
+                self.next_retry = 0
                 delay = 2
-                self.next_retry = self.clock() + delay
                 if self._idle_rollovers == 1:
-                    self._diagnostic('ntfy idle stream refreshed; receiver and panel sessions remain active.')
+                    self._diagnostic('ntfy LIVE idle stream refreshed; sessions and command cursor preserved.')
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
@@ -720,25 +960,26 @@ class RemoteRelay:
                                          else type(exc).__name__))
                 delay = self._retry_seconds(exc, self.poll_failures)
                 self.next_retry = self.clock() + delay
-                # A successful POST does not prove that a long-lived GET works.
-                # After two failed connection handshakes, use poll=1 temporarily
-                # rather than repeatedly opening a stream the network rejects.
-                if streaming_attempt and self._stream_open_count == opening_count:
-                    self._stream_connect_failures += 1
-                    if (self._stream_connect_failures >= 2 and
-                            code not in (401, 403, 429) and self.ready.is_set()):
+                # Try the other *live* protocol before polling. 401/403/429
+                # are authorization/quota problems, not streaming problems.
+                if live_attempt and self._stream_open_count == opening_count and code not in (401, 403, 429):
+                    if mode_attempted == 'websocket':
+                        self._live_transport = 'http'
+                        delay = 2
+                        self._diagnostic(f'WebSocket unavailable ({self.last_error}); trying live HTTP stream.')
+                    else:
                         self._fallback_until = self.clock() + STREAM_PROBE_INTERVAL_SECONDS
                         self._fallback_last_ok = 0
-                        delay = max(delay, 15)
-                        self._diagnostic('Live ntfy subscription could not open; '
-                                         'switching to 10-second polling until the next live-connection probe.')
-                elif streaming_attempt:
-                    # A stream established successfully, so treat a later read
-                    # failure separately from repeated handshake failures.
-                    self._stream_connect_failures = 0
-                if self.poll_failures in (1, 3, 10):
-                    self._diagnostic(f'{self.last_error}; retrying in {int(delay)}s. '
-                                     'The receiver has not been restarted.')
+                        delay = max(delay, 10)
+                        self._diagnostic(f'Both live ntfy transports failed ({self.last_error}); '
+                                         f'using {FALLBACK_POLL_SECONDS}-second POLLING as backup.')
+                elif live_attempt and self._stream_open_count > opening_count:
+                    # Connection got established: normal interruption. Keep
+                    # retrying the transport that last worked.
+                    pass
+                if self.poll_failures in (1,3,10):
+                    self._diagnostic(f'{self.last_error} in {mode_attempted or "poll"}; '
+                                     f'retrying in {int(delay)}s. Receiver was not restarted.')
             self.stop_event.wait(delay)
 
     def stop(self):

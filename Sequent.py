@@ -26442,7 +26442,14 @@ try {{
                     ink = {'CONNECTED': COLOR_SUCCESS, 'CONNECTING': SYNTAX_ORANGE,
                            'RECONNECTING': SYNTAX_ORANGE, 'POLLING': SYNTAX_ORANGE, 'RATE LIMITED': SYNTAX_ORANGE,
                            'OFFLINE': COLOR_DANGER}[state]
-                connection_badge.configure(text='  ' + state + '  ', bg=ink,
+                # Distinguish an actual live subscription from backup polling.
+                # This is display-only; connection_state() remains the source of truth.
+                display_state = state
+                if state == 'CONNECTED' and relay is not None:
+                    live_kind = getattr(relay, '_live_name', '')
+                    display_state = ('LIVE • WSS' if live_kind == 'WebSocket' else
+                                     'LIVE • HTTP' if live_kind == 'HTTP stream' else 'CONNECTED')
+                connection_badge.configure(text='  ' + display_state + '  ', bg=ink,
                                             fg=TEXT_ON_ACCENT if state in ('CONNECTED','OFFLINE')
                                                else TEXT_PRIMARY)
                 # Status comes from the receiver's health/backoff, not just the
