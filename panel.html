@@ -7,7 +7,7 @@
 <title>Sequent Remote — Portable Panel</title>
 <style>
 :root{--bg:#0c1017;--card:#151c27;--card2:#1c2734;--border:#2a3849;--ink:#eef3f9;--muted:#9aacbf;--accent:#f58b4d;--good:#62d9a7;--bad:#fa7780;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
-*{box-sizing:border-box}body{margin:0;color:var(--ink);background:radial-gradient(ellipse at top,#242634 0%,var(--bg) 56%);min-height:100dvh}main{max-width:700px;margin:auto;padding:20px 15px 80px}.heading{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:14px 0 19px}.brand{display:flex;gap:12px;align-items:center}.logo{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;color:#121720;background:linear-gradient(130deg,#ffb565,var(--accent));font-weight:900;font-size:24px}.eyebrow{font-size:.69rem;letter-spacing:.18em;color:var(--accent);font-weight:800}h1{font-size:1.37rem;line-height:1.2;margin:2px 0 0}h2{font-size:1rem;margin:0 0 5px}.hint{color:var(--muted);font-size:.83rem;line-height:1.5}.badge{font-size:.72rem;border:1px solid var(--border);border-radius:100px;padding:7px 9px;color:var(--muted);white-space:nowrap}.badge.online{border-color:#32785c;color:var(--good)}.badge.error{border-color:#984b57;color:var(--bad)}.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:17px;margin:12px 0;box-shadow:0 8px 24px #0002}.hide{display:none!important}label{font-size:.83rem;color:#d6dfeb;display:block;font-weight:600;margin:14px 0 7px}input,select{width:100%;font:inherit;font-size:.96rem;background:#101822;color:var(--ink);border:1px solid var(--border);padding:12px 14px;border-radius:11px;min-height:46px}input:focus,select:focus{outline:2px solid #b66a3c;outline-offset:1px}button{font:inherit;border:1px solid var(--border);background:var(--card2);color:var(--ink);border-radius:11px;min-height:46px;padding:9px 11px;font-weight:650;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}button:hover:not(:disabled){filter:brightness(1.15)}button.primary{background:linear-gradient(110deg,#ffa45d,#df713b);color:#19120d;border:0}button.warn{background:#502d34;color:#fff1f0;border-color:#8c4a50}.two{display:grid;grid-template-columns:1fr 1fr;gap:9px}.three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.actions button{display:flex;flex-direction:column;gap:5px;align-items:center;justify-content:center;min-height:67px}.actions button span{font-size:1.2rem}.headrow{display:flex;justify-content:space-between;align-items:center;gap:12px}.textbutton{border:0;background:transparent;color:var(--muted);padding:2px;min-height:24px;font-size:.81rem}.status{font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:#b7c8d8;font-size:.8rem;line-height:1.65;background:#101822;border-radius:10px;padding:12px;margin:10px 0 0;max-height:170px;overflow:auto}.row{display:flex;gap:9px;align-items:flex-end}.row>div{flex:1}.row>button{flex:none}.feed{display:grid;gap:8px;margin-top:10px;max-height:310px;overflow:auto}.item{padding:11px;border-radius:10px;background:#101822;border:1px solid #243345}.item b{font-size:.84rem}.item small{display:block;color:var(--muted);margin:5px 0}.item p{font-size:.8rem;color:#c9d6e4;white-space:pre-wrap;margin:6px 0}.item a{color:#ffc18d;font-size:.8rem;word-break:break-all}.preview{max-width:100%;max-height:220px;object-fit:contain;border-radius:7px}.msg{font-size:.82rem;min-height:19px;margin:10px 0;line-height:1.5}.msg.error{color:var(--bad)}.msg.ok{color:var(--good)}.subtle{font-size:.74rem;color:#8194a6}.footnote{text-align:center;font-size:.74rem;color:#8194a6;margin-top:25px}.split{height:1px;background:var(--border);margin:15px 0}#expiry{color:#ffb771}
+*{box-sizing:border-box}body{margin:0;color:var(--ink);background:radial-gradient(ellipse at top,#242634 0%,var(--bg) 56%);min-height:100dvh}main{max-width:700px;margin:auto;padding:20px 15px 80px}.heading{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:14px 0 19px}.brand{display:flex;gap:12px;align-items:center}.logo{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;color:#121720;background:linear-gradient(130deg,#ffb565,var(--accent));font-weight:900;font-size:24px}.eyebrow{font-size:.69rem;letter-spacing:.18em;color:var(--accent);font-weight:800}h1{font-size:1.37rem;line-height:1.2;margin:2px 0 0}h2{font-size:1rem;margin:0 0 5px}.hint{color:var(--muted);font-size:.83rem;line-height:1.5}.badge{font-size:.72rem;border:1px solid var(--border);border-radius:100px;padding:7px 9px;color:var(--muted);white-space:nowrap}.badge.online{border-color:#32785c;color:var(--good)}.badge.error{border-color:#984b57;color:var(--bad)}.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:17px;margin:12px 0;box-shadow:0 8px 24px #0002}.hide{display:none!important}label{font-size:.83rem;color:#d6dfeb;display:block;font-weight:600;margin:14px 0 7px}input,select{width:100%;font:inherit;font-size:.96rem;background:#101822;color:var(--ink);border:1px solid var(--border);padding:12px 14px;border-radius:11px;min-height:46px}input:focus,select:focus{outline:2px solid #b66a3c;outline-offset:1px}button{font:inherit;border:1px solid var(--border);background:var(--card2);color:var(--ink);border-radius:11px;min-height:46px;padding:9px 11px;font-weight:650;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}button:hover:not(:disabled){filter:brightness(1.15)}button.primary{background:linear-gradient(110deg,#ffa45d,#df713b);color:#19120d;border:0}button.warn{background:#502d34;color:#fff1f0;border-color:#8c4a50}.two{display:grid;grid-template-columns:1fr 1fr;gap:9px}.three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.actions button{display:flex;flex-direction:column;gap:5px;align-items:center;justify-content:center;min-height:67px}.actions button span{font-size:1.2rem}.headrow{display:flex;justify-content:space-between;align-items:center;gap:12px}.textbutton{border:0;background:transparent;color:var(--muted);padding:2px;min-height:24px;font-size:.81rem}.status{font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:#b7c8d8;font-size:.8rem;line-height:1.65;background:#101822;border-radius:10px;padding:12px;margin:10px 0 0;max-height:170px;overflow:auto}.row{display:flex;gap:9px;align-items:flex-end}.row>div{flex:1}.row>button{flex:none}.feed{display:grid;gap:8px;margin-top:10px;max-height:310px;overflow:auto}.item{padding:11px;border-radius:10px;background:#101822;border:1px solid #243345}.item b{font-size:.84rem}.item small{display:block;color:var(--muted);margin:5px 0}.item p{font-size:.8rem;color:#c9d6e4;white-space:pre-wrap;margin:6px 0}.item a{color:#ffc18d;font-size:.8rem;word-break:break-all}.preview{max-width:100%;max-height:220px;object-fit:contain;border-radius:7px}#lastPreview .preview{max-height:400px;width:100%;display:block}#previewHistory .item{padding:7px 10px}.msg{font-size:.82rem;min-height:19px;margin:10px 0;line-height:1.5}.msg.error{color:var(--bad)}.msg.ok{color:var(--good)}.subtle{font-size:.74rem;color:#8194a6}.footnote{text-align:center;font-size:.74rem;color:#8194a6;margin-top:25px}.split{height:1px;background:var(--border);margin:15px 0}#expiry{color:#ffb771}
 @media (max-width:420px){main{padding:14px 10px 60px}.card{padding:14px}.actions button{font-size:.85rem}}
 </style>
 <script>/* SEQUENT_PANEL_CONFIG */</script>
@@ -17,8 +17,21 @@
  <section class="card" id="loginCard"><h2>Unlock your control panel</h2><div class="hint">Enter the password you configured in Sequent's Remote Console. It never gets sent to ntfy.</div><label for="password">Panel password</label><input id="password" type="password" autocomplete="off" placeholder="Enter your Sequent panel password"><button class="primary" style="width:100%;margin-top:12px" id="login">Unlock & connect</button><p class="msg" id="loginMessage" role="status"></p><div class="subtle">This downloaded panel works only while its Sequent session is active and expires after two hours. ntfy and internet access are required.</div></section>
  <section id="dashboard" class="hide">
  <div class="card"><div class="headrow"><div><h2>Playback controls</h2><div class="hint">Commands are delivered through ntfy</div></div><button class="textbutton" id="logout">Lock</button></div><div class="three actions" style="margin-top:13px"><button data-op="pause"><span>Ⅱ</span>Pause</button><button data-op="resume"><span>▶</span>Resume</button><button class="warn" data-op="stop"><span>■</span>Stop</button></div></div>
+ <div class="card"><div class="headrow"><div><h2>Recording</h2><div class="hint">Remotely record desktop inputs; stop automatically after 10 minutes.</div></div></div>
+ <div class="two" style="margin-top:12px"><button id="startRecord">● Start recording</button><button id="stopRecord">■ Stop &amp; save</button></div>
+ <div class="subtle" style="margin-top:9px">Recorded inputs may contain passwords or sensitive data. Use only on your own authorized desktop.</div></div>
+ <div class="card"><h2>Desktop security</h2><div class="hint">Locking Windows interrupts interactive automation. Smart Lock stops macros and blocks restarts until locally re-armed.</div>
+ <label style="display:flex;gap:10px;align-items:center"><input id="lockAfter" type="checkbox" style="width:20px;min-height:20px"> Lock desktop after successful execution</label>
+ <div class="two"><button id="lockDesktop">🔒 Lock desktop</button><button class="warn" id="smartLock">⏹ Smart Lock</button></div></div>
+ <div class="card"><div class="headrow"><div><h2>Screenshot feed</h2><div class="hint">Updates as screenshots arrive through ntfy; not live video. Six frames maximum per session.</div></div></div>
+ <div class="two" style="margin-top:12px"><div><label for="previewInterval">Capture interval</label><select id="previewInterval"><option value="30">Every 30 seconds</option><option value="60">Every 60 seconds</option></select></div>
+ <div><label for="previewScope">Capture area</label><select id="previewScope"><option value="cursor">Mouse monitor</option><option value="all">All monitors</option></select></div></div>
+ <div class="two" style="margin-top:12px"><button id="livePreview" class="primary">▣ Start screenshot feed</button><button id="stopPreview">■ Stop feed</button></div>
+ <div id="previewState" class="hint" style="margin-top:10px" role="status">Feed not running.</div>
+ <div id="lastPreview" class="hint" style="margin-top:10px">No screenshot received yet.</div>
+ <div id="previewHistory" class="feed" style="max-height:155px" aria-label="Previous screenshot frames"></div></div>
  <div class="card"><div class="headrow"><div><h2>Current status</h2><div class="hint" id="lastUpdated">Refreshing periodically</div></div><button class="textbutton" id="refresh">↻ Refresh</button></div><div class="status" id="status">Connecting to Sequent...</div><div class="two" style="margin-top:12px"><button data-op="status">Send status notification</button><button data-op="screenshot" id="screenshot">Request screenshot</button></div></div>
- <div class="card"><h2>Macro launcher</h2><div class="hint">Only presets approved in Sequent Remote Console are available.</div><label for="macro">Approved preset</label><select id="macro"></select><div class="two" style="margin-top:12px"><button class="primary" id="run">▶ Run macro</button><button id="schedule">Schedule in 15 min</button></div></div>
+ <div class="card"><div class="headrow"><div><h2>Macro launcher</h2><div class="hint">Only saved presets approved in Sequent Remote Console can run.</div></div><button class="textbutton" id="refreshPresets">↻ Refresh presets</button></div><label for="macro">Approved preset</label><select id="macro"></select><div class="hint" id="presetInfo" role="status" style="margin-top:8px">List saved when this panel was sent. Tap Refresh presets for current options.</div><div class="two" style="margin-top:12px"><button class="primary" id="run">▶ Run macro</button><button id="schedule">Schedule in 15 min</button></div></div>
  <div class="card"><div class="headrow"><div><h2>Recent notifications</h2><div class="hint">Read from the configured ntfy phone topic</div></div><button class="textbutton" id="refreshFeed">↻ Refresh</button></div><div id="feed" class="feed"><div class="hint">Checking for notifications...</div></div></div>
  <p class="msg" id="actionMessage" role="status"></p>
  </section>
@@ -112,6 +125,18 @@
     if(!await crypto.subtle.verify('HMAC',signingKey,bytes,textEncoder.encode(canonical(verifiedBody))))return;
     if(body.kind==='status'&&loggedIn){
       el('status').textContent=body.text||'No status returned';
+      const feedStatus=(body.text||'').match(/Screenshot feed:\s*(RUNNING|STOPPED)/);
+      if(feedStatus)el('previewState').textContent='PC feed: '+feedStatus[1].toLowerCase();
+      const lockInfo=(body.text||'').match(/Lock after execution:\s*(ON|OFF)/);
+      if(lockInfo&&el('lockAfter'))el('lockAfter').checked=lockInfo[1]==='ON';
+      const smartLock=(body.text||'').match(/Smart Lock:\s*(ENGAGED|OFF)/);
+      if(smartLock){
+        const engaged=smartLock[1]==='ENGAGED';
+        if(el('startRecord'))el('startRecord').disabled=engaged||!cfg.remote_record;
+        if(el('run'))el('run').disabled=engaged||el('macro').disabled;
+        if(el('schedule'))el('schedule').disabled=engaged||el('macro').disabled;
+      }
+
       el('lastUpdated').textContent='Updated '+new Date().toLocaleTimeString();
     }
     deliverReply(body);
@@ -119,6 +144,24 @@
   function renderNotification(msg){
     if(feedItems.some(item=>item.id===msg.id))return;
     feedItems.unshift(msg);feedItems.splice(12);
+    if((msg.title||'').startsWith('Sequent Screenshot Feed') && msg.attachment?.url &&
+       /^https:\/\//.test(msg.attachment.url)){
+      const box=el('lastPreview');box.replaceChildren();
+      const stamp=document.createElement('small');
+      stamp.textContent=(msg.title||'Screenshot received')+' • '+new Date().toLocaleTimeString();
+      const anchor=document.createElement('a');
+      anchor.href=msg.attachment.url;anchor.target='_blank';anchor.rel='noopener noreferrer';
+      const image=document.createElement('img');image.className='preview';image.alt='Latest remote screenshot';
+      image.src=msg.attachment.url;anchor.append(image);box.append(stamp,anchor);
+      const history=el('previewHistory');
+      const previous=document.createElement('div');previous.className='item';
+      const link=document.createElement('a');link.href=msg.attachment.url;
+      link.target='_blank';link.rel='noopener noreferrer';
+      link.textContent=(msg.title||'Screenshot')+' • '+new Date().toLocaleTimeString();
+      previous.append(link);history.prepend(previous);
+      while(history.children.length>5)history.lastElementChild.remove();
+      el('previewState').textContent='Latest frame received '+new Date().toLocaleTimeString();
+    }
     const target=el('feed');target.replaceChildren();
     for(const item of feedItems){
       const block=document.createElement('div');block.className='item';
@@ -257,9 +300,76 @@
   document.querySelectorAll('[data-op]').forEach(btn=>btn.addEventListener('click',()=>void send(btn.dataset.op)));
   el('refresh').addEventListener('click',()=>void sendQuietStatus());
   el('refreshFeed').addEventListener('click',()=>void pollOnce());
-  const macros=Array.isArray(cfg.allowed_macros)?cfg.allowed_macros:[];
-  for(const name of macros){const option=document.createElement('option');option.value=name;option.textContent=name;el('macro').append(option);}
-  if(!macros.length){const option=document.createElement('option');option.value='';option.textContent='No approved macros';el('macro').append(option);el('run').disabled=true;el('schedule').disabled=true;}
+  el('startRecord').disabled=!cfg.remote_record||cfg.safety_locked;
+  el('stopRecord').disabled=!cfg.remote_record;
+  el('lockAfter').disabled=!cfg.remote_lock;
+  el('lockAfter').checked=Boolean(cfg.lock_after);
+  el('lockDesktop').disabled=!cfg.remote_lock;
+  el('smartLock').disabled=!cfg.remote_lock;
+  el('livePreview').disabled=!cfg.live_preview;
+  el('stopPreview').disabled=!cfg.live_preview;
+  el('startRecord').addEventListener('click',()=>{
+    if(confirm('Start capturing mouse and keyboard activity on the PC for up to 10 minutes?'))void send('record_start');
+  });
+  el('stopRecord').addEventListener('click',()=>void send('record_stop'));
+  el('lockAfter').addEventListener('change',()=>void send('lock_after',el('lockAfter').checked?'on':'off'));
+  el('lockDesktop').addEventListener('click',()=>{
+    if(confirm('Lock the Windows desktop now? This is allowed only when Sequent is idle.'))void send('lock_desktop');
+  });
+  el('smartLock').addEventListener('click',()=>{
+    if(confirm('STOP all macros, stop recording, cancel schedules, and lock Windows? Only someone at the PC can re-arm Sequent.'))void send('smart_lock');
+  });
+  el('livePreview').addEventListener('click',()=>{
+    const interval=el('previewInterval').value, scope=el('previewScope').value;
+    if(!['30','60'].includes(interval)||!['cursor','all'].includes(scope))return;
+    if(confirm('Send up to six screenshots, every '+interval+' seconds, using ntfy attachments? This may consume significant attachment bandwidth.')){
+      el('previewState').textContent='Starting screenshot feed…';
+      void send('live_preview',interval+'|'+scope);
+    }
+  });
+  el('stopPreview').addEventListener('click',()=>{
+    el('previewState').textContent='Stop requested…';
+    void send('preview_stop');
+  });
+
+  function displayPresets(list, updated=false, truncated=false){
+    const selector=el('macro'), old=selector.value;
+    const names=[...new Set(list.filter(name=>typeof name==='string'&&name.length<=250))].slice(0,80);
+    selector.replaceChildren();
+    for(const name of names){
+      const option=document.createElement('option');option.value=name;option.textContent=name;
+      selector.append(option);
+    }
+    if(!names.length){
+      const option=document.createElement('option');option.value='';
+      option.textContent='No approved saved presets';selector.append(option);
+    }else if(names.includes(old))selector.value=old;
+    else selector.value=names[0];
+    selector.disabled=!names.length;
+    el('run').disabled=!names.length;
+    el('schedule').disabled=!names.length;
+    if(updated){
+      el('presetInfo').textContent=names.length+' approved saved preset'+(names.length===1?'':'s')+
+        ' · Updated '+new Date().toLocaleTimeString()+(truncated?' · List truncated':'');
+    }
+  }
+  async function refreshPresets(){
+    if(!loggedIn)return;
+    const btn=el('refreshPresets');
+    if(btn.disabled)return;
+    btn.disabled=true;
+    el('presetInfo').textContent='Requesting latest approved presets from Sequent…';
+    try{
+      const nonce=await publish('panel_presets');
+      const answer=await waitFor(nonce,90000);
+      if(answer.kind!=='presets'||!Array.isArray(answer.presets))throw new Error('Sequent returned an invalid preset list.');
+      displayPresets(answer.presets,true,Boolean(answer.truncated));
+    }catch(error){
+      el('presetInfo').textContent='Refresh failed: '+error.message+' · Existing list retained.';
+    }finally{btn.disabled=false;}
+  }
+  displayPresets(Array.isArray(cfg.allowed_macros)?cfg.allowed_macros:[]);
+  el('refreshPresets').addEventListener('click',()=>void refreshPresets());
   el('run').addEventListener('click',()=>{const name=el('macro').value;if(name&&confirm('Run approved macro "'+name+'" on your PC?'))void send('launch',name);});
   el('schedule').addEventListener('click',()=>{const name=el('macro').value;if(name&&confirm('Schedule "'+name+'" to run in 15 minutes?'))void send('schedule',name+'@15');});
   el('screenshot').disabled=!cfg.screenshots;

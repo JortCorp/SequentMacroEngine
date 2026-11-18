@@ -27,7 +27,7 @@ from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 
 TOPIC_RE = re.compile(r'^[A-Za-z0-9_-]{12,64}$')
-SAFE_COMMANDS = frozenset({'pause', 'resume', 'stop', 'status', 'screenshot', 'dashboard', 'approve', 'choose', 'launch', 'schedule', 'panel_file', 'panel_login', 'panel_status'})
+SAFE_COMMANDS = frozenset({'pause', 'resume', 'stop', 'status', 'screenshot', 'dashboard', 'approve', 'choose', 'launch', 'schedule', 'panel_file', 'panel_login', 'panel_status', 'panel_presets', 'record_start', 'record_stop', 'lock_desktop', 'smart_lock', 'lock_after', 'live_preview', 'preview_stop'})
 PANEL_KDF_ROUNDS = 310_000
 PANEL_LIFETIME = 2 * 3600
 MAX_RESPONSE = 256_000
@@ -284,7 +284,9 @@ def config_default():
             'allow_screenshots': False, 'allow_launch': False, 'discord_enabled': False, 'web_enabled': False,
             'dashboard_url': '', 'screen_scope':'Monitor at Cursor',
             'local_panel_enabled': False, 'panel_salt': '', 'panel_auth_key': '',
-            'schedule': []}
+            'schedule': [], 'allow_remote_record': False, 'allow_remote_lock': False,
+            'allow_live_preview': False, 'lock_after_execution': False,
+            'safety_locked': False}
 
 
 def set_panel_password(cfg, password):
@@ -467,7 +469,7 @@ class RemoteRelay:
             return None
         if version in (2,3,4) and payload['op'] in ('approve','choose'):
             return None
-        if version != 4 and payload['op'] in ('panel_login', 'panel_status'):
+        if version != 4 and payload['op'] in ('panel_login', 'panel_status', 'panel_presets'):
             return None
         if version == 4 and payload['op'] in ('dashboard','panel_file'):
             return None
@@ -522,6 +524,35 @@ class RemoteRelay:
         return self._panel_reply(sid,{'kind':'status','nonce':nonce,'text':str(snapshot)[:2500],
                                      'at':int(self.clock())})
 
+    def panel_presets_reply(self, packed, available_names):
+        """Reply with *current* saved AND approved presets, signed for this panel.
+
+        A downloaded HTML file may contain an older launch list. Refresh never
+        grants access to presets not explicitly approved in Remote Console.
+        Keep the response within ntfy's message-size allowance.
+        """
+        try:
+            sid, nonce = packed.split('|', 1)
+        except (ValueError, AttributeError):
+            return False
+        allowed = set(self.cfg.get('allowed_macros', ())) if self.cfg.get('allow_launch') else set()
+        names = []
+        truncated = False
+        for name in available_names:
+            if not isinstance(name, str) or name not in allowed or name in names:
+                continue
+            if len(name) > 250 or len(names) >= 80:
+                truncated = True
+                break
+            proposal = names + [name]
+            if len(json.dumps(proposal, ensure_ascii=False).encode('utf-8')) > 2200:
+                truncated = True
+                break
+            names.append(name)
+        return self._panel_reply(sid, {
+            'kind': 'presets', 'nonce': nonce, 'presets': names,
+            'truncated': truncated, 'at': int(self.clock())})
+
     def send_panel_file(self):
         """Read project-local panel.html, personalize session metadata and attach to ntfy.
 
@@ -550,7 +581,12 @@ class RemoteRelay:
               'session':sid,'expires':now+PANEL_LIFETIME,
               'salt':self.cfg['panel_salt'],'iterations':PANEL_KDF_ROUNDS,
               'allowed_macros':list(self.cfg.get('allowed_macros',[])) if self.cfg.get('allow_launch') else [],
-              'screenshots':bool(self.cfg.get('allow_screenshots'))}
+              'screenshots':bool(self.cfg.get('allow_screenshots')),
+              'remote_record':bool(self.cfg.get('allow_remote_record')),
+              'remote_lock':bool(self.cfg.get('allow_remote_lock')),
+              'live_preview':bool(self.cfg.get('allow_live_preview') and self.cfg.get('allow_screenshots')),
+              'lock_after':bool(self.cfg.get('lock_after_execution')),
+              'safety_locked':bool(self.cfg.get('safety_locked'))}
         template_data=template.read_text(encoding='utf-8')
         marker='/* SEQUENT_PANEL_CONFIG */'
         if template_data.count(marker)!=1:
@@ -624,6 +660,21 @@ class RemoteRelay:
                                      'duplicate request, expired command, or clock skew.')
             return False
         version=payload['v']
+        # All command sources share these local, explicitly opt-in permissions.
+        op=payload['op']
+        if op in ('record_start','record_stop') and not self.cfg.get('allow_remote_record'):
+            self._diagnostic('Remote recording rejected: not enabled in Remote Console')
+            return False
+        if op in ('lock_desktop','smart_lock','lock_after') and not self.cfg.get('allow_remote_lock'):
+            self._diagnostic('Desktop lock rejected: not enabled in Remote Console')
+            return False
+        if op in ('live_preview','preview_stop') and not (
+                self.cfg.get('allow_live_preview') and self.cfg.get('allow_screenshots')):
+            self._diagnostic('Live preview rejected: not enabled in Remote Console')
+            return False
+        if self.cfg.get('safety_locked') and op in ('record_start','launch','schedule'):
+            self._diagnostic('Launch/record rejected: Smart Lock requires local re-arming')
+            return False
         if version==4 and payload['op']=='panel_login':
             self._diagnostic('Valid login received; sending signed reply to phone.')
             try:
@@ -635,6 +686,13 @@ class RemoteRelay:
                 self._diagnostic('Failed to send login reply: '
                                  f'{type(exc).__name__}: {exc}')
                 raise
+        elif version==4 and payload['op']=='panel_presets':
+            now = self.clock()
+            sid = payload['session']
+            if now - self._status_throttle.get('panel_presets:'+sid, 0) < 3:
+                return False
+            self._status_throttle['panel_presets:'+sid] = now
+            self.on_command('panel_presets', sid+'|'+payload['nonce'])
         elif version==4 and payload['op']=='panel_status':
             now=self.clock()
             sid=payload['session']
@@ -682,11 +740,11 @@ class RemoteRelay:
             self.on_command(payload['op'],payload['value'])
         else:
             now = self.clock()
-            if now-self._status_throttle.get(payload['op'],0) < (25 if payload['op'] in ('screenshot','status') else 1):
+            if now-self._status_throttle.get(payload['op'],0) < (120 if payload['op']=='live_preview' else 25 if payload['op'] in ('screenshot','status') else 1):
                 return False
             self._status_throttle[payload['op']] = now
             self.on_command(payload['op'],payload['value'])
-        if version==4 and payload['op'] not in ('panel_login','panel_status'):
+        if version==4 and payload['op'] not in ('panel_login','panel_status','panel_presets'):
             try:
                 self._panel_reply(payload['session'],{'kind':'accepted','nonce':payload['nonce'],
                                         'op':payload['op'],'ok':True})

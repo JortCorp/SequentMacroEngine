@@ -18890,6 +18890,11 @@ class BuiltInMacroApp:
         self._remote_schedule = list(self._remote_config.get('schedule', []))
         self._remote_last_heartbeat = time.monotonic()
         self._remote_console = None
+        self._remote_safety_locked = bool(self._remote_config.get('safety_locked', False))
+        self._remote_recording_started = False
+        self._remote_recording_generation = 0
+        self._remote_preview_generation = 0
+        self._remote_preview_active = False
         self._auto_trigger_key = None
         self._auto_trigger_state = None
         self._webhook_server = None
@@ -20947,6 +20952,9 @@ class BuiltInMacroApp:
             self.stop_chain()
 
     def start_chain(self):
+        if self._remote_safety_locked:
+            self.update_status('Smart Lock active: re-arm locally in Remote Console', COLOR_DANGER)
+            return
         if not self.chain_steps:
             self.update_status("Chain has no stages", COLOR_DANGER)
             return
@@ -21059,6 +21067,8 @@ class BuiltInMacroApp:
         self.btn_run_chain.set_state("normal", text="Run Macro Chain (F9)", bg=COLOR_SUCCESS, hover="#1d8a4b")
         self.pause_btn.set_state("disabled", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
         self.refresh_chain_ui()
+        if self._remote_config.get('lock_after_execution') and not self._remote_safety_locked:
+            self.root.after(400, self._remote_lock_desktop)
 
     def toggle_pause(self):
         if self.recording:
@@ -25277,6 +25287,9 @@ try {{
         else: self.stop_macro()
 
     def start_recording(self):
+        if self._remote_safety_locked:
+            self.update_status('Smart Lock active: re-arm locally in Remote Console', COLOR_DANGER)
+            return
         if not self._safe_to_replace_queue():
             return
         self._unbind_preset_autosave()
@@ -25779,13 +25792,210 @@ try {{
         state = ('Recording' if self.recording else 'Paused' if self.is_paused else
                  'Running' if self.playing else 'Chain running' if self.chain_running else 'Idle')
         return ('Sequent: '+state+'\n'
+                'Lock after execution: '+('ON' if self._remote_config.get('lock_after_execution') else 'OFF')+'\n'
+                'Smart Lock: '+('ENGAGED' if self._remote_safety_locked else 'OFF')+'\n'
+                'Screenshot feed: '+('RUNNING' if self._remote_preview_active else 'STOPPED')+'\n'
                 'Step: '+str(progress.get('current',0))+'/'+str(progress.get('total',0))+'\n'
                 'Action: '+str(progress.get('action','Idle'))+'\n'
                 'Updated: '+time.strftime('%Y-%m-%d %H:%M:%S'))
 
+    def _remote_save_recording(self):
+        # Save without opening a file dialog on the locked/unattended desktop.
+        if not self.recorded_actions:
+            self._remote_log_event('Remote recording stopped (no actions to save)')
+            return None
+        now = time.strftime('%Y%m%d_%H%M%S')
+        for suffix in range(100):
+            name = 'RemoteRecording_' + now + (('_'+str(suffix)) if suffix else '')
+            path = os.path.join(self.presets_dir, name+'.json')
+            try:
+                with open(path, 'x', encoding='utf-8') as output:
+                    json.dump(self.recorded_actions, output, indent=2, ensure_ascii=False)
+                self._remote_log_event('Recording saved as '+name+' ('+str(len(self.recorded_actions))+' actions)')
+                return name
+            except FileExistsError:
+                continue
+            except (OSError, TypeError, ValueError) as exc:
+                self._remote_log_event('Recording could not be saved: '+str(exc)[:130])
+                return None
+        self._remote_log_event('Recording not saved: could not reserve a unique preset name')
+        return None
+
+    def _remote_stop_recording(self):
+        if not self.recording:
+            self._remote_log_event('Stop recording ignored: not recording')
+            return
+        self._remote_recording_generation += 1
+        self.stop_recording()
+        if self._remote_recording_started:
+            self._remote_save_recording()
+        self._remote_recording_started = False
+
+    def _remote_auto_stop_recording(self, generation):
+        if generation != self._remote_recording_generation or not self._remote_recording_started:
+            return
+        if self.recording:
+            self._remote_log_event('Remote recording reached the 10-minute safety limit')
+            self._remote_stop_recording()
+
+    def _remote_update_security(self, **updates):
+        candidate = dict(self._remote_config, **updates)
+        sequent_remote_save_config(candidate)
+        self._remote_config = candidate
+        if self.sequent_remote:
+            self.sequent_remote.cfg.update(updates)
+        self._remote_safety_locked = bool(candidate.get('safety_locked'))
+
+    def _remote_lock_desktop(self):
+        if os.name != 'nt':
+            self._remote_log_event('Desktop locking is available only on Windows')
+            return False
+        lock = ctypes.windll.user32.LockWorkStation
+        lock.argtypes = []
+        lock.restype = ctypes.c_int
+        if not lock():
+            self._remote_log_event('Windows refused desktop lock (interactive session required)')
+            return False
+        self._remote_log_event('Windows desktop lock requested')
+        return True
+
+    def _remote_start_preview(self, options):
+        """Send a bounded screenshot feed without concurrent ntfy uploads.
+
+        Remote options are allowlisted; a signed command cannot supply arbitrary
+        paths or URLs. Frames are scheduled only after the prior upload finishes
+        so a slow network cannot create an unbounded queue of uploads.
+        """
+        parts = str(options).split('|')
+        if len(parts) != 2 or parts[0] not in ('30', '60') or parts[1] not in ('cursor', 'all'):
+            self._remote_log_event('Screenshot feed rejected: invalid interval or monitor selection')
+            return
+        if self._remote_preview_active:
+            self._remote_log_event('Screenshot feed already running; stop it before starting another')
+            return
+        if not self._remote_ready():
+            self._remote_log_event('Screenshot feed unavailable: remote receiver is offline')
+            return
+        interval = int(parts[0])
+        scope = 'Monitor at Cursor' if parts[1] == 'cursor' else 'All Monitors'
+        maximum = 6
+        self._remote_preview_generation += 1
+        generation = self._remote_preview_generation
+        self._remote_preview_active = True
+        settings = dict(self._remote_config)
+        self._remote_log_event(
+            f'Screenshot feed started: {scope}, every {interval}s, maximum {maximum} frames')
+
+        def frame(index):
+            if generation != self._remote_preview_generation or not self._remote_preview_active:
+                return
+
+            def sender():
+                try:
+                    sequent_send_notification(self.dynamic_engine, {
+                        'type': 'notify_phone', 'provider': 'ntfy',
+                        'ntfy_server': settings['server'],
+                        'ntfy_topic': settings['phone_topic'],
+                        'ntfy_token_env': settings.get('token_env', ''),
+                        'title': f'Sequent Screenshot Feed • {index}/{maximum}',
+                        'message': f'Frame {index} of {maximum} • {scope} • '
+                                   f'{interval}-second capture interval',
+                        'attach_screenshot': True,
+                        'screenshot_scope': scope,
+                        'screenshot_resolution': 'Balanced (60%)',
+                        'screenshot_image_format': 'Auto (Recommended)',
+                        'screenshot_cursor_marker': True,
+                        'screenshot_cursor_coords': True,
+                    })
+                    result = ('Screenshot feed: frame '+str(index)+'/'+str(maximum)+' sent')
+                except Exception as exc:
+                    result = ('Screenshot feed: frame '+str(index)+'/'+str(maximum)+
+                              ' failed: '+str(exc)[:130])
+                # Scheduling and state mutations belong on the Tk thread.
+                try:
+                    self.root.after(0, completed, index, result)
+                except (RuntimeError, tk.TclError):
+                    pass
+
+            Thread(target=sender, daemon=True, name='SequentScreenshotFeed').start()
+
+        def completed(index, result):
+            if generation != self._remote_preview_generation or not self._remote_preview_active:
+                return
+            self._remote_log_event(result)
+            if index >= maximum:
+                self._remote_preview_active = False
+                self._remote_log_event('Screenshot feed finished; request another session to continue')
+            else:
+                self.root.after(interval * 1000, frame, index + 1)
+
+        frame(1)
+
     def _remote_command(self, operation, value):
         self._remote_log_event('Received '+operation)
-        if operation == 'pause':
+        if operation == 'record_start':
+            if not self._remote_config.get('allow_remote_record') or self._remote_safety_locked:
+                self._remote_log_event('Remote recording rejected: disabled or Smart Lock engaged')
+                return
+            if self.recording or self.playing or self.chain_running:
+                self._remote_log_event('Remote recording rejected: Sequent is busy')
+                return
+            # Never prompt over the local desktop or discard unsaved edits remotely.
+            saved = (self._active_saved_snapshot if self._active_preset_path
+                     else self._unbound_saved_snapshot)
+            if self._queue_content_snapshot() != saved:
+                self._remote_log_event('Remote recording rejected: save unsaved queue edits locally first')
+                return
+            self.start_recording()
+            if self.recording:
+                self._remote_recording_started = True
+                self._remote_recording_generation += 1
+                generation = self._remote_recording_generation
+                self.root.after(600000, self._remote_auto_stop_recording, generation)
+                self._remote_log_event('Remote recording started; will auto-stop after 10 minutes')
+        elif operation == 'record_stop':
+            if self._remote_config.get('allow_remote_record'):
+                self._remote_stop_recording()
+        elif operation == 'lock_after':
+            if not self._remote_config.get('allow_remote_lock') or value not in ('on','off'):
+                self._remote_log_event('Lock-after request rejected')
+                return
+            self._remote_update_security(lock_after_execution=(value=='on'))
+            self._remote_log_event('Lock after successful execution: '+value.upper())
+        elif operation == 'lock_desktop':
+            if not self._remote_config.get('allow_remote_lock'):
+                return
+            if self.recording or self.playing or self.chain_running:
+                self._remote_log_event('Manual Lock rejected: stop active work first, or use Smart Lock')
+                return
+            self._remote_lock_desktop()
+        elif operation == 'smart_lock':
+            if not self._remote_config.get('allow_remote_lock'):
+                return
+            # Persist before locking so reconnects or restarts cannot re-arm macros.
+            self._remote_update_security(safety_locked=True, lock_after_execution=False,
+                                         schedule=[])
+            self._remote_recording_generation += 1
+            self._remote_preview_generation += 1
+            self._remote_preview_active = False
+            self._remote_schedule.clear()
+            if self.recording:
+                self._remote_stop_recording()
+            if self.chain_running:
+                self.stop_chain()
+            elif self.playing:
+                self.stop_macro()
+            self._stop_webhook_listener()
+            self._remote_log_event('SMART LOCK: macros stopped; schedules cleared; local re-arm required')
+            self.root.after(650, self._remote_lock_desktop)
+        elif operation == 'live_preview':
+            if self._remote_config.get('allow_live_preview') and self._remote_config.get('allow_screenshots'):
+                self._remote_start_preview(value)
+        elif operation == 'preview_stop':
+            self._remote_preview_generation += 1
+            self._remote_preview_active = False
+            self._remote_log_event('Screenshot feed stopped (already-uploading frame may still arrive)')
+        elif operation == 'pause':
             if (self.playing or self.chain_running) and not self.is_paused:
                 self.toggle_pause()
         elif operation == 'resume':
@@ -25811,6 +26021,14 @@ try {{
                 snapshot = self._remote_status_text()
                 self._remote_thread(lambda: relay.panel_status_reply(value, snapshot),
                                     'Panel status reply')
+        elif operation == 'panel_presets':
+            if self._remote_ready():
+                relay = self.sequent_remote
+                # Tk thread: resolve saved preset files now; network send runs
+                # separately, so long ntfy waits never block the Action Queue.
+                available = self.get_preset_names()
+                self._remote_thread(lambda: relay.panel_presets_reply(value, available),
+                                    'Panel presets reply')
         elif operation == 'dashboard':
             if not (self._remote_config.get('web_enabled') and
                     self._remote_config.get('dashboard_url') and self._remote_ready()):
@@ -25828,8 +26046,8 @@ try {{
         elif operation == 'launch':
             if (not self._remote_config.get('allow_launch',False) or
                     value not in self._remote_config.get('allowed_macros',[]) or
-                    self.playing or self.recording or self.chain_running):
-                self._remote_log_event('Remote launch rejected (busy or not approved)')
+                    self.playing or self.recording or self.chain_running or self._remote_safety_locked):
+                self._remote_log_event('Remote launch rejected (busy, locked or not approved)')
                 return
             if self._active_preset_path:
                 clean = self._queue_content_snapshot() == self._active_saved_snapshot
@@ -26005,6 +26223,9 @@ try {{
         discord_enabled = tk.BooleanVar(value=bool(cfg.get('discord_enabled', False)))
         web_enabled = tk.BooleanVar(value=bool(cfg.get('web_enabled', False)))
         local_panel_enabled = tk.BooleanVar(value=bool(cfg.get('local_panel_enabled', False)))
+        remote_record = tk.BooleanVar(value=bool(cfg.get('allow_remote_record', False)))
+        remote_lock = tk.BooleanVar(value=bool(cfg.get('allow_remote_lock', False)))
+        remote_preview = tk.BooleanVar(value=bool(cfg.get('allow_live_preview', False)))
         feedback = tk.StringVar(value='Changes are not saved until you click Save & Connect.')
 
         # Sticky footer: Save & Connect is always visible, including at 125%
@@ -26105,6 +26326,9 @@ try {{
         permissions = card('Permissions', 'Allow only the remote operations you actually need.')
         toggle(permissions, 'Allow screenshot requests from phone', allow_screens)
         toggle(permissions, 'Allow launching approved presets', allow_launch)
+        toggle(permissions, 'Allow starting/stopping recording remotely (10-min auto-stop)', remote_record)
+        toggle(permissions, 'Allow remote Windows desktop locking and Smart Lock', remote_lock)
+        toggle(permissions, 'Allow low-rate screenshot preview (requires screenshots)', remote_preview)
         toggle(permissions, 'Notify phone automatically when a macro fails', errors)
         toggle(permissions, 'Attach a desktop screenshot to failure alerts', error_shot)
         tk.Label(permissions, text='Remote screenshot source', bg=BG_PANEL,
@@ -26210,6 +26434,31 @@ try {{
                  bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
                  justify='left', wraplength=605).pack(anchor='w', fill=tk.X, pady=(2, 2))
 
+        safety_card = card('Smart Lock Safety',
+                           'Smart Lock cancels the active macro, stops recording, clears scheduled jobs, '
+                           'and prevents new macro starts until explicitly re-armed here.')
+        safety_text = tk.Label(safety_card,
+                        text=('SMART LOCK ENGAGED' if self._remote_safety_locked else 'Smart Lock inactive'),
+                        bg=BG_PANEL, fg=(COLOR_DANGER if self._remote_safety_locked else TEXT_MUTED),
+                        font=('Segoe UI', 10, 'bold'))
+        safety_text.pack(anchor='w', pady=(3, 8))
+        def rearm_locally():
+            if not messagebox.askyesno('Re-arm Sequent',
+                    'Allow macros, recording, triggers and schedules to run again on this PC?',
+                    parent=win):
+                return
+            try:
+                self._remote_update_security(safety_locked=False)
+                safety_text.configure(text='Smart Lock inactive', fg=TEXT_MUTED)
+                feedback.set('Sequent locally re-armed. Remote permissions remain unchanged.')
+            except (OSError, ValueError) as exc:
+                feedback.set('Could not re-arm Sequent: '+str(exc))
+                footer_message.configure(fg=COLOR_DANGER)
+        tk.Button(safety_card, text='Re-arm macro execution on this computer',
+                  command=rearm_locally, bg=BG_HOVER, fg=TEXT_PRIMARY,
+                  relief='flat', bd=0, padx=12, pady=9,
+                  font=('Segoe UI', 9, 'bold')).pack(fill=tk.X)
+
         automation = card('Scheduling & Heartbeat',
                           'Optional periodic heartbeat and a strict allowlist for preset launches.')
         heartbeat = field(automation, 'Heartbeat interval (minutes)',
@@ -26255,6 +26504,8 @@ try {{
                                enabled=enabled.get(), server=server.get().strip(),
                                phone_topic=phone.get().strip(), token_env=token.get().strip(),
                                allow_screenshots=allow_screens.get(), allow_launch=allow_launch.get(),
+                               allow_remote_record=remote_record.get(), allow_remote_lock=remote_lock.get(),
+                               allow_live_preview=remote_preview.get(),
                                discord_enabled=discord_enabled.get(),
                                web_enabled=web_enabled.get(),
                                dashboard_url=dashboard_url.get().strip(),
@@ -26467,6 +26718,9 @@ try {{
         refresh()
 
     def start_macro(self):
+        if self._remote_safety_locked:
+            self.update_status('Smart Lock active: re-arm locally in Remote Console', COLOR_DANGER)
+            return
         # Fail closed: a disconnected Studio wire is never silently ignored.
         # The legacy structured engine cannot yet execute arbitrary graph edges.
         disconnected=getattr(self,'_studio_disabled_edges',set())
@@ -27253,7 +27507,8 @@ try {{
         self.play_btn.set_state("normal", text=self.get_btn_text("start_play"), bg=COLOR_ACCENT, hover=COLOR_ACCENT_HOV)
         self.pause_btn.set_state("disabled", text="Pause (F9)", bg=BG_BORDER, hover=BG_HOVER)
         self.update_scrubber_ui(show_reticle=False)
-
+        if outcome == 'completed' and self._remote_config.get('lock_after_execution') and not self._remote_safety_locked:
+            self.root.after(400, self._remote_lock_desktop)
 
 
 if __name__ == "__main__":
