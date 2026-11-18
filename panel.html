@@ -43,7 +43,7 @@
    const seed=await crypto.subtle.importKey('raw',textEncoder.encode(password),'PBKDF2',false,['deriveBits']);
    const salt=Uint8Array.from(cfg.salt.match(/../g),pair=>parseInt(pair,16));
    const bits=await crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:cfg.iterations,hash:'SHA-256'},seed,256);
-   return crypto.subtle.importKey('raw',bits,{name:'HMAC',hash:'SHA-256'},false,['sign']);
+   return crypto.subtle.importKey('raw',bits,{name:'HMAC',hash:'SHA-256'},false,['sign','verify']);
  }
  async function publish(op,value=''){
    if(!signingKey||expired())throw new Error('Panel locked or expired. Request a new file from Sequent.');
@@ -142,17 +142,17 @@
    const value=el('password').value;if(!value){uiMessage('loginMessage','Enter your panel password.',true);return;}
    busy=true;el('login').disabled=true;
    try{
-     uiMessage('loginMessage','Authenticating with Sequent...');
+     uiMessage('loginMessage','Authenticating with Sequent... This may take up to 90 seconds in polling mode.');
      signingKey=await deriveKey(value);el('password').value='';
      const nonce=await publish('panel_login');
      const answer=await new Promise((resolve,reject)=>{
        waiting.set(nonce,resolve);
-       const deadline=Date.now()+26000;
+       const deadline=Date.now()+90000; // Fallback receiver polls about every 40 seconds.
        const check=async()=>{
          if(!waiting.has(nonce))return;
          try{await readTopic(cfg.reply,'reply');}catch(e){uiMessage('loginMessage','Polling ntfy: '+e.message,true);}
          if(Date.now()>=deadline){waiting.delete(nonce);reject(new Error('No authenticated login reply. Check Remote Console → Remote Activity for a rejected login or delivery error. Confirm Sequent is connected; if you changed settings or restarted Sequent, request a FRESH panel.html. A wrong password also causes this timeout.'));return;}
-         setTimeout(check,2500);
+         setTimeout(check,8000); // Avoid excessive ntfy polls during login.
        };
        check();
      });
