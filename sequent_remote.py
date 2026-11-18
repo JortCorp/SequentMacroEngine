@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
 import ssl
 import threading
 import time
@@ -28,6 +29,16 @@ SAFE_COMMANDS = frozenset({'pause', 'resume', 'stop', 'status', 'screenshot', 'd
 PANEL_KDF_ROUNDS = 310_000
 PANEL_LIFETIME = 2 * 3600
 MAX_RESPONSE = 256_000
+
+
+class _IdleStreamTimeout(Exception):
+    """The established subscription was quiet until its socket read timed out.
+
+    It is safe to reopen the stream using the last message ID. Unlike a timeout
+    while establishing a connection, this is not an authentication failure or
+    evidence that the receiver's worker has stopped.
+    """
+
 
 
 def _config_dir():
@@ -168,6 +179,8 @@ class RemoteRelay:
         self.poll_failures = 0
         self.next_retry = 0
         self._active_stream = None
+        self._stream_active = False
+        self._idle_rollovers = 0
         self._stream_lock = threading.RLock()
         self._status_throttle = {}
         self.panel_sessions = {}  # ephemeral two-hour downloadable-panel sessions
@@ -514,7 +527,7 @@ class RemoteRelay:
         self.worker.start()
 
     def connection_state(self, now=None):
-        """Expose actual network health instead of showing OFFLINE on one failed poll."""
+        """Report streaming health, not the last exception from an idle socket."""
         now = self.clock() if now is None else now
         if self.stop_event.is_set():
             return 'OFFLINE'
@@ -522,6 +535,14 @@ class RemoteRelay:
             return 'RATE LIMITED'
         if not self.ready.is_set():
             return 'CONNECTING'
+        # The normal production transport holds an active HTTPS subscription.
+        # After it closes, do not claim a live connection merely because the
+        # previous keepalive was recent. This also covers failed reconnects.
+        if self.transport is _request:
+            with self._stream_lock:
+                active = self._stream_active
+            if not active:
+                return 'RECONNECTING'
         if self.last_poll and now - self.last_poll > 75:
             return 'RECONNECTING'
         return 'CONNECTED'
@@ -562,12 +583,28 @@ class RemoteRelay:
         request=urllib.request.Request(url, headers=self._headers())
         with opener.open(request, timeout=65) as response:
             with self._stream_lock:
-                self._active_stream=response
-            self.last_poll=self.clock()
+                self._active_stream = response
+                self._stream_active = True
+            # A successful subscription supersedes any prior transient error.
+            # The stream may stay open indefinitely, so clearing only after
+            # stream_once returns would leave stale errors in the console.
+            recovered = bool(self.poll_failures)
+            self.poll_failures = 0
+            self.last_error = ''
+            self.next_retry = 0
+            self.last_poll = self.clock()
             self.ready.set()
+            if recovered:
+                self._diagnostic('ntfy subscription reconnected.')
             try:
                 while not self.stop_event.is_set():
-                    line=response.readline(MAX_RESPONSE+1)
+                    try:
+                        line = response.readline(MAX_RESPONSE + 1)
+                    except (TimeoutError, socket.timeout) as exc:
+                        # This connection *was* established successfully. A
+                        # silent period should roll over the subscription, not
+                        # produce a scary TimeoutError / OFFLINE status.
+                        raise _IdleStreamTimeout from exc
                     if not line:
                         break
                     if len(line)>MAX_RESPONSE:
@@ -591,7 +628,8 @@ class RemoteRelay:
             finally:
                 with self._stream_lock:
                     if self._active_stream is response:
-                        self._active_stream=None
+                        self._active_stream = None
+                    self._stream_active = False
         if not self.stop_event.is_set():
             # A healthy stream remains open. Fast disconnects must back off,
             # not turn into another rapid request loop.
@@ -614,6 +652,20 @@ class RemoteRelay:
                 self.next_retry=0
                 self.last_error=''
                 delay=2 if self.transport is _request else 20
+            except _IdleStreamTimeout:
+                if self.stop_event.is_set():
+                    break
+                # Socket read timeouts after an established connection are
+                # normal subscription rollovers. Reopen from last_id without
+                # invalidating sessions, re-seeding the cursor, or reconnecting
+                # the entire RemoteRelay object.
+                self._idle_rollovers += 1
+                self.poll_failures = 0
+                self.last_error = ''
+                delay = 2
+                self.next_retry = self.clock() + delay
+                if self._idle_rollovers == 1:
+                    self._diagnostic('ntfy idle stream refreshed; receiver and panel sessions remain active.')
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
@@ -633,8 +685,9 @@ class RemoteRelay:
         self.stop_event.set()
         # Release long-lived subscription when the Remote Console reconnects.
         with self._stream_lock:
-            stream=self._active_stream
-            self._active_stream=None
+            stream = self._active_stream
+            self._active_stream = None
+            self._stream_active = False
         if stream is not None:
             try:
                 stream.close()
