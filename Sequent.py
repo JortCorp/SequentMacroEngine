@@ -25742,7 +25742,7 @@ try {{
             # when connection credentials and routing are unchanged.
             stable_fields = ('server', 'inbox_topic', 'phone_topic',
                              'panel_auth_key', 'panel_salt', 'local_panel_enabled',
-                             'token_env', 'secret')
+                             'allow_panel_slash_from_phone', 'token_env', 'secret')
             can_preserve = (previous is not None and
                             all(previous.cfg.get(key) == relay.cfg.get(key)
                                 for key in stable_fields))
@@ -26044,7 +26044,11 @@ try {{
                 self._remote_log_event('HTML Panel request rejected: disabled or offline')
                 return
             relay = self.sequent_remote
-            self._remote_thread(relay.send_panel_file, 'Send HTML panel')
+            # Only phone-topic slash commands request a second ntfy message
+            # containing a clickable attachment link. Normal buttons keep
+            # the original, low-traffic file-only behavior.
+            self._remote_thread(lambda: relay.send_panel_file(
+                include_open_link=(value == 'link')), 'Send HTML panel')
         elif operation == 'panel_status':
             if self._remote_ready():
                 relay = self.sequent_remote
@@ -26254,6 +26258,7 @@ try {{
         discord_enabled = tk.BooleanVar(value=bool(cfg.get('discord_enabled', False)))
         web_enabled = tk.BooleanVar(value=bool(cfg.get('web_enabled', False)))
         local_panel_enabled = tk.BooleanVar(value=bool(cfg.get('local_panel_enabled', False)))
+        phone_panel_command = tk.BooleanVar(value=bool(cfg.get('allow_panel_slash_from_phone', False)))
         remote_record = tk.BooleanVar(value=bool(cfg.get('allow_remote_record', False)))
         remote_lock = tk.BooleanVar(value=bool(cfg.get('allow_remote_lock', False)))
         remote_preview = tk.BooleanVar(value=bool(cfg.get('allow_live_preview', False)))
@@ -26486,6 +26491,7 @@ try {{
                                 'The file opens in your phone browser and signs commands with a password '
                                 'you set here; no remote signing secret is included in the file.')
         toggle(attachment_panel, 'Enable downloadable HTML panel commands', local_panel_enabled)
+        toggle(attachment_panel, 'Allow /panel command in the phone notification topic', phone_panel_command)
         panel_password = field(
             attachment_panel, 'Set or change panel password (16+ characters)', '',
             'Leave empty to retain the existing password. Password is never written to panel.html. '
@@ -26501,9 +26507,10 @@ try {{
             font=('Segoe UI', 9), anchor='w', justify='left')
         password_status_label.pack(anchor='w', fill=tk.X, pady=(5, 4))
         tk.Label(attachment_panel,
-                 text='From the ntfy Android app, publish /panel to the Sequent command topic. '
-                      'The requested panel is delivered to your configured phone notification topic. '
-                      'Downloaded pages expire after two hours or when Sequent reconnects.',
+                 text='With the option above enabled, publish /panel to your usual phone topic. '
+                      'Sequent will send panel.html, followed by an Open Panel link. '
+                      'The separate command topic and Get HTML Panel button still work. '
+                      'Panels expire after two hours; attachment links may expire sooner.',
                  bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
                  justify='left', wraplength=605).pack(anchor='w', fill=tk.X, pady=(7, 6))
         tk.Button(attachment_panel, text='Copy ntfy command topic',
@@ -26654,6 +26661,7 @@ try {{
                 selected.extend(name for name in extra_new if name not in selected)
                 new_cfg = dict(self._remote_config,
                                local_panel_enabled=local_panel_enabled.get(),
+                               allow_panel_slash_from_phone=phone_panel_command.get(),
                                enabled=enabled.get(), server=server.get().strip(),
                                phone_topic=phone.get().strip(), token_env=token.get().strip(),
                                allow_screenshots=allow_screens.get(), allow_launch=allow_launch.get(),

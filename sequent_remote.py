@@ -100,7 +100,7 @@ class _SecureNtfyWebSocket:
             tls = ssl.create_default_context().wrap_socket(conn, server_hostname=host)
             self.sock = tls
             tls.settimeout(timeout)
-            urlpath = ('/' + urllib.parse.quote(topic, safe='') + '/ws?' +
+            urlpath = ('/' + urllib.parse.quote(topic, safe=',') + '/ws?' +
                        urllib.parse.urlencode({'since': str(since)}))
             key = base64.b64encode(secrets.token_bytes(16)).decode('ascii')
             authority = host if port == 443 else f'{host}:{port}'
@@ -286,7 +286,8 @@ def config_default():
             'local_panel_enabled': False, 'panel_salt': '', 'panel_auth_key': '',
             'schedule': [], 'allow_remote_record': False, 'allow_remote_lock': False,
             'allow_live_preview': False, 'lock_after_execution': False,
-            'safety_locked': False, 'auto_approve_new_presets': True}
+            'safety_locked': False, 'auto_approve_new_presets': True,
+            'allow_panel_slash_from_phone': False}
 
 
 def set_panel_password(cfg, password):
@@ -325,6 +326,10 @@ def save_config(cfg, path=None):
         raise ValueError('Invalid command topic')
     if not re.fullmatch(r'[a-f0-9]{64}', cfg['secret']):
         raise ValueError('Invalid remote signing key')
+    if cfg.get('allow_panel_slash_from_phone') and not cfg.get('local_panel_enabled'):
+        raise ValueError('Enable Downloadable HTML Panel before enabling /panel in phone topic')
+    if cfg.get('allow_panel_slash_from_phone') and not TOPIC_RE.fullmatch(cfg.get('phone_topic','')):
+        raise ValueError('A valid phone notification topic is required for /panel')
     if cfg.get('local_panel_enabled'):
         if not re.fullmatch(r'[a-f0-9]{32}', cfg.get('panel_salt','')) or not re.fullmatch(r'[a-f0-9]{64}', cfg.get('panel_auth_key','')):
             raise ValueError('Set a panel password (16+ characters) before enabling HTML Panel')
@@ -553,7 +558,57 @@ class RemoteRelay:
             'kind': 'presets', 'nonce': nonce, 'presets': names,
             'truncated': truncated, 'at': int(self.clock())})
 
-    def send_panel_file(self):
+    def _subscription_topics(self):
+        """One ntfy connection handles signed commands plus optional /panel requests.
+
+        The phone topic is never a source of executable macro commands. Only
+        its exact /panel text is recognized, and only when explicitly enabled.
+        """
+        names = [self.cfg['inbox_topic']]
+        phone = self.cfg.get('phone_topic', '')
+        if (self.cfg.get('local_panel_enabled') and
+                self.cfg.get('allow_panel_slash_from_phone') and
+                TOPIC_RE.fullmatch(phone) and phone not in names):
+            names.append(phone)
+        return ','.join(names)
+
+    def _publish_panel_attachment_link(self, attachment):
+        """Share ntfy's *actual* attachment URL, not a guessed file URL."""
+        if not isinstance(attachment, dict):
+            self._diagnostic('ntfy did not provide an attachment link; the HTML file was sent.')
+            return False
+        link = str(attachment.get('url',''))
+        parsed = urllib.parse.urlsplit(link)
+        host = urllib.parse.urlsplit(self.server)
+        if (parsed.scheme != 'https' or parsed.netloc.lower() != host.netloc.lower()
+                or parsed.username or parsed.password or parsed.fragment or not parsed.path):
+            self._diagnostic('ntfy returned no usable HTTPS attachment URL; the file was sent.')
+            return False
+        body = {
+            'topic': self.cfg['phone_topic'],
+            'title': 'Sequent Remote • Open Panel',
+            'message': ('Tap Open Panel to get your new dashboard file. Open the downloaded '
+                        'HTML in your browser and enter the password set in Remote Console. '
+                        'The panel session lasts up to two hours; the attachment link may expire sooner.'),
+            'actions': [{'action':'view', 'label':'Open Panel', 'url':link, 'clear': True}],
+            'click': link,
+        }
+        try:
+            response = self.transport(self.server+'/',
+                                      payload=json.dumps(body).encode('utf-8'),
+                                      headers={'Content-Type':'application/json', **self._headers()})
+            if json.loads(response).get('event') != 'message':
+                raise ValueError('ntfy did not acknowledge panel link')
+            self.last_push = self.clock()
+            return True
+        except Exception as exc:
+            # HTML delivery already succeeded; a rate-limited second message
+            # must not invalidate its session or trigger extra retries.
+            self._diagnostic('HTML attachment delivered, but Open Panel link could not be posted: '
+                             + type(exc).__name__)
+            return False
+
+    def send_panel_file(self, *, include_open_link=False):
         """Read project-local panel.html, personalize session metadata and attach to ntfy.
 
         The file contains no password or HMAC signing key. It is read afresh
@@ -615,29 +670,43 @@ class RemoteRelay:
                  **self._headers()}
         try:
             response=self.transport(self.server+'/'+self.cfg['phone_topic'],payload=payload,headers=headers)
-            if json.loads(response).get('event')!='message':
+            upload_result = json.loads(response)
+            if upload_result.get('event')!='message':
                 raise ValueError('ntfy did not accept the panel attachment')
         except Exception:
             self.panel_sessions.pop(sid,None)
             raise
         self.last_push=self.clock()
+        if include_open_link:
+            self._publish_panel_attachment_link(upload_result.get('attachment'))
         return True
 
     def receive_message(self, msg):
-        if msg.get('event') != 'message' or msg.get('topic') != self.cfg['inbox_topic']:
+        if msg.get('event') != 'message':
             return False
-        raw=msg.get('message','')
-        # A plain /panel request only sends the public HTML shell to the
-        # owner's configured phone topic. It authorizes NO desktop commands.
-        if isinstance(raw,str) and raw.strip().lower() in ('/panel','/sequent panel'):
+        topic = msg.get('topic')
+        inbox = self.cfg['inbox_topic']
+        phone = self.cfg.get('phone_topic', '')
+        is_phone = topic == phone
+        is_inbox = topic == inbox
+        if not is_inbox and not is_phone:
+            return False
+        raw = msg.get('message', '')
+        # A plaintext /panel request can only deliver the public HTML shell.
+        # No macro-control commands are accepted from the phone topic.
+        if isinstance(raw, str) and raw.strip().lower() in ('/panel', '/sequent panel'):
             if not self.cfg.get('local_panel_enabled'):
                 return False
-            now=self.clock()
-            if now-self._status_throttle.get('panel_file',0)<60:
+            if is_phone and not self.cfg.get('allow_panel_slash_from_phone'):
                 return False
-            self._status_throttle['panel_file']=now
-            self.on_command('panel_file','')
+            now = self.clock()
+            if now-self._status_throttle.get('panel_file', 0) < 60:
+                return False
+            self._status_throttle['panel_file'] = now
+            self.on_command('panel_file', 'link' if is_phone else '')
             return True
+        if is_phone and not is_inbox:
+            return False
         try:
             payload=self.verify(json.loads(raw))
         except (ValueError,TypeError,OverflowError):
@@ -760,7 +829,7 @@ class RemoteRelay:
         initial = not self.ready.is_set()
         floor = str(int(self.clock())) if initial and self.last_id == 'latest' else None
         query = urllib.parse.urlencode({'poll':'1', 'since':self.last_id})
-        url = self.server+'/'+self.cfg['inbox_topic']+'/json?'+query
+        url = self.server+'/'+self._subscription_topics()+'/json?'+query
         content = self.transport(url, headers=self._headers(), timeout=12)
         self.last_poll = self.clock()
         # Initialize cursor but never accept old commands cached before connecting.
@@ -769,7 +838,7 @@ class RemoteRelay:
                 msg = json.loads(line)
             except (ValueError,UnicodeDecodeError):
                 continue
-            if msg.get('event') == 'message' and msg.get('topic') == self.cfg['inbox_topic']:
+            if msg.get('event') == 'message' and msg.get('topic') in self._subscription_topics().split(','):
                 if isinstance(msg.get('id'),str) and len(msg['id']) < 100:
                     self.last_id = msg['id']
                 if not initial:
@@ -833,7 +902,7 @@ class RemoteRelay:
 
     def websocket_once(self):
         """Preferred low-latency ntfy transport (WSS, stdlib only)."""
-        ws = _SecureNtfyWebSocket(self.server, self.cfg['inbox_topic'],
+        ws = _SecureNtfyWebSocket(self.server, self._subscription_topics(),
                                  self.last_id, self._headers(), timeout=12)
         with self._stream_lock:
             self._active_stream = ws
@@ -857,7 +926,7 @@ class RemoteRelay:
                 event = msg.get('event') if isinstance(msg, dict) else None
                 if event in ('open','keepalive','message'):
                     self.last_poll = self.clock()
-                if event != 'message' or msg.get('topic') != self.cfg['inbox_topic']:
+                if event != 'message' or msg.get('topic') not in self._subscription_topics().split(','):
                     continue
                 mid = msg.get('id')
                 if isinstance(mid, str) and 0 < len(mid) < 100:
@@ -881,7 +950,7 @@ class RemoteRelay:
         ntfy's open/keepalive frames are used to track connection health.
         """
         query=urllib.parse.urlencode({'since':self.last_id})
-        url=self.server+'/'+self.cfg['inbox_topic']+'/json?'+query
+        url=self.server+'/'+self._subscription_topics()+'/json?'+query
         # Match _request: no redirects or non-HTTPS requests, and system TLS.
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, request, fp, code, message, hdrs, newurl):
@@ -934,7 +1003,7 @@ class RemoteRelay:
                     event=msg.get('event')
                     if event in ('open','keepalive','message'):
                         self.last_poll=self.clock()
-                    if event != 'message' or msg.get('topic') != self.cfg['inbox_topic']:
+                    if event != 'message' or msg.get('topic') not in self._subscription_topics().split(','):
                         continue
                     mid=msg.get('id')
                     if isinstance(mid,str) and 0<len(mid)<100:
