@@ -26021,8 +26021,7 @@ try {{
             self._remote_log_event('SMART LOCK: macros stopped; schedules cleared; local re-arm required')
             self.root.after(650, self._remote_lock_desktop)
         elif operation == 'live_preview':
-            if self._remote_config.get('allow_live_preview') and self._remote_config.get('allow_screenshots'):
-                self._remote_start_preview(value)
+            self._remote_log_event('Screenshot feed rejected: encrypted transport is not implemented')
         elif operation == 'preview_stop':
             self._remote_preview_generation += 1
             self._remote_preview_active = False
@@ -26075,12 +26074,7 @@ try {{
             relay = self.sequent_remote
             self._remote_thread(relay.send_dashboard_link, 'Dashboard link reply')
         elif operation == 'screenshot':
-            if not self._remote_config.get('allow_screenshots',False):
-                self._remote_log_event('Screenshot rejected: disabled in Remote Console')
-                return
-            if self._remote_ready():
-                settings = dict(self._remote_config)
-                self._remote_thread(lambda:self._remote_send_screenshot(settings), 'Screenshot reply')
+            self._remote_log_event('Screenshot rejected: encrypted transport is not implemented')
         elif operation == 'launch':
             if (not self._remote_config.get('allow_launch',False) or
                     value not in self._remote_config.get('allowed_macros',[]) or
@@ -26112,22 +26106,12 @@ try {{
             self._remote_log_event(f'Scheduled remotely: {preset} in {minutes} minutes')
 
     def _remote_send_screenshot(self, settings):
-        engine = self.dynamic_engine
-        sequent_send_notification(engine,{
-            'type':'notify_phone','provider':'ntfy',
-            'ntfy_server':settings['server'],'ntfy_topic':settings['phone_topic'],
-            'ntfy_token_env':settings.get('token_env',''),
-            'title':'Sequent Remote Screenshot','message':'Screenshot requested from phone.',
-            'attach_screenshot':True,
-            'screenshot_scope':settings.get('screen_scope','Monitor at Cursor'),
-            'screenshot_resolution':'Native (100%)',
-            'screenshot_image_format':'Auto (Recommended)',
-            'screenshot_cursor_marker':True,'screenshot_cursor_coords':True})
+        raise RuntimeError('Unencrypted remote screenshots are disabled')
 
     def _remote_error_notice(self, reason):
         cfg = dict(self._remote_config)
         try:
-            if cfg.get('error_screenshot') and cfg.get('allow_screenshots'):
+            if False:  # No remote screenshot attachments until authenticated encryption exists.
                 sequent_send_notification(self.dynamic_engine,{
                     'type':'notify_phone','provider':'ntfy','ntfy_server':cfg['server'],
                     'ntfy_topic':cfg['phone_topic'],'ntfy_token_env':cfg.get('token_env',''),
@@ -26787,10 +26771,89 @@ try {{
             feedback.set(f'{name} scheduled in {mins} minutes (only while app is open).')
             footer_message.configure(fg=COLOR_SUCCESS)
 
+        def create_paired_panel():
+            if not self._remote_ready() or not self._remote_config.get('local_panel_enabled'):
+                messagebox.showerror('Pair device', 'Enable the remote receiver and HTML Panel, then Save & Connect.', parent=win)
+                return
+            from tkinter import filedialog
+            destination = filedialog.asksaveasfilename(parent=win, title='Save enrollment panel locally',
+                        defaultextension='.html', initialfile='Sequent-Paired-Panel.html',
+                        filetypes=[('HTML panel', '*.html')])
+            if not destination:
+                return
+            try:
+                device_id, enrollment_secret = self.sequent_remote.begin_authenticated_enrollment(destination)
+                self._remote_config = dict(self.sequent_remote.cfg)
+                messagebox.showwarning('Enrollment ready — 10 minutes',
+                    'The HTML panel contains NO authentication secret. Open it on your device, then enter the one-time enrollment secret below.\n\n'
+                    'This secret expires in 10 minutes and must be transferred privately. Do NOT send it through ntfy, email, or public chat.\n\n'
+                    'Enrollment secret: ' + enrollment_secret + '\n\nDevice ID: ' + device_id,
+                    parent=win)
+            except Exception as exc:
+                messagebox.showerror('Pair device', str(exc), parent=win)
+
+        def revoke_paired_panels():
+            relay = self.sequent_remote
+            if not relay:
+                return
+            devices = relay.cfg.get('paired_devices', {})
+            if not devices:
+                messagebox.showinfo('Paired devices', 'No paired devices exist.', parent=win)
+                return
+            listing = '\n'.join(f"{key}: {rec.get('label', 'Device')}" for key, rec in devices.items())
+            device_id = simpledialog.askstring('Revoke paired device',
+                'Enter the exact device ID to revoke:\n' + listing, parent=win)
+            if device_id:
+                try:
+                    if not relay.revoke_paired_device(device_id.strip()):
+                        raise ValueError('Unknown device ID')
+                    self._remote_config = dict(relay.cfg)
+                    messagebox.showinfo('Paired device', 'Device revoked; active sessions invalidated.', parent=win)
+                except Exception as exc:
+                    messagebox.showerror('Revoke paired device', str(exc), parent=win)
+
+        def edit_paired_permissions():
+            relay = self.sequent_remote
+            if not relay:
+                return
+            devices = relay.cfg.get('paired_devices', {})
+            if not devices:
+                messagebox.showinfo('Device permissions', 'No paired devices exist.', parent=win)
+                return
+            listing = '\n'.join(f"{key}: {rec.get('label', 'Device')}" for key, rec in devices.items())
+            device_id = simpledialog.askstring('Device permissions',
+                'Enter device ID to edit:\n' + listing, parent=win)
+            if not device_id:
+                return
+            device_id = device_id.strip()
+            if device_id not in devices:
+                messagebox.showerror('Device permissions', 'Unknown device ID.', parent=win)
+                return
+            current = ', '.join(devices[device_id].get('permissions', []))
+            entered = simpledialog.askstring('Device permissions',
+                'Comma-separated allowed operations.\nDangerous operations such as launch, record_start and lock_desktop grant remote control.\n'
+                'Screenshot and legacy panel operations are prohibited.',
+                initialvalue=current, parent=win)
+            if entered is None:
+                return
+            permissions = [part.strip() for part in entered.split(',') if part.strip()]
+            if not messagebox.askyesno('Confirm device permissions',
+                'Apply permissions to this device?\n\n' + ', '.join(permissions), parent=win):
+                return
+            try:
+                relay.set_paired_device_permissions(device_id, permissions)
+                self._remote_config = dict(relay.cfg)
+                messagebox.showinfo('Device permissions', 'Permissions saved.', parent=win)
+            except Exception as exc:
+                messagebox.showerror('Device permissions', str(exc), parent=win)
+
         quick = card('Quick Actions', 'Available after saving and connecting Remote.')
         quick_row = tk.Frame(quick, bg=BG_PANEL)
         quick_row.pack(fill=tk.X, pady=(2, 0))
-        for index, (label, command) in enumerate((('Send Phone Controls', panel),
+        for index, (label, command) in enumerate((('Pair Device Locally', create_paired_panel),
+                                                    ('Revoke Paired Device', revoke_paired_panels),
+                                                    ('Edit Device Permissions', edit_paired_permissions),
+                                                    ('Send Phone Controls', panel),
                                                     ('Send HTML Panel', send_attached_panel),
                                                     ('Send Dashboard Link', send_dashboard),
                                                     ('Test Notification', test),

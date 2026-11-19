@@ -57,7 +57,7 @@
   const uiMessage=(id,msg,error=false)=>{const node=el(id);node.textContent=msg;node.className='msg '+(error?'error':'ok');};
   const canonical=o=>{const result={};Object.keys(o).sort().forEach(k=>result[k]=o[k]);return JSON.stringify(result);};
   const expired=()=>now()>=cfg.expires;
-  let signingKey=null,loggedIn=false,busy=false;
+  let signingKey=null,replyKey=null,loggedIn=false,busy=false;
   let ntfyCooldownUntil=0,rateLimitMessage='';
   // A single subscription transports BOTH Sequent replies and the phone feed.
   // The cursor is retained across SSE -> fallback -> SSE transitions.
@@ -80,11 +80,26 @@
     if(Date.now()<ntfyCooldownUntil)throw new Error(rateLimitMessage||'ntfy temporarily rate-limited');
   }
   async function deriveKey(password){
-    const seed=await crypto.subtle.importKey('raw',textEncoder.encode(password),'PBKDF2',false,['deriveBits']);
-    const salt=Uint8Array.from(cfg.salt.match(/../g),pair=>parseInt(pair,16));
-    const bits=await crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:cfg.iterations,hash:'SHA-256'},seed,256);
+    let bits;
+    if(cfg.enrollment_mode){
+      if(!/^[a-f0-9]{64}$/i.test(password))throw new Error('Enter the 64-character enrollment secret shown on your computer.');
+      bits=Uint8Array.from(password.match(/../g),pair=>parseInt(pair,16));
+    }else if(cfg.paired_key){
+      bits=Uint8Array.from(cfg.paired_key.match(/../g),pair=>parseInt(pair,16));
+    }else{
+      const seed=await crypto.subtle.importKey('raw',textEncoder.encode(password),'PBKDF2',false,['deriveBits']);
+      const salt=Uint8Array.from(cfg.salt.match(/../g),pair=>parseInt(pair,16));
+      bits=await crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:cfg.iterations,hash:'SHA-256'},seed,256);
+    }
     // Both permissions are essential: commands are signed and replies verified.
-    return crypto.subtle.importKey('raw',bits,{name:'HMAC',hash:'SHA-256'},false,['sign','verify']);
+    const master=await crypto.subtle.importKey('raw',bits,{name:'HMAC',hash:'SHA-256'},false,['sign']);
+    async function directionalKey(direction){
+      const context='Sequent panel v4 | '+direction+' | '+cfg.session;
+      const derived=await crypto.subtle.sign('HMAC',master,textEncoder.encode(context));
+      return crypto.subtle.importKey('raw',derived,{name:'HMAC',hash:'SHA-256'},false,['sign','verify']);
+    }
+    replyKey=await directionalKey('reply');
+    return directionalKey('command');
   }
   async function publish(op,value=''){
     if(!signingKey||expired())throw new Error('Panel locked or expired. Request a new file from Sequent.');
@@ -131,7 +146,7 @@
        typeof body.sig!=='string'||!/^([a-f0-9]{64})$/.test(body.sig))return;
     const verifiedBody={...body};delete verifiedBody.sig;
     const bytes=Uint8Array.from(body.sig.match(/../g),pair=>parseInt(pair,16));
-    if(!await crypto.subtle.verify('HMAC',signingKey,bytes,textEncoder.encode(canonical(verifiedBody))))return;
+    if(!await crypto.subtle.verify('HMAC',replyKey,bytes,textEncoder.encode(canonical(verifiedBody))))return;
     if(body.kind==='status'&&loggedIn){
       el('status').textContent=body.text||'No status returned';
       const feedStatus=(body.text||'').match(/Screenshot feed:\s*(RUNNING|STOPPED)/);
@@ -273,10 +288,10 @@
   async function sendQuietStatus(){if(!loggedIn)return;try{await publish('panel_status');}catch{}}
   async function doLoginSafe(){
     if(busy)return;
-    if(expired()){uiMessage('loginMessage','This panel expired. Request a fresh panel.html.',true);return;}
+    if(expired()){uiMessage('loginMessage','This enrollment expired. Start a new enrollment on the computer.',true);return;}
     if(!globalThis.crypto?.subtle){uiMessage('loginMessage','This viewer does not support browser cryptography. Try Chrome or an HTTPS-hosted panel.',true);return;}
     const value=el('password').value;
-    if(!value){uiMessage('loginMessage','Enter your panel password.',true);return;}
+    if(!value&&!cfg.paired_key){uiMessage('loginMessage',cfg.enrollment_mode?'Enter the enrollment secret from Sequent.':'Enter your panel password.',true);return;}
     busy=true;el('login').disabled=true;
     try{
       uiMessage('loginMessage','Connecting to Sequent. Waiting for authenticated reply...');
@@ -286,18 +301,19 @@
       const nonce=await publish('panel_login');
       const answer=await waitFor(nonce,90000);
       if(answer.kind!=='login'||!answer.ok)throw new Error('Sequent rejected the login.');
+      if(Number.isInteger(answer.expires)&&answer.expires>now())cfg.expires=answer.expires;
       loggedIn=true;setModeLabel();
       el('loginCard').classList.add('hide');el('dashboard').classList.remove('hide');
       uiMessage('actionMessage','Authenticated. Commands are signed and time-limited.');
       await sendQuietStatus();
     }catch(error){
-      closeStream();stopFallback();waiting.clear();earlyReplies.clear();signingKey=null;
+      closeStream();stopFallback();waiting.clear();earlyReplies.clear();signingKey=null;replyKey=null;
       uiMessage('loginMessage',error.message,true);
       el('connectionBadge').className='badge error';el('connectionBadge').textContent='LOCKED';
     }finally{busy=false;el('login').disabled=false;}
   }
   function lock(message=''){
-    closeStream();stopFallback();signingKey=null;loggedIn=false;
+    closeStream();stopFallback();signingKey=null;replyKey=null;loggedIn=false;
     waiting.clear();earlyReplies.clear();
     el('loginCard').classList.remove('hide');el('dashboard').classList.add('hide');
     el('connectionBadge').textContent='LOCKED';el('connectionBadge').className='badge';
@@ -305,6 +321,8 @@
   }
   // Password is hidden by default; the eye is a purely local display toggle.
   const passwordInput=el('password'), passwordEye=el('passwordEye');
+  if(cfg.enrollment_mode){el('login').textContent='Enroll this device';passwordInput.placeholder='64-character enrollment secret';}
+  if(cfg.paired_key){passwordInput.closest('.password-wrap').style.display='none';passwordInput.previousElementSibling?.setAttribute('hidden','');el('login').textContent='Connect paired device';}
   function setPasswordVisibility(visible){
     passwordInput.type=visible?'text':'password';
     passwordEye.setAttribute('aria-pressed',visible?'true':'false');
@@ -406,7 +424,7 @@
   // The dashboard sends status only on login, user request, and infrequent
   // heartbeat, rather than flooding ntfy with status commands every few sec.
   setInterval(()=>{if(loggedIn&&!document.hidden)void sendQuietStatus();},120000);
-  window.addEventListener('pagehide',()=>{closeStream();stopFallback();signingKey=null;});
+  window.addEventListener('pagehide',()=>{closeStream();stopFallback();signingKey=null;replyKey=null;});
 })();
 </script>
 </body>

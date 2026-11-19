@@ -27,6 +27,7 @@ from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 
 TOPIC_RE = re.compile(r'^[A-Za-z0-9_-]{12,64}$')
+UNSAFE_PAIRED_OPERATIONS = frozenset({'approve', 'choose', 'panel_file', 'dashboard', 'screenshot', 'live_preview'})
 SAFE_COMMANDS = frozenset({'pause', 'resume', 'stop', 'status', 'screenshot', 'dashboard', 'approve', 'choose', 'launch', 'schedule', 'panel_file', 'panel_login', 'panel_status', 'panel_presets', 'record_start', 'record_stop', 'lock_desktop', 'smart_lock', 'lock_after', 'live_preview', 'preview_stop'})
 PANEL_KDF_ROUNDS = 310_000
 PANEL_LIFETIME = 2 * 3600
@@ -287,7 +288,8 @@ def config_default():
             'schedule': [], 'allow_remote_record': False, 'allow_remote_lock': False,
             'allow_live_preview': False, 'lock_after_execution': False,
             'safety_locked': False, 'auto_approve_new_presets': False,
-            'allow_panel_slash_from_phone': False}
+            'allow_panel_slash_from_phone': False, 'paired_devices': {},
+            'legacy_panel_unsafe_opt_in': False, 'encrypted_screenshot_transport': False, 'paired_sessions': {}}
 
 
 def set_panel_password(cfg, password):
@@ -304,6 +306,44 @@ def set_panel_password(cfg, password):
     return cfg
 
 
+def panel_direction_key(master_hex, session_id, direction):
+    """Domain-separated, per-session HMAC key (never publish this key)."""
+    if direction not in ('command', 'reply') or not isinstance(session_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,64}', session_id):
+        raise ValueError('Invalid panel key context')
+    return hmac.new(bytes.fromhex(master_hex),
+                    ('Sequent panel v4 | ' + direction + ' | ' + session_id).encode('ascii'),
+                    hashlib.sha256).digest()
+
+
+def _protect_config_for_disk(cfg):
+    """Protect authentication secrets with user-scoped Windows DPAPI."""
+    if os.name != 'nt':
+        return cfg  # Offline non-Windows tests only; never a Windows fallback.
+    from sequent_dpapi import protect_text
+    stored = dict(cfg)
+    for field in ('secret', 'panel_auth_key'):
+        if stored.get(field):
+            stored[field] = protect_text(stored[field])
+    stored['paired_devices'] = {device_id: {**record, 'key': protect_text(record['key'])}
+                                for device_id, record in cfg.get('paired_devices', {}).items()}
+    return stored
+
+
+def _unprotect_config_from_disk(cfg):
+    if os.name != 'nt':
+        return cfg
+    from sequent_dpapi import unprotect_text
+    for field in ('secret', 'panel_auth_key'):
+        value = cfg.get(field, '')
+        if isinstance(value, str) and value.startswith('dpapi:'):
+            cfg[field] = unprotect_text(value)
+    for record in cfg.get('paired_devices', {}).values():
+        value = record.get('key', '')
+        if isinstance(value, str) and value.startswith('dpapi:'):
+            record['key'] = unprotect_text(value)
+    return cfg
+
+
 def load_config(path=None):
     path = Path(path or _config_dir() / 'remote.json')
     if not path.exists():
@@ -313,7 +353,7 @@ def load_config(path=None):
         raise ValueError('Remote configuration must be an object')
     defaults = config_default()
     defaults.update(config)
-    return defaults
+    return _unprotect_config_from_disk(defaults)
 
 
 def save_config(cfg, path=None):
@@ -326,22 +366,58 @@ def save_config(cfg, path=None):
         raise ValueError('Invalid command topic')
     if not re.fullmatch(r'[a-f0-9]{64}', cfg['secret']):
         raise ValueError('Invalid remote signing key')
+    if cfg.get('allow_panel_slash_from_phone'):
+        raise ValueError('Public /panel delivery is disabled in hardened mode')
     if cfg.get('allow_panel_slash_from_phone') and not cfg.get('local_panel_enabled'):
         raise ValueError('Enable Downloadable HTML Panel before enabling /panel in phone topic')
     if cfg.get('allow_panel_slash_from_phone') and not TOPIC_RE.fullmatch(cfg.get('phone_topic','')):
         raise ValueError('A valid phone notification topic is required for /panel')
+    if not isinstance(cfg.get('paired_devices', {}), dict) or len(cfg.get('paired_devices', {})) > 32:
+        raise ValueError('Invalid paired devices')
+    for device_id, record in cfg.get('paired_devices', {}).items():
+        if not re.fullmatch(r'[a-f0-9]{32}', device_id) or not isinstance(record, dict) or not re.fullmatch(r'[a-f0-9]{64}', record.get('key','')):
+            raise ValueError('Invalid paired device credential')
+        permissions = record.get('permissions', [])
+        if not isinstance(permissions, list) or len(permissions) > len(SAFE_COMMANDS) or any(
+                not isinstance(op, str) or op not in SAFE_COMMANDS or op in UNSAFE_PAIRED_OPERATIONS for op in permissions):
+            raise ValueError('Invalid paired device permissions')
+    sessions = cfg.get('paired_sessions', {})
+    if not isinstance(sessions, dict) or len(sessions) > 64:
+        raise ValueError('Invalid paired sessions')
+    for sid, session in sessions.items():
+        if (not isinstance(sid, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,64}', sid)
+                or not isinstance(session, dict)
+                or set(session) != {'reply_topic', 'expires', 'device_id'}
+                or not isinstance(session['expires'], int) or isinstance(session['expires'], bool)
+                or session['expires'] < 0
+                or session['device_id'] not in cfg['paired_devices']
+                or not TOPIC_RE.fullmatch(session['reply_topic'])):
+            raise ValueError('Invalid paired session')
+    if cfg.get('allow_screenshots') or cfg.get('allow_live_preview') or cfg.get('error_screenshot'):
+        raise ValueError('Remote screenshot upload disabled until end-to-end encryption is implemented')
+    if cfg.get('legacy_panel_unsafe_opt_in'):
+        raise ValueError('Legacy password panel is permanently disabled')
     if cfg.get('local_panel_enabled'):
         if not re.fullmatch(r'[a-f0-9]{32}', cfg.get('panel_salt','')) or not re.fullmatch(r'[a-f0-9]{64}', cfg.get('panel_auth_key','')):
             raise ValueError('Set a panel password (16+ characters) before enabling HTML Panel')
         if cfg.get('token_env'):
             raise ValueError('Downloaded HTML Panel requires browser access to ntfy. Authenticated ntfy token mode is not supported by the password-only panel.')
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + '.tmp')
-    with open(tmp, 'w', encoding='utf-8') as file:
-        os.chmod(tmp, 0o600)
-        json.dump(cfg, file, indent=2)
-        file.write('\n')
-    os.replace(tmp, path)
+    # Use a fresh, exclusively created temporary file. A predictable .tmp path
+    # can be replaced with a symlink or collide with another Sequent instance.
+    import tempfile
+    fd, temp_name = tempfile.mkstemp(prefix='.remote-', suffix='.tmp', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as file:
+            os.chmod(temp_name, 0o600)
+            json.dump(_protect_config_for_disk(cfg), file, indent=2)
+            file.write('\n')
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
     return path
 
 
@@ -392,7 +468,198 @@ class RemoteRelay:
         self._stream_started_at = 0
         self._live_transport = 'websocket'
         self._live_name = ''
-        self.panel_sessions = {}  # ephemeral two-hour downloadable-panel sessions
+        self.panel_sessions = {sid: dict(record) for sid, record in self.cfg.get('paired_sessions', {}).items()
+                               if record['expires'] > self.clock() and record['device_id'] in self.cfg.get('paired_devices', {})}
+        self._panel_sessions_lock = threading.RLock()
+        self._pending_enrollments = {}
+        self._panel_key_fingerprint = self._current_panel_fingerprint()
+
+    def _current_panel_fingerprint(self):
+        """Detect credential replacement without retaining a second copy of the key."""
+        return hashlib.sha256(str(self.cfg.get('panel_auth_key', '')).encode('ascii')).digest()
+
+    def _persist_paired_sessions(self):
+        # Store only valid paired sessions, never legacy password sessions.
+        self.cfg['paired_sessions'] = {sid: dict(session) for sid, session in self.panel_sessions.items()
+            if session.get('device_id') in self.cfg.get('paired_devices', {})
+            and session.get('expires', 0) > self.clock()}
+        save_config(self.cfg)
+
+    def set_paired_device_permissions(self, device_id, permissions):
+        if (not isinstance(permissions, (list, tuple, set)) or not permissions
+                or any(not isinstance(op, str) or op not in SAFE_COMMANDS for op in permissions)):
+            raise ValueError('Invalid permissions')
+        if UNSAFE_PAIRED_OPERATIONS.intersection(permissions):
+            raise ValueError('Unsafe or unavailable permission')
+        with self._panel_sessions_lock:
+            if device_id not in self.cfg.get('paired_devices', {}):
+                raise ValueError('Unknown device')
+            old = list(self.cfg['paired_devices'][device_id]['permissions'])
+            self.cfg['paired_devices'][device_id]['permissions'] = sorted(set(permissions))
+            try:
+                save_config(self.cfg)
+            except Exception:
+                self.cfg['paired_devices'][device_id]['permissions'] = old
+                raise
+
+    def revoke_panel_session(self, session_id):
+        """Immediately revoke one downloaded panel, including its reply channel."""
+        with self._panel_sessions_lock:
+            previous = self.panel_sessions.get(session_id)
+            if previous is None:
+                return False
+            self.panel_sessions.pop(session_id)
+            try:
+                self._persist_paired_sessions()
+            except Exception:
+                self.panel_sessions[session_id] = previous
+                raise
+            return True
+
+    def revoke_all_panel_sessions(self):
+        """Immediately invalidate all downloaded panels on this relay instance."""
+        with self._panel_sessions_lock:
+            count = len(self.panel_sessions)
+            previous = dict(self.panel_sessions)
+            self.panel_sessions.clear()
+            try:
+                self._persist_paired_sessions()
+            except Exception:
+                self.panel_sessions.update(previous)
+                raise
+            return count
+
+    def rotate_panel_password(self, password):
+        """Rotate the local password verifier and invalidate every prior panel.
+
+        Caller must persist the updated configuration through save_config().
+        """
+        with self._panel_sessions_lock:
+            set_panel_password(self.cfg, password)
+            self.panel_sessions.clear()
+            self._persist_paired_sessions()
+            self._panel_key_fingerprint = self._current_panel_fingerprint()
+
+    def create_local_paired_panel(self, destination, *, label='Paired device', permissions=None):
+        """Disabled: the old HTML bundle embedded a reusable device credential."""
+        raise ValueError('Legacy credential-bearing panels are disabled. Use begin_authenticated_enrollment.')
+
+    def begin_authenticated_enrollment(self, destination, *, label='Paired device', permissions=None):
+        """Desktop-authorized, single-use enrollment; never put credentials in HTML.
+
+        Returns (device_id, enrollment_secret) for local, out-of-band display.
+        The enrollment secret is 256 random bits and expires after 10 minutes.
+        It is NOT sent to the relay. No device is authorized before a valid
+        signed panel_login completes enrollment.
+        """
+        if not self.cfg.get('local_panel_enabled'):
+            raise ValueError('Enable local HTML panel first')
+        if permissions is None:
+            permissions = ['status', 'panel_login', 'panel_status', 'panel_presets', 'pause', 'resume', 'stop']
+        if (not isinstance(permissions, (list, tuple, set)) or not permissions or
+                any(not isinstance(op, str) or op not in SAFE_COMMANDS or op in UNSAFE_PAIRED_OPERATIONS for op in permissions)):
+            raise ValueError('Invalid enrollment permissions')
+        with self._panel_sessions_lock:
+            if len(self.cfg.get('paired_devices', {})) + len(self._pending_enrollments) >= 32:
+                raise ValueError('Maximum devices reached')
+            device_id = secrets.token_hex(16)
+            secret = secrets.token_hex(32)
+            sid = secrets.token_urlsafe(18)
+            reply_topic = 'seq_reply_' + secrets.token_hex(14)
+            deadline = int(self.clock() + 600)
+            panel_data = {'server': self.server, 'inbox': self.cfg['inbox_topic'],
+                          'phone': '', 'reply': reply_topic, 'session': sid,
+                          'expires': deadline, 'enrollment_mode': True,
+                          'device_id': device_id, 'allowed_macros': [],
+                          'screenshots': False, 'remote_record': False,
+                          'remote_lock': False, 'live_preview': False,
+                          'lock_after': False, 'safety_locked': True}
+            template = (Path(__file__).resolve().parent / 'panel.html').read_text(encoding='utf-8')
+            marker = '/* SEQUENT_PANEL_CONFIG */'
+            if template.count(marker) != 1:
+                raise ValueError('Invalid panel template')
+            serialized = json.dumps(panel_data, separators=(',', ':'), ensure_ascii=False).replace('<', r'\u003c').replace('>', r'\u003e').replace('&', r'\u0026')
+            target = Path(destination)
+            # Exclusive file creation; do not remove a file that we did not create.
+            with target.open('x', encoding='utf-8') as output:
+                output.write(template.replace(marker, 'window.SEQUENT_PANEL_CONFIG = ' + serialized + ';'))
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
+            self._pending_enrollments[sid] = {
+                'device_id': device_id, 'key': secret, 'reply_topic': reply_topic,
+                'expires': deadline, 'label': str(label)[:80],
+                'permissions': sorted(set(permissions))}
+            return device_id, secret
+
+    def cancel_authenticated_enrollment(self, device_id):
+        with self._panel_sessions_lock:
+            for sid, pending in list(self._pending_enrollments.items()):
+                if pending['device_id'] == device_id:
+                    del self._pending_enrollments[sid]
+                    return True
+            return False
+
+    def _activate_enrollment(self, sid, nonce):
+        """Commit the newly authenticated principal before accepting commands."""
+        with self._panel_sessions_lock:
+            pending = self._pending_enrollments.get(sid)
+            if not pending or pending['expires'] <= self.clock():
+                return False
+            did = pending['device_id']
+            self.cfg.setdefault('paired_devices', {})[did] = {
+                'key': pending['key'], 'label': pending['label'],
+                'created': int(self.clock()), 'permissions': pending['permissions']}
+            self.panel_sessions[sid] = {
+                'reply_topic': pending['reply_topic'],
+                'expires': int(self.clock() + PANEL_LIFETIME), 'device_id': did}
+            try:
+                self._persist_paired_sessions()
+            except Exception:
+                self.panel_sessions.pop(sid, None)
+                self.cfg['paired_devices'].pop(did, None)
+                return False
+            del self._pending_enrollments[sid]
+            return True
+
+    def revoke_paired_device(self, device_id):
+        with self._panel_sessions_lock:
+            if device_id not in self.cfg.get('paired_devices', {}):
+                return False
+            old_devices = dict(self.cfg['paired_devices'])
+            old_sessions = dict(self.panel_sessions)
+            self.cfg['paired_devices'].pop(device_id)
+            self.panel_sessions = {sid: s for sid, s in self.panel_sessions.items()
+                                   if s.get('device_id') != device_id}
+            try:
+                self._persist_paired_sessions()
+            except Exception:
+                self.cfg['paired_devices'] = old_devices
+                self.panel_sessions = old_sessions
+                raise
+            return True
+
+    def rotate_paired_device(self, device_id):
+        """Invalidate all existing panels for device; create a fresh local panel to re-pair."""
+        return self.revoke_paired_device(device_id)
+
+    def _active_panel_session(self, session_id):
+        with self._panel_sessions_lock:
+            if not hmac.compare_digest(self._panel_key_fingerprint, self._current_panel_fingerprint()):
+                self.panel_sessions.clear()
+                self._panel_key_fingerprint = self._current_panel_fingerprint()
+            session = self.panel_sessions.get(session_id)
+            if session and session['expires'] > self.clock():
+                if session.get('device_id') and session['device_id'] not in self.cfg.get('paired_devices', {}):
+                    self.panel_sessions.pop(session_id, None)
+                    self._persist_paired_sessions()
+                    return None
+                return dict(session)
+            if session:
+                self.panel_sessions.pop(session_id, None)
+                self._persist_paired_sessions()
+            return None
 
     def _diagnostic(self, detail):
         """Report protocol failures locally, not on public ntfy topics."""
@@ -472,8 +739,15 @@ class RemoteRelay:
             sid = payload.get('session')
             if not isinstance(sid,str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,64}', sid):
                 return None
-            session = self.panel_sessions.get(sid)
-            if not session or session['expires'] <= self.clock():
+            session = self._active_panel_session(sid)
+            enrolling = False
+            if not session:
+                with self._panel_sessions_lock:
+                    pending = self._pending_enrollments.get(sid)
+                    if pending and pending['expires'] > self.clock() and payload.get('op') == 'panel_login':
+                        session = {'device_id': pending['device_id'], 'enrollment': True}
+                        enrolling = True
+            if not session or not session.get('device_id'):
                 return None
         else:
             return None
@@ -485,6 +759,13 @@ class RemoteRelay:
             return None
         if version == 4 and payload['op'] in ('dashboard','panel_file'):
             return None
+        if version == 4 and payload['op'] in UNSAFE_PAIRED_OPERATIONS:
+            return None
+        if version == 4 and session.get('device_id'):
+            record = (self._pending_enrollments.get(sid, {}) if enrolling
+                      else self.cfg.get('paired_devices', {}).get(session['device_id'], {}))
+            if payload['op'] not in record.get('permissions', []):
+                return None
         if any(not isinstance(payload.get(k),str) or len(payload[k]) > 250
                for k in ('value','nonce','sig')):
             return None
@@ -498,7 +779,12 @@ class RemoteRelay:
         signed = {k:v for k,v in payload.items() if k!='sig'}
         msg=json.dumps(signed, sort_keys=True, separators=(',',':'),
                        ensure_ascii=(version==1)).encode('utf-8')
-        key=bytes.fromhex(self.cfg.get('panel_auth_key','')) if version==4 else bytes.fromhex(self.cfg['secret'])
+        master = ((self._pending_enrollments.get(sid, {}).get('key', '') if enrolling else
+                   self.cfg.get('paired_devices', {}).get(session.get('device_id'), {}).get('key', ''))
+                  if version == 4 and session.get('device_id') else self.cfg.get('panel_auth_key', ''))
+        if version == 4 and not re.fullmatch(r'[a-f0-9]{64}', master):
+            return None
+        key=panel_direction_key(master, payload['session'], 'command') if version==4 else bytes.fromhex(self.cfg['secret'])
         expected=hmac.new(key,msg,hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected,payload['sig']):
             return None
@@ -511,20 +797,28 @@ class RemoteRelay:
             for old_nonce, expiry in list(self.seen.items()):
                 if expiry < now:
                     del self.seen[old_nonce]
-            if nonce in self.seen or len(self.seen) >= 10000:
+            # Scope replay identifiers to the authenticated principal and protocol.
+            # A nonce collision from another principal must not evict or mask this one.
+            principal = ('panel:' + session['device_id'] if version == 4 else 'channel:' + str(version))
+            nonce_key = principal + ':' + nonce
+            if nonce_key in self.seen or len(self.seen) >= 10000:
                 return None
-            self.seen[nonce] = payload['exp']
+            if version == 4 and enrolling and not self._activate_enrollment(sid, nonce):
+                return None
+            self.seen[nonce_key] = payload['exp']
         return payload
 
     def _panel_reply(self, sid, reply):
-        session=self.panel_sessions.get(sid)
-        if not session or session['expires'] <= self.clock():
+        session=self._active_panel_session(sid)
+        if not session:
             return False
         # Reply topics may be readable/writable by others on public ntfy.
         # Authenticate ALL responses, including login confirmation and status.
         signed_reply=dict(reply, v=4, session=sid, issued=int(self.clock()))
         proof=json.dumps(signed_reply,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode('utf-8')
-        signed_reply['sig']=hmac.new(bytes.fromhex(self.cfg['panel_auth_key']),proof,hashlib.sha256).hexdigest()
+        master = (self.cfg.get('paired_devices', {}).get(session.get('device_id'), {}).get('key', '')
+                  if session.get('device_id') else self.cfg['panel_auth_key'])
+        signed_reply['sig']=hmac.new(panel_direction_key(master, sid, 'reply'),proof,hashlib.sha256).hexdigest()
         body={'topic':session['reply_topic'], 'title':'Sequent Panel',
               'message':json.dumps(signed_reply,ensure_ascii=False,separators=(',',':'))}
         answer=self.transport(self.server+'/',payload=json.dumps(body).encode('utf-8'),
@@ -698,6 +992,8 @@ class RemoteRelay:
         from the project folder each request. Anyone who can read this topic
         can download the UI, but cannot sign commands without the password.
         """
+        if True:  # legacy credential delivery is permanently disabled
+            raise RuntimeError('Legacy password panel delivery disabled; use Pair Device Locally')
         if not self.cfg.get('enabled') or not self.cfg.get('local_panel_enabled'):
             raise RuntimeError('Enable remote receiver and Downloadable HTML Panel first')
         if self.cfg.get('token_env'):
@@ -710,10 +1006,11 @@ class RemoteRelay:
         sid=secrets.token_urlsafe(18)
         reply_topic='seq_reply_'+secrets.token_hex(14)
         now=int(self.clock())
-        self.panel_sessions={k:v for k,v in self.panel_sessions.items() if v['expires']>now}
-        while len(self.panel_sessions)>=6:
-            self.panel_sessions.pop(next(iter(self.panel_sessions)))
-        self.panel_sessions[sid]={'reply_topic':reply_topic,'expires':now+PANEL_LIFETIME}
+        with self._panel_sessions_lock:
+            self.panel_sessions={k:v for k,v in self.panel_sessions.items() if v['expires']>now}
+            while len(self.panel_sessions)>=6:
+                self.panel_sessions.pop(next(iter(self.panel_sessions)))
+            self.panel_sessions[sid]={'reply_topic':reply_topic,'expires':now+PANEL_LIFETIME}
         data={'server':self.server,'inbox':self.cfg['inbox_topic'],
               'phone':self.cfg['phone_topic'],'reply':reply_topic,
               'session':sid,'expires':now+PANEL_LIFETIME,
@@ -796,6 +1093,8 @@ class RemoteRelay:
         # A plaintext /panel request can only deliver the public HTML shell.
         # No macro-control commands are accepted from the phone topic.
         if isinstance(raw, str) and raw.strip().lower() in ('/panel', '/sequent panel'):
+            if True:  # legacy credential delivery is permanently disabled
+                return False
             if not self.cfg.get('local_panel_enabled'):
                 self._diagnostic('Received /panel, but Downloadable HTML Panel is disabled.')
                 return False
@@ -827,7 +1126,7 @@ class RemoteRelay:
             if (isinstance(candidate, dict) and candidate.get('v') == 4
                     and candidate.get('op') == 'panel_login'):
                 sid = candidate.get('session')
-                if not isinstance(sid, str) or sid not in self.panel_sessions:
+                if not isinstance(sid, str) or not self._active_panel_session(sid):
                     self._diagnostic('Login rejected: session no longer exists. '
                                      'Request a NEW panel.html after reconnecting.')
                 else:
@@ -854,7 +1153,7 @@ class RemoteRelay:
             self._diagnostic('Valid login received; sending signed reply to phone.')
             try:
                 if not self._panel_reply(payload['session'],
-                        {'kind':'login','nonce':payload['nonce'],'ok':True}):
+                        {'kind':'login','nonce':payload['nonce'],'ok':True, 'expires': self._active_panel_session(payload['session'])['expires']}):
                     self._diagnostic('Login reply was not acknowledged by ntfy.')
                     return False
             except Exception as exc:
