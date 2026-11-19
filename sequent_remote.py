@@ -575,14 +575,14 @@ class RemoteRelay:
     def _publish_panel_attachment_link(self, attachment):
         """Share ntfy's *actual* attachment URL, not a guessed file URL."""
         if not isinstance(attachment, dict):
-            self._diagnostic('ntfy did not provide an attachment link; the HTML file was sent.')
+            self._diagnostic('No Open Panel link returned. Download Sequent-Remote-Panel.html from the earlier attachment notification.')
             return False
         link = str(attachment.get('url',''))
         parsed = urllib.parse.urlsplit(link)
         host = urllib.parse.urlsplit(self.server)
         if (parsed.scheme != 'https' or parsed.netloc.lower() != host.netloc.lower()
                 or parsed.username or parsed.password or parsed.fragment or not parsed.path):
-            self._diagnostic('ntfy returned no usable HTTPS attachment URL; the file was sent.')
+            self._diagnostic('No usable HTTPS Open Panel link. Download Sequent-Remote-Panel.html from the earlier attachment notification.')
             return False
         body = {
             'topic': self.cfg['phone_topic'],
@@ -663,7 +663,10 @@ class RemoteRelay:
         if len(payload)>1_000_000:
             del self.panel_sessions[sid]
             raise ValueError('Panel attachment is too large')
-        headers={'Content-Type':'text/html; charset=utf-8',
+        # Force a true downloadable attachment instead of letting a client try
+        # to render the HTML as the notification body. The .html filename is
+        # preserved, so the downloaded file still opens in a browser.
+        headers={'Content-Type':'application/octet-stream',
                  'X-Filename':'Sequent-Remote-Panel.html',
                  'X-Title':'Sequent Remote - HTML Control Panel',
                  'X-Message':'Open the attached HTML file in your browser. Enter the panel password set in Sequent Remote Console.',
@@ -673,12 +676,27 @@ class RemoteRelay:
             upload_result = json.loads(response)
             if upload_result.get('event')!='message':
                 raise ValueError('ntfy did not accept the panel attachment')
+            # A successful text notification is NOT the same as an uploaded
+            # file. In particular, don't report success when the server has
+            # disabled attachments or silently turned the HTML into text.
+            attachment = upload_result.get('attachment')
+            if not (isinstance(attachment, dict) and
+                    (attachment.get('name') or attachment.get('url'))):
+                raise ValueError(
+                    'ntfy did not confirm a downloadable HTML attachment. '
+                    'Check server attachment support, upload quota and limits.')
         except Exception:
             self.panel_sessions.pop(sid,None)
             raise
         self.last_push=self.clock()
         if include_open_link:
-            self._publish_panel_attachment_link(upload_result.get('attachment'))
+            # The attachment is always published FIRST. If ntfy does not
+            # supply a usable link (or the second post is rate-limited), the
+            # downloadable file in that first notification is the fallback.
+            if not self._publish_panel_attachment_link(attachment):
+                self._diagnostic(
+                    'Panel file delivered: use the Sequent-Remote-Panel.html '
+                    'download in the first ntfy notification.')
         return True
 
     def receive_message(self, msg):
