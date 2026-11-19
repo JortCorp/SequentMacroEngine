@@ -286,7 +286,7 @@ def config_default():
             'local_panel_enabled': False, 'panel_salt': '', 'panel_auth_key': '',
             'schedule': [], 'allow_remote_record': False, 'allow_remote_lock': False,
             'allow_live_preview': False, 'lock_after_execution': False,
-            'safety_locked': False, 'auto_approve_new_presets': True,
+            'safety_locked': False, 'auto_approve_new_presets': False,
             'allow_panel_slash_from_phone': False}
 
 
@@ -375,6 +375,13 @@ class RemoteRelay:
         self._idle_rollovers = 0
         self._stream_lock = threading.RLock()
         self._status_throttle = {}
+        # Only a successfully uploaded panel starts the 60-second cooldown.
+        # A failed upload must not make later /panel requests disappear silently.
+        self._panel_request_lock = threading.RLock()
+        self._panel_send_lock = threading.Lock()
+        self._panel_request_pending = False
+        self._panel_request_since = 0.0
+        self._panel_rate_limit_until = 0.0
         # Streaming is preferable, but some networks allow uploads while
         # timing out the long-lived GET subscription. Fall back to deliberately
         # conservative polling until a periodic streaming probe.
@@ -499,10 +506,14 @@ class RemoteRelay:
         if not re.fullmatch(r'[A-Za-z0-9_-]{6,64}',nonce):
             return None
         with self.pending_lock:
-            if nonce in self.seen:
+            # Never evict a live nonce: doing so permits replay of a signed command.
+            # Reject new traffic at capacity instead (fail closed).
+            for old_nonce, expiry in list(self.seen.items()):
+                if expiry < now:
+                    del self.seen[old_nonce]
+            if nonce in self.seen or len(self.seen) >= 10000:
                 return None
-            self.seen[nonce]=payload['exp']
-            while len(self.seen)>1500: self.seen.popitem(last=False)
+            self.seen[nonce] = payload['exp']
         return payload
 
     def _panel_reply(self, sid, reply):
@@ -608,7 +619,79 @@ class RemoteRelay:
                              + type(exc).__name__)
             return False
 
+    def _begin_panel_request(self, source):
+        """Enqueue a requested panel once, with actionable local diagnostics.
+
+        The cooldown starts ONLY after a successful upload, not at reception.
+        This prevents a failed ntfy upload from silently swallowing retries.
+        """
+        now = self.clock()
+        with self._panel_request_lock:
+            if now < self._panel_rate_limit_until:
+                self._diagnostic('Received /panel (' + source + '), but ntfy rate-limited ' +
+                                 'uploads. Wait ' + str(max(1, int(self._panel_rate_limit_until - now + 0.999))) +
+                                 ' seconds before retrying.')
+                return False
+            if self._panel_request_pending:
+                # Recover from a failed Tk dispatch or an unexpectedly vanished
+                # worker without holding the request lock forever.
+                age = now - self._panel_request_since
+                if age < 120:
+                    self._diagnostic('Received /panel (' + source +
+                                     '), but a panel upload is already in progress.')
+                    return False
+                self._panel_request_pending = False
+                self._diagnostic('Previous panel request stalled; allowing a new attempt.')
+            elapsed = now - self._status_throttle.get('panel_file', 0)
+            if elapsed < 60:
+                self._diagnostic('Received /panel (' + source + '), but a panel ' +
+                                 'was already delivered. Retry in ' +
+                                 str(max(1, int(61 - elapsed))) + ' seconds.')
+                return False
+            self._panel_request_pending = True
+            self._panel_request_since = now
+        self._diagnostic('Received /panel (' + source + '); queuing HTML attachment.')
+        return True
+
+    def _finish_panel_request(self, delivered):
+        with self._panel_request_lock:
+            self._panel_request_pending = False
+            self._panel_request_since = 0.0
+            if delivered:
+                self._status_throttle['panel_file'] = self.clock()
+
     def send_panel_file(self, *, include_open_link=False):
+        """Upload panel once and release the guard even if ntfy rejects it."""
+        if not self._panel_send_lock.acquire(blocking=False):
+            self._diagnostic('Panel HTML upload already running; duplicate send skipped.')
+            raise RuntimeError('Panel HTML upload already running')
+        with self._panel_request_lock:
+            self._panel_request_pending = True
+            self._panel_request_since = self.clock()
+        delivered = False
+        try:
+            result = self._send_panel_file_impl(include_open_link=include_open_link)
+            delivered = bool(result)
+            if delivered:
+                self._diagnostic('Panel HTML uploaded to phone topic. Check the ' +
+                                 'Sequent Remote - HTML Control Panel attachment.')
+            return result
+        except Exception as exc:
+            if getattr(exc, 'code', None) == 429:
+                cooldown = self._retry_seconds(exc, 1)
+                with self._panel_request_lock:
+                    self._panel_rate_limit_until = self.clock() + cooldown
+                self._diagnostic('Panel HTML upload rate-limited (HTTP 429). ' +
+                                 'Wait ' + str(int(cooldown)) + ' seconds before retrying.')
+            else:
+                self._diagnostic('Panel HTML delivery failed: ' + type(exc).__name__ +
+                                 ': ' + str(exc)[:105] + '. Retry allowed.')
+            raise
+        finally:
+            self._finish_panel_request(delivered)
+            self._panel_send_lock.release()
+
+    def _send_panel_file_impl(self, *, include_open_link=False):
         """Read project-local panel.html, personalize session metadata and attach to ntfy.
 
         The file contains no password or HMAC signing key. It is read afresh
@@ -714,14 +797,19 @@ class RemoteRelay:
         # No macro-control commands are accepted from the phone topic.
         if isinstance(raw, str) and raw.strip().lower() in ('/panel', '/sequent panel'):
             if not self.cfg.get('local_panel_enabled'):
+                self._diagnostic('Received /panel, but Downloadable HTML Panel is disabled.')
                 return False
             if is_phone and not self.cfg.get('allow_panel_slash_from_phone'):
+                self._diagnostic('Received /panel on phone topic, but phone-topic commands are disabled.')
                 return False
-            now = self.clock()
-            if now-self._status_throttle.get('panel_file', 0) < 60:
+            source = 'phone topic' if is_phone else 'command topic'
+            if not self._begin_panel_request(source):
                 return False
-            self._status_throttle['panel_file'] = now
-            self.on_command('panel_file', 'link' if is_phone else '')
+            try:
+                self.on_command('panel_file', 'link' if is_phone else '')
+            except Exception:
+                self._finish_panel_request(False)
+                raise
             return True
         if is_phone and not is_inbox:
             return False
@@ -799,11 +887,13 @@ class RemoteRelay:
         elif payload['op'] == 'panel_file':
             if not self.cfg.get('local_panel_enabled'):
                 return False
-            now=self.clock()
-            if now-self._status_throttle.get('panel_file',0)<60:
+            if not self._begin_panel_request('signed button'):
                 return False
-            self._status_throttle['panel_file']=now
-            self.on_command('panel_file','')
+            try:
+                self.on_command('panel_file','')
+            except Exception:
+                self._finish_panel_request(False)
+                raise
         elif payload['op'] in ('approve','choose'):
             with self.pending_lock:
                 record = self.pending.get(payload['request'])

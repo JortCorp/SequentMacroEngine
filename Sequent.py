@@ -25788,8 +25788,10 @@ try {{
     def _remote_command_async(self, operation, value):
         try:
             self.root.after(0,lambda:self._remote_command(operation,value))
-        except (RuntimeError,tk.TclError):
-            pass
+        except (RuntimeError,tk.TclError) as exc:
+            self._remote_log_event('Remote command dispatch failed: ' + type(exc).__name__)
+            if operation == 'panel_file' and self.sequent_remote:
+                self.sequent_remote._finish_panel_request(False)
 
     def _remote_status_text(self):
         progress = dict(getattr(self,'_remote_progress',{}))
@@ -25809,7 +25811,7 @@ try {{
         Never alter an existing preset's approval state merely because it was
         re-saved. Persist the allowlist before applying it to the live relay.
         """
-        if not self._remote_config.get('auto_approve_new_presets', True):
+        if not self._remote_config.get('auto_approve_new_presets', False):
             return False
         if not isinstance(name, str) or name not in self.get_preset_names():
             return False
@@ -26042,6 +26044,8 @@ try {{
         elif operation == 'panel_file':
             if not (self._remote_config.get('local_panel_enabled') and self._remote_ready()):
                 self._remote_log_event('HTML Panel request rejected: disabled or offline')
+                if self.sequent_remote:
+                    self.sequent_remote._finish_panel_request(False)
                 return
             relay = self.sequent_remote
             # Only phone-topic slash commands request a second ntfy message
@@ -26251,7 +26255,7 @@ try {{
         enabled = tk.BooleanVar(value=bool(cfg.get('enabled', False)))
         allow_screens = tk.BooleanVar(value=bool(cfg.get('allow_screenshots', False)))
         allow_launch = tk.BooleanVar(value=bool(cfg.get('allow_launch', False)))
-        approve_new_presets = tk.BooleanVar(value=bool(cfg.get('auto_approve_new_presets', True)))
+        approve_new_presets = tk.BooleanVar(value=bool(cfg.get('auto_approve_new_presets', False)))
         errors = tk.BooleanVar(value=bool(cfg.get('auto_error_alert', False)))
         error_shot = tk.BooleanVar(value=bool(cfg.get('error_screenshot', False)))
         scope = tk.StringVar(value=cfg.get('screen_scope', 'Monitor at Cursor'))
